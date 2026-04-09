@@ -1,5 +1,4 @@
 import os
-import re
 import html
 import sqlite3
 from datetime import datetime, timezone
@@ -11,9 +10,9 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
+CHAT_ID = os.environ.get("CHAT_ID")  # твой chat_id / user_id
 GGSEL_API_KEY = os.environ.get("GGSEL_API_KEY")
-APP_URL = os.environ.get("APP_URL", "").rstrip("/")  # например https://ggsel-ggsel.up.railway.app
+APP_URL = os.environ.get("APP_URL", "").rstrip("/")
 
 if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError("BOT_TOKEN and CHAT_ID must be set")
@@ -36,6 +35,14 @@ NEGATIVE_PATTERNS = [
     "не могу",
     "не получается",
 ]
+
+REPLY_TEMPLATES = {
+    "instruction": "Здравствуйте! Отправляю инструкцию. Выполните, пожалуйста, все шаги по порядку и напишите результат.",
+    "replace": "Здравствуйте! Сейчас проверю ситуацию. Если проблема подтвердится, выдам замену.",
+    "wait": "Здравствуйте! Принял ваш запрос. Пожалуйста, ожидайте, я проверяю информацию.",
+    "photo": "Здравствуйте! Пожалуйста, отправьте фото или скриншот ошибки, чтобы я быстрее помог.",
+    "details": "Здравствуйте! Уточните, пожалуйста, в чем именно проблема: что вы делаете и на каком шаге возникает ошибка?",
+}
 
 # -------------------- DB --------------------
 
@@ -79,31 +86,6 @@ def init_db():
     )
     """)
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS reviews (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        review_id TEXT UNIQUE,
-        invoice_id TEXT,
-        text TEXT,
-        rating TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        raw_json TEXT
-    )
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS sales (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        invoice_id TEXT UNIQUE,
-        product_name TEXT,
-        amount TEXT,
-        currency_type TEXT,
-        purchase_date TEXT,
-        raw_json TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-
     conn.commit()
     conn.close()
 
@@ -119,9 +101,36 @@ def is_negative_text(text: str) -> bool:
     lower = (text or "").lower()
     return any(p in lower for p in NEGATIVE_PATTERNS)
 
-def shorten(text: str, limit: int = 3500) -> str:
+def shorten(text: str, limit: int = 3900) -> str:
     text = text or ""
     return text if len(text) <= limit else text[:limit - 3] + "..."
+
+def is_owner_telegram_update(update: Dict[str, Any]) -> bool:
+    """
+    Пускаем только владельца.
+    Проверяем и chat.id, и from.id.
+    """
+    owner = str(CHAT_ID)
+
+    if "callback_query" in update:
+        cq = update.get("callback_query", {})
+        from_user = cq.get("from", {}) or {}
+        message = cq.get("message", {}) or {}
+        chat = message.get("chat", {}) or {}
+
+        from_id = str(from_user.get("id", ""))
+        chat_id = str(chat.get("id", ""))
+
+        return from_id == owner and chat_id == owner
+
+    message = update.get("message", {}) or {}
+    from_user = message.get("from", {}) or {}
+    chat = message.get("chat", {}) or {}
+
+    from_id = str(from_user.get("id", ""))
+    chat_id = str(chat.get("id", ""))
+
+    return from_id == owner and chat_id == owner
 
 # -------------------- Telegram --------------------
 
@@ -134,7 +143,7 @@ def tg_request(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
 def send_message(text: str, reply_markup: Optional[Dict[str, Any]] = None):
     payload = {
         "chat_id": CHAT_ID,
-        "text": shorten(text, 3900),
+        "text": shorten(text),
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
@@ -165,11 +174,43 @@ def set_telegram_webhook():
     payload = {"url": f"{APP_URL}/telegram"}
     return tg_request("setWebhook", payload)
 
+def main_menu():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📦 Последние продажи", "callback_data": "sales"},
+                {"text": "💰 Баланс", "callback_data": "balance"},
+            ],
+            [
+                {"text": "🏆 Топ товаров", "callback_data": "top"},
+                {"text": "🚨 Проблемные", "callback_data": "negative"},
+            ],
+            [
+                {"text": "🧩 Шаблоны", "callback_data": "templates"},
+            ],
+        ]
+    }
+
+def templates_menu():
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Инструкция", "callback_data": "tpl:instruction"},
+                {"text": "Замена", "callback_data": "tpl:replace"},
+            ],
+            [
+                {"text": "Подождать", "callback_data": "tpl:wait"},
+                {"text": "Фото ошибки", "callback_data": "tpl:photo"},
+            ],
+            [
+                {"text": "Уточнить детали", "callback_data": "tpl:details"},
+            ],
+        ]
+    }
+
 # -------------------- GGSEL --------------------
 
 def ggsel_headers() -> Dict[str, str]:
-    # Оставил несколько распространённых вариантов заголовка.
-    # Обычно хватает Authorization: Bearer ...
     return {
         "Accept": "application/json",
         "Authorization": f"Bearer {GGSEL_API_KEY}" if GGSEL_API_KEY else "",
@@ -192,7 +233,6 @@ def ggsel_get(path: str) -> Dict[str, Any]:
         if isinstance(data.get("data"), (dict, list)):
             return data["data"]
         return data
-
     return {}
 
 def ggsel_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -210,7 +250,6 @@ def ggsel_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(data.get("data"), (dict, list)):
             return data["data"]
         return data
-
     return {}
 
 def get_order_info(invoice_id: str) -> Dict[str, Any]:
@@ -219,18 +258,28 @@ def get_order_info(invoice_id: str) -> Dict[str, Any]:
 def get_balance_info() -> Dict[str, Any]:
     return ggsel_get("/api_sellers/api/sellers/account/balance/info")
 
-def get_receipts() -> Any:
-    return ggsel_get("/api_sellers/api/sellers/account/receipts")
-
 def get_last_sales() -> Any:
     return ggsel_get("/api_sellers/api/seller-last-sales")
 
-def get_reviews() -> Any:
-    return ggsel_get("/api_sellers/api/reviews")
+def send_reply_to_buyer(debate_id: str, text: str) -> Dict[str, Any]:
+    """
+    Если у GGSEL другой путь/тело для отправки сообщения,
+    поправим только этот блок.
+    """
+    payload_variants = [
+        {"DebateId": debate_id, "Message": text},
+        {"debate_id": debate_id, "message": text},
+        {"id": debate_id, "text": text},
+    ]
 
-# Поиск товаров documented as POST /api_sellers/xml/shop_search.asp
-def search_products(query: str) -> Any:
-    return ggsel_post("/api_sellers/xml/shop_search.asp", {"query": query})
+    last_error = None
+    for payload in payload_variants:
+        try:
+            return ggsel_post("/api_sellers/api/debates/v2/chats", payload)
+        except Exception as e:
+            last_error = e
+
+    raise RuntimeError(f"Не удалось отправить ответ в GGSEL: {last_error}")
 
 # -------------------- Persistence --------------------
 
@@ -298,47 +347,6 @@ def save_message(
     conn.commit()
     conn.close()
 
-def save_sales(items: List[Dict[str, Any]]):
-    conn = db()
-    cur = conn.cursor()
-    for item in items:
-        invoice_id = str(item.get("invoice_id", "") or item.get("invoiceId", "") or "")
-        if not invoice_id:
-            continue
-        cur.execute("""
-            INSERT OR IGNORE INTO sales (invoice_id, product_name, amount, currency_type, purchase_date, raw_json)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            invoice_id,
-            str(item.get("name", "") or item.get("product_name", "") or ""),
-            str(item.get("amount", "") or ""),
-            str(item.get("currency_type", "") or ""),
-            str(item.get("purchase_date", "") or ""),
-            str(item),
-        ))
-    conn.commit()
-    conn.close()
-
-def save_reviews(items: List[Dict[str, Any]]):
-    conn = db()
-    cur = conn.cursor()
-    for item in items:
-        review_id = str(item.get("id", "") or item.get("review_id", "") or "")
-        if not review_id:
-            continue
-        cur.execute("""
-            INSERT OR IGNORE INTO reviews (review_id, invoice_id, text, rating, raw_json)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            review_id,
-            str(item.get("invoice_id", "") or ""),
-            str(item.get("text", "") or item.get("review", "") or ""),
-            str(item.get("rating", "") or ""),
-            str(item),
-        ))
-    conn.commit()
-    conn.close()
-
 # -------------------- Queries --------------------
 
 def find_orders_by_text(query: str) -> List[sqlite3.Row]:
@@ -346,11 +354,12 @@ def find_orders_by_text(query: str) -> List[sqlite3.Row]:
     cur = conn.cursor()
     like = f"%{query.lower()}%"
     cur.execute("""
-        SELECT o.invoice_id, o.product_name, o.buyer_email, o.amount, o.currency_type, o.purchase_date
+        SELECT o.invoice_id, o.product_name, o.buyer_email, o.buyer_account,
+               o.amount, o.currency_type, o.purchase_date
         FROM orders o
-        WHERE lower(o.product_name) LIKE ?
-           OR lower(o.buyer_email) LIKE ?
-           OR lower(o.buyer_account) LIKE ?
+        WHERE lower(coalesce(o.product_name, '')) LIKE ?
+           OR lower(coalesce(o.buyer_email, '')) LIKE ?
+           OR lower(coalesce(o.buyer_account, '')) LIKE ?
         ORDER BY o.updated_at DESC
         LIMIT 15
     """, (like, like, like))
@@ -361,9 +370,7 @@ def find_orders_by_text(query: str) -> List[sqlite3.Row]:
 def get_order_local(invoice_id: str) -> Optional[sqlite3.Row]:
     conn = db()
     cur = conn.cursor()
-    cur.execute("""
-        SELECT * FROM orders WHERE invoice_id = ?
-    """, (invoice_id,))
+    cur.execute("SELECT * FROM orders WHERE invoice_id = ?", (invoice_id,))
     row = cur.fetchone()
     conn.close()
     return row
@@ -380,6 +387,20 @@ def get_messages_for_order(invoice_id: str) -> List[sqlite3.Row]:
     rows = cur.fetchall()
     conn.close()
     return rows
+
+def get_latest_debate_id_for_order(invoice_id: str) -> Optional[str]:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT debate_id
+        FROM messages
+        WHERE invoice_id = ? AND debate_id IS NOT NULL AND debate_id != ''
+        ORDER BY id DESC
+        LIMIT 1
+    """, (invoice_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row["debate_id"] if row else None
 
 def top_products() -> List[sqlite3.Row]:
     conn = db()
@@ -412,19 +433,6 @@ def recent_negative_messages() -> List[sqlite3.Row]:
 
 # -------------------- Formatters --------------------
 
-def format_order_block(order: Dict[str, Any]) -> str:
-    buyer_info = order.get("buyer_info", {}) if isinstance(order.get("buyer_info"), dict) else {}
-    return (
-        f"<b>Товар:</b> {safe(order.get('name'))}\n"
-        f"<b>Почта:</b> {safe(buyer_info.get('email'))}\n"
-        f"<b>Аккаунт:</b> {safe(buyer_info.get('account'))}\n"
-        f"<b>Заказ:</b> {safe(order.get('invoice_id') or order.get('id'))}\n"
-        f"<b>Внешний ID:</b> {safe(order.get('external_order_id'))}\n"
-        f"<b>Дата покупки:</b> {safe(order.get('purchase_date'))}\n"
-        f"<b>Оплата:</b> {safe(order.get('payment_method'))}\n"
-        f"<b>Сумма:</b> {safe(order.get('amount'))} {safe(order.get('currency_type'))}"
-    )
-
 def format_local_order(row: sqlite3.Row) -> str:
     return (
         f"<b>Товар:</b> {safe(row['product_name'])}\n"
@@ -436,31 +444,11 @@ def format_local_order(row: sqlite3.Row) -> str:
         f"<b>Сумма:</b> {safe(row['amount'])} {safe(row['currency_type'])}"
     )
 
-def main_menu():
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "📦 Последние продажи", "callback_data": "sales"},
-                {"text": "💰 Баланс", "callback_data": "balance"},
-            ],
-            [
-                {"text": "⭐ Отзывы", "callback_data": "reviews"},
-                {"text": "🏆 Топ товаров", "callback_data": "top"},
-            ],
-            [
-                {"text": "🚨 Проблемные", "callback_data": "negative"},
-            ],
-        ]
-    }
-
-# -------------------- Sync helpers --------------------
-
 def sync_last_sales() -> str:
     data = get_last_sales()
     items = data if isinstance(data, list) else data.get("items", []) if isinstance(data, dict) else []
     if not isinstance(items, list):
         items = []
-    save_sales(items)
 
     lines = ["<b>Последние продажи</b>\n"]
     if not items:
@@ -476,27 +464,7 @@ def sync_last_sales() -> str:
         )
     return "\n".join(lines)
 
-def sync_reviews() -> str:
-    data = get_reviews()
-    items = data if isinstance(data, list) else data.get("items", []) if isinstance(data, dict) else []
-    if not isinstance(items, list):
-        items = []
-    save_reviews(items)
-
-    lines = ["<b>Последние отзывы</b>\n"]
-    if not items:
-        lines.append("Нет данных.")
-        return "\n".join(lines)
-
-    for item in items[:10]:
-        lines.append(
-            f"• Рейтинг: {safe(item.get('rating'))}\n"
-            f"  Заказ: {safe(item.get('invoice_id'))}\n"
-            f"  {safe(item.get('text') or item.get('review'))}\n"
-        )
-    return "\n".join(lines)
-
-# -------------------- Handlers --------------------
+# -------------------- Web routes --------------------
 
 @app.get("/")
 def home():
@@ -532,12 +500,8 @@ def ggsel_webhook():
                 if isinstance(order, dict):
                     order["invoice_id"] = invoice_id
                     upsert_order_from_api(order, invoice_id)
-            except Exception as e:
-                send_message(
-                    f"⚠️ <b>GGSEL API</b>\n"
-                    f"Не удалось получить детали заказа {safe(invoice_id)}\n"
-                    f"<code>{safe(e)}</code>"
-                )
+            except Exception:
+                pass
 
         save_message(debate_id, invoice_id, message_date, message, image_path)
 
@@ -585,14 +549,14 @@ def ggsel_webhook():
             try:
                 send_photo(image_path, caption=caption)
             except Exception:
-                send_message(
-                    f"{caption}\n\n<b>Ссылка на изображение:</b>\n{safe(image_path)}"
-                )
+                send_message(f"{caption}\n\n<b>Ссылка на изображение:</b>\n{safe(image_path)}")
 
         return jsonify({"ok": True}), 200
 
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+# -------------------- Telegram command handlers --------------------
 
 def handle_command(text: str):
     text = (text or "").strip()
@@ -604,10 +568,11 @@ def handle_command(text: str):
             "/find слово — поиск по товару/email\n"
             "/order 123456 — карточка заказа\n"
             "/user email@example.com — поиск по покупателю\n"
+            "/reply 123456 текст — ответ покупателю\n"
+            "/tpl 123456 instruction — шаблонный ответ\n"
             "/top — топ товаров\n"
             "/balance — баланс\n"
             "/sales — последние продажи\n"
-            "/reviews — отзывы\n"
             "/negative — проблемные сообщения",
             reply_markup=main_menu()
         )
@@ -619,10 +584,15 @@ def handle_command(text: str):
             "/find windows\n"
             "/order 123456\n"
             "/user buyer@mail.com\n"
+            "/reply 123456 Здравствуйте! Проверьте инструкцию.\n"
+            "/tpl 123456 instruction\n"
+            "/tpl 123456 replace\n"
+            "/tpl 123456 wait\n"
+            "/tpl 123456 photo\n"
+            "/tpl 123456 details\n"
             "/top\n"
             "/balance\n"
             "/sales\n"
-            "/reviews\n"
             "/negative"
         )
         return
@@ -640,6 +610,7 @@ def handle_command(text: str):
                 f"• <b>{safe(row['product_name'])}</b>\n"
                 f"  Заказ: {safe(row['invoice_id'])}\n"
                 f"  Почта: {safe(row['buyer_email'])}\n"
+                f"  Аккаунт: {safe(row['buyer_account'])}\n"
                 f"  Сумма: {safe(row['amount'])} {safe(row['currency_type'])}\n"
                 f"  Дата: {safe(row['purchase_date'])}\n"
             )
@@ -668,7 +639,6 @@ def handle_command(text: str):
         invoice_id = text[7:].strip()
         local = get_order_local(invoice_id)
 
-        # если нет локально — попробуем дотянуть из GGSEL
         if not local:
             try:
                 order = get_order_info(invoice_id)
@@ -677,9 +647,7 @@ def handle_command(text: str):
                     upsert_order_from_api(order, invoice_id)
                 local = get_order_local(invoice_id)
             except Exception as e:
-                send_message(
-                    f"Не удалось получить заказ {safe(invoice_id)}\n<code>{safe(e)}</code>"
-                )
+                send_message(f"Не удалось получить заказ {safe(invoice_id)}\n<code>{safe(e)}</code>")
                 return
 
         if not local:
@@ -688,6 +656,10 @@ def handle_command(text: str):
 
         msgs = get_messages_for_order(invoice_id)
         lines = [f"<b>Карточка заказа</b>\n\n{format_local_order(local)}\n"]
+
+        debate_id = get_latest_debate_id_for_order(invoice_id)
+        if debate_id:
+            lines.append(f"<b>DebateId:</b> {safe(debate_id)}\n")
 
         if msgs:
             lines.append("<b>Последние сообщения:</b>")
@@ -699,6 +671,76 @@ def handle_command(text: str):
                 )
 
         send_message("\n".join(lines))
+        return
+
+    if text.startswith("/reply "):
+        parts = text.split(maxsplit=2)
+        if len(parts) < 3:
+            send_message("Формат: <code>/reply НОМЕР_ЗАКАЗА текст ответа</code>")
+            return
+
+        invoice_id = parts[1].strip()
+        reply_text = parts[2].strip()
+
+        debate_id = get_latest_debate_id_for_order(invoice_id)
+        if not debate_id:
+            send_message(f"Не найден debate_id для заказа <b>{safe(invoice_id)}</b>")
+            return
+
+        try:
+            send_reply_to_buyer(debate_id, reply_text)
+            send_message(
+                f"✅ Ответ отправлен\n\n"
+                f"<b>Заказ:</b> {safe(invoice_id)}\n"
+                f"<b>Диалог:</b> {safe(debate_id)}\n"
+                f"<b>Текст:</b>\n{safe(reply_text)}"
+            )
+        except Exception as e:
+            send_message(
+                f"❌ Не удалось отправить ответ\n\n"
+                f"<b>Заказ:</b> {safe(invoice_id)}\n"
+                f"<b>Диалог:</b> {safe(debate_id)}\n"
+                f"<code>{safe(e)}</code>"
+            )
+        return
+
+    if text.startswith("/tpl "):
+        parts = text.split(maxsplit=2)
+        if len(parts) < 3:
+            send_message("Формат: <code>/tpl НОМЕР_ЗАКАЗА template_name</code>")
+            return
+
+        invoice_id = parts[1].strip()
+        template_name = parts[2].strip().lower()
+
+        template_text = REPLY_TEMPLATES.get(template_name)
+        if not template_text:
+            send_message(
+                "Неизвестный шаблон.\n\n"
+                "Доступно:\n"
+                "instruction\nreplace\nwait\nphoto\ndetails"
+            )
+            return
+
+        debate_id = get_latest_debate_id_for_order(invoice_id)
+        if not debate_id:
+            send_message(f"Не найден debate_id для заказа <b>{safe(invoice_id)}</b>")
+            return
+
+        try:
+            send_reply_to_buyer(debate_id, template_text)
+            send_message(
+                f"✅ Шаблон отправлен\n\n"
+                f"<b>Заказ:</b> {safe(invoice_id)}\n"
+                f"<b>Шаблон:</b> {safe(template_name)}\n"
+                f"<b>Текст:</b>\n{safe(template_text)}"
+            )
+        except Exception as e:
+            send_message(
+                f"❌ Не удалось отправить шаблон\n\n"
+                f"<b>Заказ:</b> {safe(invoice_id)}\n"
+                f"<code>{safe(e)}</code>"
+            )
         return
 
     if text == "/top":
@@ -728,13 +770,6 @@ def handle_command(text: str):
             send_message(f"Не удалось получить продажи\n<code>{safe(e)}</code>")
         return
 
-    if text == "/reviews":
-        try:
-            send_message(sync_reviews())
-        except Exception as e:
-            send_message(f"Не удалось получить отзывы\n<code>{safe(e)}</code>")
-        return
-
     if text == "/negative":
         rows = recent_negative_messages()
         if not rows:
@@ -754,10 +789,16 @@ def handle_command(text: str):
 
     send_message("Не понял команду. Нажми /help")
 
+# -------------------- Telegram webhook --------------------
+
 @app.post("/telegram")
 def telegram_webhook():
     try:
         update = request.get_json(silent=True) or {}
+
+        # Главная защита: только владелец
+        if not is_owner_telegram_update(update):
+            return jsonify({"ok": True, "ignored": "not owner"}), 200
 
         if "callback_query" in update:
             cq = update["callback_query"]
@@ -771,22 +812,34 @@ def telegram_webhook():
                 handle_command("/balance")
             elif data == "sales":
                 handle_command("/sales")
-            elif data == "reviews":
-                handle_command("/reviews")
             elif data == "top":
                 handle_command("/top")
             elif data == "negative":
                 handle_command("/negative")
+            elif data == "templates":
+                send_message(
+                    "Шаблоны быстрых ответов:\n\n"
+                    "Используй так:\n"
+                    "<code>/tpl НОМЕР_ЗАКАЗА instruction</code>\n"
+                    "<code>/tpl НОМЕР_ЗАКАЗА replace</code>\n"
+                    "<code>/tpl НОМЕР_ЗАКАЗА wait</code>\n"
+                    "<code>/tpl НОМЕР_ЗАКАЗА photo</code>\n"
+                    "<code>/tpl НОМЕР_ЗАКАЗА details</code>",
+                    reply_markup=templates_menu()
+                )
+            elif data.startswith("tpl:"):
+                template_name = data.split(":", 1)[1]
+                send_message(
+                    f"Шаблон <b>{safe(template_name)}</b>\n\n"
+                    f"Используй команду:\n"
+                    f"<code>/tpl НОМЕР_ЗАКАЗА {safe(template_name)}</code>\n\n"
+                    f"Текст шаблона:\n{safe(REPLY_TEMPLATES.get(template_name, ''))}"
+                )
 
             return jsonify({"ok": True}), 200
 
-        message = update.get("message", {})
-        text = message.get("text", "")
-        chat = message.get("chat", {})
-        chat_id = str(chat.get("id", ""))
-
-        if chat_id != str(CHAT_ID):
-            return jsonify({"ok": True, "ignored": "not owner chat"}), 200
+        message = update.get("message", {}) or {}
+        text = message.get("text", "") or ""
 
         if text:
             handle_command(text)
