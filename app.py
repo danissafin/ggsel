@@ -14,7 +14,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")  # твой telegram user/chat id
 APP_URL = os.environ.get("APP_URL", "").rstrip("/")
 
-# Для GGSEL через apilogin
+# Для GGSEL авторизации
 GGSEL_LOGIN = os.environ.get("GGSEL_LOGIN")
 GGSEL_PASSWORD = os.environ.get("GGSEL_PASSWORD")
 
@@ -229,24 +229,16 @@ def extract_token_from_response(data: Any) -> Optional[str]:
     if not isinstance(data, dict):
         return None
 
-    if data.get("token"):
-        return str(data["token"])
-    if data.get("access_token"):
-        return str(data["access_token"])
+    for key in ("token", "access_token", "accessToken"):
+        if data.get(key):
+            return str(data[key])
 
-    content = data.get("content")
-    if isinstance(content, dict):
-        if content.get("token"):
-            return str(content["token"])
-        if content.get("access_token"):
-            return str(content["access_token"])
-
-    inner_data = data.get("data")
-    if isinstance(inner_data, dict):
-        if inner_data.get("token"):
-            return str(inner_data["token"])
-        if inner_data.get("access_token"):
-            return str(inner_data["access_token"])
+    for container_key in ("content", "data", "result"):
+        inner = data.get(container_key)
+        if isinstance(inner, dict):
+            for key in ("token", "access_token", "accessToken"):
+                if inner.get(key):
+                    return str(inner[key])
 
     return None
 
@@ -257,99 +249,189 @@ def get_seller_token() -> str:
 
     url = f"{GGSEL_BASE}/api_sellers/api/apilogin"
 
-    # Пробуем несколько самых вероятных вариантов тела запроса.
     payload_variants = [
         {"login": GGSEL_LOGIN, "password": GGSEL_PASSWORD},
         {"username": GGSEL_LOGIN, "password": GGSEL_PASSWORD},
         {"email": GGSEL_LOGIN, "password": GGSEL_PASSWORD},
+        {"Login": GGSEL_LOGIN, "Password": GGSEL_PASSWORD},
+        {"UserName": GGSEL_LOGIN, "Password": GGSEL_PASSWORD},
+        {"Email": GGSEL_LOGIN, "Password": GGSEL_PASSWORD},
+        {"name": GGSEL_LOGIN, "password": GGSEL_PASSWORD},
+        {"key": GGSEL_LOGIN, "password": GGSEL_PASSWORD},
+        {"api_key": GGSEL_LOGIN, "password": GGSEL_PASSWORD},
     ]
 
     last_error = None
 
     for payload in payload_variants:
+        # JSON
         try:
             r = requests.post(url, json=payload, timeout=30)
-
+            print("APILOGIN MODE: json", flush=True)
             print("APILOGIN URL:", url, flush=True)
             print("APILOGIN PAYLOAD KEYS:", list(payload.keys()), flush=True)
             print("APILOGIN STATUS:", r.status_code, flush=True)
             print("APILOGIN TEXT:", r.text[:3000], flush=True)
 
-            r.raise_for_status()
-            data = r.json()
-
-            token = extract_token_from_response(data)
-            if token:
-                return token
-
-            last_error = RuntimeError(f"Token not found in response: {data}")
-
+            if r.ok:
+                data = r.json()
+                token = extract_token_from_response(data)
+                if token:
+                    return token
+                last_error = RuntimeError(f"Token not found in JSON response: {data}")
+            else:
+                last_error = RuntimeError(f"JSON login failed: {r.status_code} {r.text[:500]}")
         except Exception as e:
             last_error = e
-            print("APILOGIN ERROR:", repr(e), flush=True)
+            print("APILOGIN JSON ERROR:", repr(e), flush=True)
+
+        # FORM
+        try:
+            r = requests.post(
+                url,
+                data=payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=30,
+            )
+            print("APILOGIN MODE: form-urlencoded", flush=True)
+            print("APILOGIN URL:", url, flush=True)
+            print("APILOGIN PAYLOAD KEYS:", list(payload.keys()), flush=True)
+            print("APILOGIN STATUS:", r.status_code, flush=True)
+            print("APILOGIN TEXT:", r.text[:3000], flush=True)
+
+            if r.ok:
+                data = r.json()
+                token = extract_token_from_response(data)
+                if token:
+                    return token
+                last_error = RuntimeError(f"Token not found in FORM response: {data}")
+            else:
+                last_error = RuntimeError(f"FORM login failed: {r.status_code} {r.text[:500]}")
+        except Exception as e:
+            last_error = e
+            print("APILOGIN FORM ERROR:", repr(e), flush=True)
 
     raise RuntimeError(f"Could not get seller token: {last_error}")
 
 
-def ggsel_headers(token: str) -> Dict[str, str]:
-    return {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
+def ggsel_header_variants(token: str) -> List[Dict[str, str]]:
+    return [
+        {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        {
+            "Accept": "application/json",
+            "authorization": f"Bearer {token}",
+        },
+        {
+            "Accept": "application/json",
+            "X-API-KEY": token,
+        },
+        {
+            "Accept": "application/json",
+            "Api-Key": token,
+        },
+        {
+            "Accept": "application/json",
+            "token": token,
+        },
+    ]
 
 
-def ggsel_get(path: str) -> Dict[str, Any]:
-    token = get_seller_token()
-    url = f"{GGSEL_BASE}{path}"
-
-    r = requests.get(url, headers=ggsel_headers(token), timeout=30)
-
-    print("GGSEL GET URL:", url, flush=True)
-    print("GGSEL GET STATUS:", r.status_code, flush=True)
-    print("GGSEL GET TEXT:", r.text[:3000], flush=True)
-
-    r.raise_for_status()
-    data = r.json()
-
+def normalize_ggsel_response(data: Any) -> Any:
     if isinstance(data, dict):
         if isinstance(data.get("content"), (dict, list)):
             return data["content"]
         if isinstance(data.get("data"), (dict, list)):
             return data["data"]
+        if isinstance(data.get("result"), (dict, list)):
+            return data["result"]
         return data
+    return data
 
-    return {}
 
-
-def ggsel_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def ggsel_get(path: str) -> Any:
     token = get_seller_token()
     url = f"{GGSEL_BASE}{path}"
 
-    r = requests.post(url, headers=ggsel_headers(token), json=payload, timeout=30)
+    last_error = None
 
-    print("GGSEL POST URL:", url, flush=True)
-    print("GGSEL POST PAYLOAD:", str(payload)[:2000], flush=True)
-    print("GGSEL POST STATUS:", r.status_code, flush=True)
-    print("GGSEL POST TEXT:", r.text[:3000], flush=True)
+    for headers in ggsel_header_variants(token):
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
 
-    r.raise_for_status()
-    data = r.json()
+            print("GGSEL GET URL:", url, flush=True)
+            print("GGSEL GET HEADERS:", headers, flush=True)
+            print("GGSEL GET STATUS:", r.status_code, flush=True)
+            print("GGSEL GET TEXT:", r.text[:3000], flush=True)
 
-    if isinstance(data, dict):
-        if isinstance(data.get("content"), (dict, list)):
-            return data["content"]
-        if isinstance(data.get("data"), (dict, list)):
-            return data["data"]
-        return data
+            r.raise_for_status()
+            data = r.json()
+            return normalize_ggsel_response(data)
 
-    return {}
+        except Exception as e:
+            last_error = e
+            print("GGSEL GET ERROR:", repr(e), flush=True)
+
+    raise RuntimeError(f"GGSEL GET failed: {last_error}")
 
 
-def get_order_info(invoice_id: str) -> Dict[str, Any]:
+def ggsel_post(path: str, payload: Dict[str, Any]) -> Any:
+    token = get_seller_token()
+    url = f"{GGSEL_BASE}{path}"
+
+    last_error = None
+
+    for headers in ggsel_header_variants(token):
+        # JSON
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=30)
+
+            print("GGSEL POST MODE: json", flush=True)
+            print("GGSEL POST URL:", url, flush=True)
+            print("GGSEL POST HEADERS:", headers, flush=True)
+            print("GGSEL POST PAYLOAD:", str(payload)[:2000], flush=True)
+            print("GGSEL POST STATUS:", r.status_code, flush=True)
+            print("GGSEL POST TEXT:", r.text[:3000], flush=True)
+
+            r.raise_for_status()
+            data = r.json()
+            return normalize_ggsel_response(data)
+
+        except Exception as e:
+            last_error = e
+            print("GGSEL POST JSON ERROR:", repr(e), flush=True)
+
+        # FORM
+        try:
+            form_headers = dict(headers)
+            form_headers["Content-Type"] = "application/x-www-form-urlencoded"
+            r = requests.post(url, headers=form_headers, data=payload, timeout=30)
+
+            print("GGSEL POST MODE: form-urlencoded", flush=True)
+            print("GGSEL POST URL:", url, flush=True)
+            print("GGSEL POST HEADERS:", form_headers, flush=True)
+            print("GGSEL POST PAYLOAD:", str(payload)[:2000], flush=True)
+            print("GGSEL POST STATUS:", r.status_code, flush=True)
+            print("GGSEL POST TEXT:", r.text[:3000], flush=True)
+
+            r.raise_for_status()
+            data = r.json()
+            return normalize_ggsel_response(data)
+
+        except Exception as e:
+            last_error = e
+            print("GGSEL POST FORM ERROR:", repr(e), flush=True)
+
+    raise RuntimeError(f"GGSEL POST failed: {last_error}")
+
+
+def get_order_info(invoice_id: str) -> Any:
     return ggsel_get(f"/api_sellers/api/purchase/info/{invoice_id}")
 
 
-def get_balance_info() -> Dict[str, Any]:
+def get_balance_info() -> Any:
     return ggsel_get("/api_sellers/api/sellers/account/balance/info")
 
 
@@ -357,7 +439,7 @@ def get_last_sales() -> Any:
     return ggsel_get("/api_sellers/api/seller-last-sales")
 
 
-def send_reply_to_buyer(debate_id: str, text: str) -> Dict[str, Any]:
+def send_reply_to_buyer(debate_id: str, text: str) -> Any:
     payload_variants = [
         {"DebateId": debate_id, "Message": text},
         {"debate_id": debate_id, "message": text},
@@ -601,8 +683,9 @@ def ggsel_webhook():
         order = {}
         if invoice_id:
             try:
-                order = get_order_info(invoice_id)
-                if isinstance(order, dict):
+                raw_order = get_order_info(invoice_id)
+                if isinstance(raw_order, dict):
+                    order = raw_order
                     order["invoice_id"] = invoice_id
                     upsert_order_from_api(order, invoice_id)
             except Exception as e:
@@ -749,10 +832,10 @@ def handle_command(text: str):
 
         if not local:
             try:
-                order = get_order_info(invoice_id)
-                if isinstance(order, dict):
-                    order["invoice_id"] = invoice_id
-                    upsert_order_from_api(order, invoice_id)
+                raw_order = get_order_info(invoice_id)
+                if isinstance(raw_order, dict):
+                    raw_order["invoice_id"] = invoice_id
+                    upsert_order_from_api(raw_order, invoice_id)
                 local = get_order_local(invoice_id)
             except Exception as e:
                 print("ORDER COMMAND ERROR:", traceback.format_exc(), flush=True)
