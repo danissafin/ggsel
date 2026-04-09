@@ -1,6 +1,7 @@
 import os
 import html
 import sqlite3
+import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -10,9 +11,12 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")  # твой chat_id / user_id
-GGSEL_API_KEY = os.environ.get("GGSEL_API_KEY")
+CHAT_ID = os.environ.get("CHAT_ID")  # твой telegram user/chat id
 APP_URL = os.environ.get("APP_URL", "").rstrip("/")
+
+# Для GGSEL через apilogin
+GGSEL_LOGIN = os.environ.get("GGSEL_LOGIN")
+GGSEL_PASSWORD = os.environ.get("GGSEL_PASSWORD")
 
 if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError("BOT_TOKEN and CHAT_ID must be set")
@@ -44,12 +48,14 @@ REPLY_TEMPLATES = {
     "details": "Здравствуйте! Уточните, пожалуйста, в чем именно проблема: что вы делаете и на каком шаге возникает ошибка?",
 }
 
+
 # -------------------- DB --------------------
 
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
 
 def init_db():
     conn = db()
@@ -89,27 +95,28 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 # -------------------- Utils --------------------
 
 def safe(value: Any) -> str:
     return html.escape(str(value)) if value not in (None, "") else "—"
 
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def is_negative_text(text: str) -> bool:
     lower = (text or "").lower()
     return any(p in lower for p in NEGATIVE_PATTERNS)
 
+
 def shorten(text: str, limit: int = 3900) -> str:
     text = text or ""
     return text if len(text) <= limit else text[:limit - 3] + "..."
 
+
 def is_owner_telegram_update(update: Dict[str, Any]) -> bool:
-    """
-    Пускаем только владельца.
-    Проверяем и chat.id, и from.id.
-    """
     owner = str(CHAT_ID)
 
     if "callback_query" in update:
@@ -132,6 +139,7 @@ def is_owner_telegram_update(update: Dict[str, Any]) -> bool:
 
     return from_id == owner and chat_id == owner
 
+
 # -------------------- Telegram --------------------
 
 def tg_request(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -139,6 +147,7 @@ def tg_request(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
     return r.json()
+
 
 def send_message(text: str, reply_markup: Optional[Dict[str, Any]] = None):
     payload = {
@@ -151,6 +160,7 @@ def send_message(text: str, reply_markup: Optional[Dict[str, Any]] = None):
         payload["reply_markup"] = reply_markup
     return tg_request("sendMessage", payload)
 
+
 def send_photo(photo_url: str, caption: str = ""):
     payload = {
         "chat_id": CHAT_ID,
@@ -160,6 +170,7 @@ def send_photo(photo_url: str, caption: str = ""):
     }
     return tg_request("sendPhoto", payload)
 
+
 def answer_callback(callback_query_id: str, text: str = ""):
     payload = {
         "callback_query_id": callback_query_id,
@@ -168,11 +179,13 @@ def answer_callback(callback_query_id: str, text: str = ""):
     }
     return tg_request("answerCallbackQuery", payload)
 
+
 def set_telegram_webhook():
     if not APP_URL:
         return {"ok": False, "error": "APP_URL is not set"}
     payload = {"url": f"{APP_URL}/telegram"}
     return tg_request("setWebhook", payload)
+
 
 def main_menu():
     return {
@@ -191,6 +204,7 @@ def main_menu():
         ]
     }
 
+
 def templates_menu():
     return {
         "inline_keyboard": [
@@ -208,22 +222,92 @@ def templates_menu():
         ]
     }
 
+
 # -------------------- GGSEL --------------------
 
-def ggsel_headers() -> Dict[str, str]:
+def extract_token_from_response(data: Any) -> Optional[str]:
+    if not isinstance(data, dict):
+        return None
+
+    if data.get("token"):
+        return str(data["token"])
+    if data.get("access_token"):
+        return str(data["access_token"])
+
+    content = data.get("content")
+    if isinstance(content, dict):
+        if content.get("token"):
+            return str(content["token"])
+        if content.get("access_token"):
+            return str(content["access_token"])
+
+    inner_data = data.get("data")
+    if isinstance(inner_data, dict):
+        if inner_data.get("token"):
+            return str(inner_data["token"])
+        if inner_data.get("access_token"):
+            return str(inner_data["access_token"])
+
+    return None
+
+
+def get_seller_token() -> str:
+    if not GGSEL_LOGIN or not GGSEL_PASSWORD:
+        raise RuntimeError("GGSEL_LOGIN and GGSEL_PASSWORD must be set")
+
+    url = f"{GGSEL_BASE}/api_sellers/api/apilogin"
+
+    # Пробуем несколько самых вероятных вариантов тела запроса.
+    payload_variants = [
+        {"login": GGSEL_LOGIN, "password": GGSEL_PASSWORD},
+        {"username": GGSEL_LOGIN, "password": GGSEL_PASSWORD},
+        {"email": GGSEL_LOGIN, "password": GGSEL_PASSWORD},
+    ]
+
+    last_error = None
+
+    for payload in payload_variants:
+        try:
+            r = requests.post(url, json=payload, timeout=30)
+
+            print("APILOGIN URL:", url, flush=True)
+            print("APILOGIN PAYLOAD KEYS:", list(payload.keys()), flush=True)
+            print("APILOGIN STATUS:", r.status_code, flush=True)
+            print("APILOGIN TEXT:", r.text[:3000], flush=True)
+
+            r.raise_for_status()
+            data = r.json()
+
+            token = extract_token_from_response(data)
+            if token:
+                return token
+
+            last_error = RuntimeError(f"Token not found in response: {data}")
+
+        except Exception as e:
+            last_error = e
+            print("APILOGIN ERROR:", repr(e), flush=True)
+
+    raise RuntimeError(f"Could not get seller token: {last_error}")
+
+
+def ggsel_headers(token: str) -> Dict[str, str]:
     return {
         "Accept": "application/json",
-        "Authorization": f"Bearer {GGSEL_API_KEY}" if GGSEL_API_KEY else "",
-        "X-API-KEY": GGSEL_API_KEY or "",
-        "Api-Key": GGSEL_API_KEY or "",
+        "Authorization": f"Bearer {token}",
     }
 
-def ggsel_get(path: str) -> Dict[str, Any]:
-    if not GGSEL_API_KEY:
-        raise RuntimeError("GGSEL_API_KEY is not set")
 
+def ggsel_get(path: str) -> Dict[str, Any]:
+    token = get_seller_token()
     url = f"{GGSEL_BASE}{path}"
-    r = requests.get(url, headers=ggsel_headers(), timeout=30)
+
+    r = requests.get(url, headers=ggsel_headers(token), timeout=30)
+
+    print("GGSEL GET URL:", url, flush=True)
+    print("GGSEL GET STATUS:", r.status_code, flush=True)
+    print("GGSEL GET TEXT:", r.text[:3000], flush=True)
+
     r.raise_for_status()
     data = r.json()
 
@@ -233,14 +317,21 @@ def ggsel_get(path: str) -> Dict[str, Any]:
         if isinstance(data.get("data"), (dict, list)):
             return data["data"]
         return data
+
     return {}
+
 
 def ggsel_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not GGSEL_API_KEY:
-        raise RuntimeError("GGSEL_API_KEY is not set")
-
+    token = get_seller_token()
     url = f"{GGSEL_BASE}{path}"
-    r = requests.post(url, headers=ggsel_headers(), json=payload, timeout=30)
+
+    r = requests.post(url, headers=ggsel_headers(token), json=payload, timeout=30)
+
+    print("GGSEL POST URL:", url, flush=True)
+    print("GGSEL POST PAYLOAD:", str(payload)[:2000], flush=True)
+    print("GGSEL POST STATUS:", r.status_code, flush=True)
+    print("GGSEL POST TEXT:", r.text[:3000], flush=True)
+
     r.raise_for_status()
     data = r.json()
 
@@ -250,22 +341,23 @@ def ggsel_post(path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(data.get("data"), (dict, list)):
             return data["data"]
         return data
+
     return {}
+
 
 def get_order_info(invoice_id: str) -> Dict[str, Any]:
     return ggsel_get(f"/api_sellers/api/purchase/info/{invoice_id}")
 
+
 def get_balance_info() -> Dict[str, Any]:
     return ggsel_get("/api_sellers/api/sellers/account/balance/info")
+
 
 def get_last_sales() -> Any:
     return ggsel_get("/api_sellers/api/seller-last-sales")
 
+
 def send_reply_to_buyer(debate_id: str, text: str) -> Dict[str, Any]:
-    """
-    Если у GGSEL другой путь/тело для отправки сообщения,
-    поправим только этот блок.
-    """
     payload_variants = [
         {"DebateId": debate_id, "Message": text},
         {"debate_id": debate_id, "message": text},
@@ -280,6 +372,7 @@ def send_reply_to_buyer(debate_id: str, text: str) -> Dict[str, Any]:
             last_error = e
 
     raise RuntimeError(f"Не удалось отправить ответ в GGSEL: {last_error}")
+
 
 # -------------------- Persistence --------------------
 
@@ -322,6 +415,7 @@ def upsert_order_from_api(order: Dict[str, Any], invoice_id: str):
     conn.commit()
     conn.close()
 
+
 def save_message(
     debate_id: str,
     invoice_id: str,
@@ -347,6 +441,7 @@ def save_message(
     conn.commit()
     conn.close()
 
+
 # -------------------- Queries --------------------
 
 def find_orders_by_text(query: str) -> List[sqlite3.Row]:
@@ -367,6 +462,7 @@ def find_orders_by_text(query: str) -> List[sqlite3.Row]:
     conn.close()
     return rows
 
+
 def get_order_local(invoice_id: str) -> Optional[sqlite3.Row]:
     conn = db()
     cur = conn.cursor()
@@ -374,6 +470,7 @@ def get_order_local(invoice_id: str) -> Optional[sqlite3.Row]:
     row = cur.fetchone()
     conn.close()
     return row
+
 
 def get_messages_for_order(invoice_id: str) -> List[sqlite3.Row]:
     conn = db()
@@ -388,6 +485,7 @@ def get_messages_for_order(invoice_id: str) -> List[sqlite3.Row]:
     conn.close()
     return rows
 
+
 def get_latest_debate_id_for_order(invoice_id: str) -> Optional[str]:
     conn = db()
     cur = conn.cursor()
@@ -401,6 +499,7 @@ def get_latest_debate_id_for_order(invoice_id: str) -> Optional[str]:
     row = cur.fetchone()
     conn.close()
     return row["debate_id"] if row else None
+
 
 def top_products() -> List[sqlite3.Row]:
     conn = db()
@@ -417,6 +516,7 @@ def top_products() -> List[sqlite3.Row]:
     conn.close()
     return rows
 
+
 def recent_negative_messages() -> List[sqlite3.Row]:
     conn = db()
     cur = conn.cursor()
@@ -431,6 +531,7 @@ def recent_negative_messages() -> List[sqlite3.Row]:
     conn.close()
     return rows
 
+
 # -------------------- Formatters --------------------
 
 def format_local_order(row: sqlite3.Row) -> str:
@@ -443,6 +544,7 @@ def format_local_order(row: sqlite3.Row) -> str:
         f"<b>Оплата:</b> {safe(row['payment_method'])}\n"
         f"<b>Сумма:</b> {safe(row['amount'])} {safe(row['currency_type'])}"
     )
+
 
 def sync_last_sales() -> str:
     data = get_last_sales()
@@ -464,11 +566,13 @@ def sync_last_sales() -> str:
         )
     return "\n".join(lines)
 
+
 # -------------------- Web routes --------------------
 
 @app.get("/")
 def home():
     return "OK", 200
+
 
 @app.get("/setup-telegram-webhook")
 def setup_telegram_webhook_route():
@@ -477,6 +581,7 @@ def setup_telegram_webhook_route():
         return jsonify(result), 200
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 @app.route("/ggsel", methods=["POST", "GET"])
 def ggsel_webhook():
@@ -500,8 +605,8 @@ def ggsel_webhook():
                 if isinstance(order, dict):
                     order["invoice_id"] = invoice_id
                     upsert_order_from_api(order, invoice_id)
-            except Exception:
-                pass
+            except Exception as e:
+                print("ORDER INFO ERROR:", repr(e), flush=True)
 
         save_message(debate_id, invoice_id, message_date, message, image_path)
 
@@ -548,13 +653,16 @@ def ggsel_webhook():
             )
             try:
                 send_photo(image_path, caption=caption)
-            except Exception:
+            except Exception as e:
+                print("SEND PHOTO ERROR:", repr(e), flush=True)
                 send_message(f"{caption}\n\n<b>Ссылка на изображение:</b>\n{safe(image_path)}")
 
         return jsonify({"ok": True}), 200
 
     except Exception as e:
+        print("GGSEL WEBHOOK ERROR:", traceback.format_exc(), flush=True)
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 # -------------------- Telegram command handlers --------------------
 
@@ -647,6 +755,7 @@ def handle_command(text: str):
                     upsert_order_from_api(order, invoice_id)
                 local = get_order_local(invoice_id)
             except Exception as e:
+                print("ORDER COMMAND ERROR:", traceback.format_exc(), flush=True)
                 send_message(f"Не удалось получить заказ {safe(invoice_id)}\n<code>{safe(e)}</code>")
                 return
 
@@ -696,6 +805,7 @@ def handle_command(text: str):
                 f"<b>Текст:</b>\n{safe(reply_text)}"
             )
         except Exception as e:
+            print("REPLY ERROR:", traceback.format_exc(), flush=True)
             send_message(
                 f"❌ Не удалось отправить ответ\n\n"
                 f"<b>Заказ:</b> {safe(invoice_id)}\n"
@@ -736,6 +846,7 @@ def handle_command(text: str):
                 f"<b>Текст:</b>\n{safe(template_text)}"
             )
         except Exception as e:
+            print("TPL ERROR:", traceback.format_exc(), flush=True)
             send_message(
                 f"❌ Не удалось отправить шаблон\n\n"
                 f"<b>Заказ:</b> {safe(invoice_id)}\n"
@@ -760,6 +871,7 @@ def handle_command(text: str):
             data = get_balance_info()
             send_message(f"<b>Баланс</b>\n\n<code>{safe(data)}</code>")
         except Exception as e:
+            print("BALANCE ERROR TRACE:", traceback.format_exc(), flush=True)
             send_message(f"Не удалось получить баланс\n<code>{safe(e)}</code>")
         return
 
@@ -767,6 +879,7 @@ def handle_command(text: str):
         try:
             send_message(sync_last_sales())
         except Exception as e:
+            print("SALES ERROR TRACE:", traceback.format_exc(), flush=True)
             send_message(f"Не удалось получить продажи\n<code>{safe(e)}</code>")
         return
 
@@ -789,6 +902,7 @@ def handle_command(text: str):
 
     send_message("Не понял команду. Нажми /help")
 
+
 # -------------------- Telegram webhook --------------------
 
 @app.post("/telegram")
@@ -796,7 +910,6 @@ def telegram_webhook():
     try:
         update = request.get_json(silent=True) or {}
 
-        # Главная защита: только владелец
         if not is_owner_telegram_update(update):
             return jsonify({"ok": True, "ignored": "not owner"}), 200
 
@@ -847,7 +960,9 @@ def telegram_webhook():
         return jsonify({"ok": True}), 200
 
     except Exception as e:
+        print("TELEGRAM WEBHOOK ERROR:", traceback.format_exc(), flush=True)
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 init_db()
 
