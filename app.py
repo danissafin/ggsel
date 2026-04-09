@@ -7,15 +7,17 @@ app = Flask(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-
-# Данные GGSEL API
-GGSEL_TOKEN = os.environ.get("GGSEL_TOKEN")  # если у тебя уже есть API token
-GGSEL_API_BASE = os.environ.get("GGSEL_API_BASE", "https://seller.ggsel.com")
+GGSEL_API_KEY = os.environ.get("GGSEL_API_KEY")
 
 if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError("BOT_TOKEN and CHAT_ID must be set")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+GGSEL_BASE = "https://seller.ggsel.com"
+
+
+def safe(value):
+    return html.escape(str(value)) if value not in (None, "") else "—"
 
 
 def send_message(text: str):
@@ -38,37 +40,34 @@ def send_photo(photo_url: str, caption: str = ""):
         "parse_mode": "HTML",
     }
     if caption:
-        payload["caption"] = caption[:1024]  # лимит caption у Telegram
+        payload["caption"] = caption[:1024]
     r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
 
 
 def get_order_info(invoice_id: str) -> dict:
-    """
-    Получаем подробности заказа по InvoiceId.
-    ВАЖНО:
-    Ниже header Authorization может отличаться в зависимости от того,
-    как именно GGSEL выдает токен в твоем кабинете/API.
-    Если что, подправим под твой формат.
-    """
-    if not GGSEL_TOKEN or not invoice_id:
+    if not GGSEL_API_KEY or not invoice_id:
         return {}
 
-    url = f"{GGSEL_API_BASE}/api_sellers/api/purchase/info/{invoice_id}"
+    url = f"{GGSEL_BASE}/api_sellers/api/purchase/info/{invoice_id}"
     headers = {
-        "Authorization": f"Bearer {GGSEL_TOKEN}",
         "Accept": "application/json",
+        "Authorization": f"Bearer {GGSEL_API_KEY}",
     }
 
     r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
-
     data = r.json()
-    return data.get("content", {}) if isinstance(data, dict) else {}
 
+    # На случай разных форматов ответа
+    if isinstance(data, dict):
+        if isinstance(data.get("content"), dict):
+            return data["content"]
+        if isinstance(data.get("data"), dict):
+            return data["data"]
+        return data
 
-def safe(value):
-    return html.escape(str(value)) if value not in (None, "") else "—"
+    return {}
 
 
 @app.get("/")
@@ -92,22 +91,21 @@ def ggsel_webhook():
         image_path = data.get("ImagePath", "")
 
         order = {}
-        try:
-            if invoice_id:
+        if invoice_id:
+            try:
                 order = get_order_info(str(invoice_id))
-        except Exception as api_error:
-            # если заказ не подтянулся — просто продолжаем без него
-            send_message(
-                f"⚠️ Не удалось получить детали заказа {safe(invoice_id)}\n"
-                f"<code>{safe(api_error)}</code>"
-            )
+            except Exception as e:
+                send_message(
+                    f"⚠️ Не удалось получить детали заказа {safe(invoice_id)}\n"
+                    f"<code>{safe(e)}</code>"
+                )
 
         product_name = order.get("name", "")
         buyer_info = order.get("buyer_info", {}) if isinstance(order.get("buyer_info"), dict) else {}
 
         buyer_email = buyer_info.get("email", "")
         buyer_account = buyer_info.get("account", "")
-        payment_method = buyer_info.get("payment_method", "")
+        payment_method = order.get("payment_method", "")
         amount = order.get("amount", "")
         currency_type = order.get("currency_type", "")
         purchase_date = order.get("purchase_date", "")
@@ -123,9 +121,9 @@ def ggsel_webhook():
             f"<b>Диалог:</b> {safe(debate_id)}\n"
             f"<b>Дата сообщения:</b> {safe(message_date)}\n"
             f"<b>Дата покупки:</b> {safe(purchase_date)}\n"
-            f"<b>Оплата:</b> {safe(payment_method)}\n"
+            f"<b>Способ оплаты:</b> {safe(payment_method)}\n"
             f"<b>Сумма:</b> {safe(amount)} {safe(currency_type)}\n\n"
-            f"<b>Текст:</b>\n{safe(message)}"
+            f"<b>Сообщение:</b>\n{safe(message)}"
         )
 
         send_message(text)
