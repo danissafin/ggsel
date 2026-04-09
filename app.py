@@ -14,15 +14,10 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")  # твой telegram user/chat id
 APP_URL = os.environ.get("APP_URL", "").rstrip("/")
 
-# Для GGSEL авторизации
-GGSEL_LOGIN = os.environ.get("GGSEL_LOGIN")
-GGSEL_PASSWORD = os.environ.get("GGSEL_PASSWORD")
-
 if not BOT_TOKEN or not CHAT_ID:
     raise RuntimeError("BOT_TOKEN and CHAT_ID must be set")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-GGSEL_BASE = "https://seller.ggsel.com"
 DB_PATH = "crm.sqlite3"
 
 NEGATIVE_PATTERNS = [
@@ -67,12 +62,24 @@ def init_db():
         product_name TEXT,
         buyer_email TEXT,
         buyer_account TEXT,
+        buyer_phone TEXT,
+        buyer_skype TEXT,
+        buyer_whatsapp TEXT,
+        buyer_ip_address TEXT,
+        payment_aggregator TEXT,
         amount TEXT,
         currency_type TEXT,
-        payment_method TEXT,
+        invoice_state TEXT,
         purchase_date TEXT,
+        date_pay TEXT,
         external_order_id TEXT,
         item_id TEXT,
+        content_id TEXT,
+        profit TEXT,
+        unique_code_state TEXT,
+        feedback_text TEXT,
+        feedback_type TEXT,
+        feedback_comment TEXT,
         raw_json TEXT,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -84,9 +91,17 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         debate_id TEXT,
         invoice_id TEXT,
+        message_id TEXT,
         message_date TEXT,
         message_text TEXT,
         image_path TEXT,
+        is_buyer INTEGER DEFAULT 0,
+        is_seller INTEGER DEFAULT 0,
+        is_file INTEGER DEFAULT 0,
+        is_img INTEGER DEFAULT 0,
+        filename TEXT,
+        file_url TEXT,
+        preview TEXT,
         is_negative INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
@@ -125,26 +140,20 @@ def is_owner_telegram_update(update: Dict[str, Any]) -> bool:
         message = cq.get("message", {}) or {}
         chat = message.get("chat", {}) or {}
 
-        from_id = str(from_user.get("id", ""))
-        chat_id = str(chat.get("id", ""))
-
-        return from_id == owner and chat_id == owner
+        return str(from_user.get("id", "")) == owner and str(chat.get("id", "")) == owner
 
     message = update.get("message", {}) or {}
     from_user = message.get("from", {}) or {}
     chat = message.get("chat", {}) or {}
 
-    from_id = str(from_user.get("id", ""))
-    chat_id = str(chat.get("id", ""))
-
-    return from_id == owner and chat_id == owner
+    return str(from_user.get("id", "")) == owner and str(chat.get("id", "")) == owner
 
 
 # -------------------- Telegram --------------------
 
 def tg_request(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{TELEGRAM_API}/{method}"
-    r = requests.post(url, json=payload, timeout=30)
+    r = requests.post(url, json=payload, timeout=20)
     r.raise_for_status()
     return r.json()
 
@@ -191,10 +200,6 @@ def main_menu():
     return {
         "inline_keyboard": [
             [
-                {"text": "📦 Последние продажи", "callback_data": "sales"},
-                {"text": "💰 Баланс", "callback_data": "balance"},
-            ],
-            [
                 {"text": "🏆 Топ товаров", "callback_data": "top"},
                 {"text": "🚨 Проблемные", "callback_data": "negative"},
             ],
@@ -223,261 +228,66 @@ def templates_menu():
     }
 
 
-# -------------------- GGSEL --------------------
-
-def extract_token_from_response(data: Any) -> Optional[str]:
-    if not isinstance(data, dict):
-        return None
-
-    for key in ("token", "access_token", "accessToken"):
-        if data.get(key):
-            return str(data[key])
-
-    for container_key in ("content", "data", "result"):
-        inner = data.get(container_key)
-        if isinstance(inner, dict):
-            for key in ("token", "access_token", "accessToken"):
-                if inner.get(key):
-                    return str(inner[key])
-
-    return None
-
-
-def get_seller_token() -> str:
-    if not GGSEL_LOGIN or not GGSEL_PASSWORD:
-        raise RuntimeError("GGSEL_LOGIN and GGSEL_PASSWORD must be set")
-
-    url = f"{GGSEL_BASE}/api_sellers/api/apilogin"
-
-    payload_variants = [
-        {"login": GGSEL_LOGIN, "password": GGSEL_PASSWORD},
-        {"username": GGSEL_LOGIN, "password": GGSEL_PASSWORD},
-        {"email": GGSEL_LOGIN, "password": GGSEL_PASSWORD},
-        {"Login": GGSEL_LOGIN, "Password": GGSEL_PASSWORD},
-        {"UserName": GGSEL_LOGIN, "Password": GGSEL_PASSWORD},
-        {"Email": GGSEL_LOGIN, "Password": GGSEL_PASSWORD},
-        {"name": GGSEL_LOGIN, "password": GGSEL_PASSWORD},
-        {"key": GGSEL_LOGIN, "password": GGSEL_PASSWORD},
-        {"api_key": GGSEL_LOGIN, "password": GGSEL_PASSWORD},
-    ]
-
-    last_error = None
-
-    for payload in payload_variants:
-        # JSON
-        try:
-            r = requests.post(url, json=payload, timeout=30)
-            print("APILOGIN MODE: json", flush=True)
-            print("APILOGIN URL:", url, flush=True)
-            print("APILOGIN PAYLOAD KEYS:", list(payload.keys()), flush=True)
-            print("APILOGIN STATUS:", r.status_code, flush=True)
-            print("APILOGIN TEXT:", r.text[:3000], flush=True)
-
-            if r.ok:
-                data = r.json()
-                token = extract_token_from_response(data)
-                if token:
-                    return token
-                last_error = RuntimeError(f"Token not found in JSON response: {data}")
-            else:
-                last_error = RuntimeError(f"JSON login failed: {r.status_code} {r.text[:500]}")
-        except Exception as e:
-            last_error = e
-            print("APILOGIN JSON ERROR:", repr(e), flush=True)
-
-        # FORM
-        try:
-            r = requests.post(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=30,
-            )
-            print("APILOGIN MODE: form-urlencoded", flush=True)
-            print("APILOGIN URL:", url, flush=True)
-            print("APILOGIN PAYLOAD KEYS:", list(payload.keys()), flush=True)
-            print("APILOGIN STATUS:", r.status_code, flush=True)
-            print("APILOGIN TEXT:", r.text[:3000], flush=True)
-
-            if r.ok:
-                data = r.json()
-                token = extract_token_from_response(data)
-                if token:
-                    return token
-                last_error = RuntimeError(f"Token not found in FORM response: {data}")
-            else:
-                last_error = RuntimeError(f"FORM login failed: {r.status_code} {r.text[:500]}")
-        except Exception as e:
-            last_error = e
-            print("APILOGIN FORM ERROR:", repr(e), flush=True)
-
-    raise RuntimeError(f"Could not get seller token: {last_error}")
-
-
-def ggsel_header_variants(token: str) -> List[Dict[str, str]]:
-    return [
-        {
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
-        {
-            "Accept": "application/json",
-            "authorization": f"Bearer {token}",
-        },
-        {
-            "Accept": "application/json",
-            "X-API-KEY": token,
-        },
-        {
-            "Accept": "application/json",
-            "Api-Key": token,
-        },
-        {
-            "Accept": "application/json",
-            "token": token,
-        },
-    ]
-
-
-def normalize_ggsel_response(data: Any) -> Any:
-    if isinstance(data, dict):
-        if isinstance(data.get("content"), (dict, list)):
-            return data["content"]
-        if isinstance(data.get("data"), (dict, list)):
-            return data["data"]
-        if isinstance(data.get("result"), (dict, list)):
-            return data["result"]
-        return data
-    return data
-
-
-def ggsel_get(path: str) -> Any:
-    token = get_seller_token()
-    url = f"{GGSEL_BASE}{path}"
-
-    last_error = None
-
-    for headers in ggsel_header_variants(token):
-        try:
-            r = requests.get(url, headers=headers, timeout=30)
-
-            print("GGSEL GET URL:", url, flush=True)
-            print("GGSEL GET HEADERS:", headers, flush=True)
-            print("GGSEL GET STATUS:", r.status_code, flush=True)
-            print("GGSEL GET TEXT:", r.text[:3000], flush=True)
-
-            r.raise_for_status()
-            data = r.json()
-            return normalize_ggsel_response(data)
-
-        except Exception as e:
-            last_error = e
-            print("GGSEL GET ERROR:", repr(e), flush=True)
-
-    raise RuntimeError(f"GGSEL GET failed: {last_error}")
-
-
-def ggsel_post(path: str, payload: Dict[str, Any]) -> Any:
-    token = get_seller_token()
-    url = f"{GGSEL_BASE}{path}"
-
-    last_error = None
-
-    for headers in ggsel_header_variants(token):
-        # JSON
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=30)
-
-            print("GGSEL POST MODE: json", flush=True)
-            print("GGSEL POST URL:", url, flush=True)
-            print("GGSEL POST HEADERS:", headers, flush=True)
-            print("GGSEL POST PAYLOAD:", str(payload)[:2000], flush=True)
-            print("GGSEL POST STATUS:", r.status_code, flush=True)
-            print("GGSEL POST TEXT:", r.text[:3000], flush=True)
-
-            r.raise_for_status()
-            data = r.json()
-            return normalize_ggsel_response(data)
-
-        except Exception as e:
-            last_error = e
-            print("GGSEL POST JSON ERROR:", repr(e), flush=True)
-
-        # FORM
-        try:
-            form_headers = dict(headers)
-            form_headers["Content-Type"] = "application/x-www-form-urlencoded"
-            r = requests.post(url, headers=form_headers, data=payload, timeout=30)
-
-            print("GGSEL POST MODE: form-urlencoded", flush=True)
-            print("GGSEL POST URL:", url, flush=True)
-            print("GGSEL POST HEADERS:", form_headers, flush=True)
-            print("GGSEL POST PAYLOAD:", str(payload)[:2000], flush=True)
-            print("GGSEL POST STATUS:", r.status_code, flush=True)
-            print("GGSEL POST TEXT:", r.text[:3000], flush=True)
-
-            r.raise_for_status()
-            data = r.json()
-            return normalize_ggsel_response(data)
-
-        except Exception as e:
-            last_error = e
-            print("GGSEL POST FORM ERROR:", repr(e), flush=True)
-
-    raise RuntimeError(f"GGSEL POST failed: {last_error}")
-
-
-def get_order_info(invoice_id: str) -> Any:
-    return ggsel_get(f"/api_sellers/api/purchase/info/{invoice_id}")
-
-
-def get_balance_info() -> Any:
-    return ggsel_get("/api_sellers/api/sellers/account/balance/info")
-
-
-def get_last_sales() -> Any:
-    return ggsel_get("/api_sellers/api/seller-last-sales")
-
-
-def send_reply_to_buyer(debate_id: str, text: str) -> Any:
-    payload_variants = [
-        {"DebateId": debate_id, "Message": text},
-        {"debate_id": debate_id, "message": text},
-        {"id": debate_id, "text": text},
-    ]
-
-    last_error = None
-    for payload in payload_variants:
-        try:
-            return ggsel_post("/api_sellers/api/debates/v2/chats", payload)
-        except Exception as e:
-            last_error = e
-
-    raise RuntimeError(f"Не удалось отправить ответ в GGSEL: {last_error}")
-
-
 # -------------------- Persistence --------------------
 
-def upsert_order_from_api(order: Dict[str, Any], invoice_id: str):
+def upsert_order_from_webhook(invoice_id: str, raw: Dict[str, Any]):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO orders (
+            invoice_id, raw_json, updated_at
+        ) VALUES (?, ?, ?)
+        ON CONFLICT(invoice_id) DO UPDATE SET
+            raw_json=excluded.raw_json,
+            updated_at=excluded.updated_at
+    """, (
+        str(invoice_id),
+        str(raw),
+        now_iso(),
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def upsert_order_from_api_shape(order: Dict[str, Any], invoice_id: str):
     buyer_info = order.get("buyer_info", {}) if isinstance(order.get("buyer_info"), dict) else {}
+    feedback = order.get("feedback", {}) if isinstance(order.get("feedback"), dict) else {}
 
     conn = db()
     cur = conn.cursor()
+
     cur.execute("""
         INSERT INTO orders (
-            invoice_id, product_name, buyer_email, buyer_account, amount, currency_type,
-            payment_method, purchase_date, external_order_id, item_id, raw_json, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            invoice_id, product_name, buyer_email, buyer_account, buyer_phone,
+            buyer_skype, buyer_whatsapp, buyer_ip_address, payment_aggregator,
+            amount, currency_type, invoice_state, purchase_date, date_pay,
+            external_order_id, item_id, content_id, profit, unique_code_state,
+            feedback_text, feedback_type, feedback_comment, raw_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(invoice_id) DO UPDATE SET
             product_name=excluded.product_name,
             buyer_email=excluded.buyer_email,
             buyer_account=excluded.buyer_account,
+            buyer_phone=excluded.buyer_phone,
+            buyer_skype=excluded.buyer_skype,
+            buyer_whatsapp=excluded.buyer_whatsapp,
+            buyer_ip_address=excluded.buyer_ip_address,
+            payment_aggregator=excluded.payment_aggregator,
             amount=excluded.amount,
             currency_type=excluded.currency_type,
-            payment_method=excluded.payment_method,
+            invoice_state=excluded.invoice_state,
             purchase_date=excluded.purchase_date,
+            date_pay=excluded.date_pay,
             external_order_id=excluded.external_order_id,
             item_id=excluded.item_id,
+            content_id=excluded.content_id,
+            profit=excluded.profit,
+            unique_code_state=excluded.unique_code_state,
+            feedback_text=excluded.feedback_text,
+            feedback_type=excluded.feedback_type,
+            feedback_comment=excluded.feedback_comment,
             raw_json=excluded.raw_json,
             updated_at=excluded.updated_at
     """, (
@@ -485,15 +295,28 @@ def upsert_order_from_api(order: Dict[str, Any], invoice_id: str):
         str(order.get("name", "") or ""),
         str(buyer_info.get("email", "") or ""),
         str(buyer_info.get("account", "") or ""),
+        str(buyer_info.get("phone", "") or ""),
+        str(buyer_info.get("skype", "") or ""),
+        str(buyer_info.get("whatsapp", "") or ""),
+        str(buyer_info.get("ip_address", "") or ""),
+        str(buyer_info.get("payment_aggregator", "") or ""),
         str(order.get("amount", "") or ""),
         str(order.get("currency_type", "") or ""),
-        str(order.get("payment_method", "") or ""),
+        str(order.get("invoice_state", "") or ""),
         str(order.get("purchase_date", "") or ""),
+        str(order.get("date_pay", "") or ""),
         str(order.get("external_order_id", "") or ""),
         str(order.get("item_id", "") or ""),
+        str(order.get("content_id", "") or ""),
+        str(order.get("profit", "") or ""),
+        str(order.get("unique_code_state", "") or ""),
+        str(feedback.get("feedback", "") or ""),
+        str(feedback.get("feedback_type", "") or ""),
+        str(feedback.get("comment", "") or ""),
         str(order),
         now_iso(),
     ))
+
     conn.commit()
     conn.close()
 
@@ -504,22 +327,43 @@ def save_message(
     message_date: str,
     message_text: str,
     image_path: str,
+    message_id: str = "",
+    is_buyer: int = 0,
+    is_seller: int = 0,
+    is_file: int = 0,
+    is_img: int = 0,
+    filename: str = "",
+    file_url: str = "",
+    preview: str = "",
 ):
     negative = 1 if is_negative_text(message_text) else 0
 
     conn = db()
     cur = conn.cursor()
+
     cur.execute("""
-        INSERT INTO messages (debate_id, invoice_id, message_date, message_text, image_path, is_negative)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO messages (
+            debate_id, invoice_id, message_id, message_date, message_text, image_path,
+            is_buyer, is_seller, is_file, is_img, filename, file_url, preview, is_negative
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         str(debate_id or ""),
         str(invoice_id or ""),
+        str(message_id or ""),
         str(message_date or ""),
         str(message_text or ""),
         str(image_path or ""),
+        int(is_buyer or 0),
+        int(is_seller or 0),
+        int(is_file or 0),
+        int(is_img or 0),
+        str(filename or ""),
+        str(file_url or ""),
+        str(preview or ""),
         negative,
     ))
+
     conn.commit()
     conn.close()
 
@@ -531,15 +375,16 @@ def find_orders_by_text(query: str) -> List[sqlite3.Row]:
     cur = conn.cursor()
     like = f"%{query.lower()}%"
     cur.execute("""
-        SELECT o.invoice_id, o.product_name, o.buyer_email, o.buyer_account,
-               o.amount, o.currency_type, o.purchase_date
-        FROM orders o
-        WHERE lower(coalesce(o.product_name, '')) LIKE ?
-           OR lower(coalesce(o.buyer_email, '')) LIKE ?
-           OR lower(coalesce(o.buyer_account, '')) LIKE ?
-        ORDER BY o.updated_at DESC
+        SELECT invoice_id, product_name, buyer_email, buyer_account,
+               amount, currency_type, purchase_date, invoice_state
+        FROM orders
+        WHERE lower(coalesce(product_name, '')) LIKE ?
+           OR lower(coalesce(buyer_email, '')) LIKE ?
+           OR lower(coalesce(buyer_account, '')) LIKE ?
+           OR lower(coalesce(external_order_id, '')) LIKE ?
+        ORDER BY updated_at DESC
         LIMIT 15
-    """, (like, like, like))
+    """, (like, like, like, like))
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -558,7 +403,8 @@ def get_messages_for_order(invoice_id: str) -> List[sqlite3.Row]:
     conn = db()
     cur = conn.cursor()
     cur.execute("""
-        SELECT * FROM messages
+        SELECT *
+        FROM messages
         WHERE invoice_id = ?
         ORDER BY id DESC
         LIMIT 10
@@ -617,36 +463,31 @@ def recent_negative_messages() -> List[sqlite3.Row]:
 # -------------------- Formatters --------------------
 
 def format_local_order(row: sqlite3.Row) -> str:
-    return (
-        f"<b>Товар:</b> {safe(row['product_name'])}\n"
-        f"<b>Почта:</b> {safe(row['buyer_email'])}\n"
-        f"<b>Аккаунт:</b> {safe(row['buyer_account'])}\n"
-        f"<b>Заказ:</b> {safe(row['invoice_id'])}\n"
-        f"<b>Дата покупки:</b> {safe(row['purchase_date'])}\n"
-        f"<b>Оплата:</b> {safe(row['payment_method'])}\n"
-        f"<b>Сумма:</b> {safe(row['amount'])} {safe(row['currency_type'])}"
-    )
-
-
-def sync_last_sales() -> str:
-    data = get_last_sales()
-    items = data if isinstance(data, list) else data.get("items", []) if isinstance(data, dict) else []
-    if not isinstance(items, list):
-        items = []
-
-    lines = ["<b>Последние продажи</b>\n"]
-    if not items:
-        lines.append("Нет данных.")
-        return "\n".join(lines)
-
-    for item in items[:10]:
-        lines.append(
-            f"• {safe(item.get('name') or item.get('product_name'))}\n"
-            f"  Заказ: {safe(item.get('invoice_id') or item.get('invoiceId'))}\n"
-            f"  Сумма: {safe(item.get('amount'))} {safe(item.get('currency_type'))}\n"
-            f"  Дата: {safe(item.get('purchase_date'))}\n"
-        )
-    return "\n".join(lines)
+    parts = [
+        f"<b>Товар:</b> {safe(row['product_name'])}",
+        f"<b>Заказ:</b> {safe(row['invoice_id'])}",
+        f"<b>Внешний ID:</b> {safe(row['external_order_id'])}",
+        f"<b>Статус:</b> {safe(row['invoice_state'])}",
+        f"<b>Дата покупки:</b> {safe(row['purchase_date'])}",
+        f"<b>Дата оплаты:</b> {safe(row['date_pay'])}",
+        f"<b>Сумма:</b> {safe(row['amount'])} {safe(row['currency_type'])}",
+        f"<b>Прибыль:</b> {safe(row['profit'])}",
+        f"<b>Item ID:</b> {safe(row['item_id'])}",
+        f"<b>Content ID:</b> {safe(row['content_id'])}",
+        "",
+        f"<b>Почта:</b> {safe(row['buyer_email'])}",
+        f"<b>Аккаунт:</b> {safe(row['buyer_account'])}",
+        f"<b>Телефон:</b> {safe(row['buyer_phone'])}",
+        f"<b>Skype:</b> {safe(row['buyer_skype'])}",
+        f"<b>WhatsApp:</b> {safe(row['buyer_whatsapp'])}",
+        f"<b>IP:</b> {safe(row['buyer_ip_address'])}",
+        f"<b>Агрегатор оплаты:</b> {safe(row['payment_aggregator'])}",
+        "",
+        f"<b>Отзыв:</b> {safe(row['feedback_text'])}",
+        f"<b>Тип отзыва:</b> {safe(row['feedback_type'])}",
+        f"<b>Комментарий:</b> {safe(row['feedback_comment'])}",
+    ]
+    return "\n".join(parts)
 
 
 # -------------------- Web routes --------------------
@@ -679,45 +520,31 @@ def ggsel_webhook():
         message = str(data.get("Message", "") or "")
         invoice_id = str(data.get("InvoiceId", "") or "")
         image_path = str(data.get("ImagePath", "") or "")
+        message_id = str(data.get("MessageId", "") or "")
 
-        order = {}
         if invoice_id:
-            try:
-                raw_order = get_order_info(invoice_id)
-                if isinstance(raw_order, dict):
-                    order = raw_order
-                    order["invoice_id"] = invoice_id
-                    upsert_order_from_api(order, invoice_id)
-            except Exception as e:
-                print("ORDER INFO ERROR:", repr(e), flush=True)
+            upsert_order_from_webhook(invoice_id, data)
 
-        save_message(debate_id, invoice_id, message_date, message, image_path)
-
-        buyer_info = order.get("buyer_info", {}) if isinstance(order.get("buyer_info"), dict) else {}
-        product_name = order.get("name", "")
-        buyer_email = buyer_info.get("email", "")
-        buyer_account = buyer_info.get("account", "")
-        amount = order.get("amount", "")
-        currency_type = order.get("currency_type", "")
-        payment_method = order.get("payment_method", "")
-        purchase_date = order.get("purchase_date", "")
-        external_order_id = order.get("external_order_id", "")
+        save_message(
+            debate_id=debate_id,
+            invoice_id=invoice_id,
+            message_date=message_date,
+            message_text=message,
+            image_path=image_path,
+            message_id=message_id,
+            is_buyer=1,
+            is_img=1 if image_path else 0,
+            preview=image_path,
+        )
 
         danger = "🚨 <b>ПРОБЛЕМНОЕ СООБЩЕНИЕ</b>\n\n" if is_negative_text(message) else ""
 
         text = (
             f"{danger}"
             "📩 <b>Новое сообщение с GGSEL</b>\n\n"
-            f"<b>Товар:</b> {safe(product_name)}\n"
-            f"<b>Почта покупателя:</b> {safe(buyer_email)}\n"
-            f"<b>Аккаунт покупателя:</b> {safe(buyer_account)}\n"
             f"<b>Заказ:</b> {safe(invoice_id)}\n"
-            f"<b>Внешний ID:</b> {safe(external_order_id)}\n"
             f"<b>Диалог:</b> {safe(debate_id)}\n"
-            f"<b>Дата сообщения:</b> {safe(message_date)}\n"
-            f"<b>Дата покупки:</b> {safe(purchase_date)}\n"
-            f"<b>Оплата:</b> {safe(payment_method)}\n"
-            f"<b>Сумма:</b> {safe(amount)} {safe(currency_type)}\n\n"
+            f"<b>Дата сообщения:</b> {safe(message_date)}\n\n"
             f"<b>Сообщение:</b>\n{safe(message)}"
         )
 
@@ -727,17 +554,13 @@ def ggsel_webhook():
             caption = (
                 ("🚨 Проблемное сообщение\n\n" if is_negative_text(message) else "")
                 + "🖼 <b>Изображение от покупателя</b>\n\n"
-                + f"<b>Товар:</b> {safe(product_name)}\n"
-                + f"<b>Почта:</b> {safe(buyer_email)}\n"
-                + f"<b>Аккаунт:</b> {safe(buyer_account)}\n"
                 + f"<b>Заказ:</b> {safe(invoice_id)}\n"
                 + f"<b>Диалог:</b> {safe(debate_id)}\n"
                 + f"<b>Дата:</b> {safe(message_date)}"
             )
             try:
                 send_photo(image_path, caption=caption)
-            except Exception as e:
-                print("SEND PHOTO ERROR:", repr(e), flush=True)
+            except Exception:
                 send_message(f"{caption}\n\n<b>Ссылка на изображение:</b>\n{safe(image_path)}")
 
         return jsonify({"ok": True}), 200
@@ -747,7 +570,7 @@ def ggsel_webhook():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
-# -------------------- Telegram command handlers --------------------
+# -------------------- Telegram commands --------------------
 
 def handle_command(text: str):
     text = (text or "").strip()
@@ -759,12 +582,11 @@ def handle_command(text: str):
             "/find слово — поиск по товару/email\n"
             "/order 123456 — карточка заказа\n"
             "/user email@example.com — поиск по покупателю\n"
-            "/reply 123456 текст — ответ покупателю\n"
-            "/tpl 123456 instruction — шаблонный ответ\n"
             "/top — топ товаров\n"
-            "/balance — баланс\n"
-            "/sales — последние продажи\n"
-            "/negative — проблемные сообщения",
+            "/negative — проблемные сообщения\n"
+            "/balance — временно отключено\n"
+            "/sales — временно отключено\n"
+            "/reply — временно отключено",
             reply_markup=main_menu()
         )
         return
@@ -775,16 +597,9 @@ def handle_command(text: str):
             "/find windows\n"
             "/order 123456\n"
             "/user buyer@mail.com\n"
-            "/reply 123456 Здравствуйте! Проверьте инструкцию.\n"
-            "/tpl 123456 instruction\n"
-            "/tpl 123456 replace\n"
-            "/tpl 123456 wait\n"
-            "/tpl 123456 photo\n"
-            "/tpl 123456 details\n"
             "/top\n"
-            "/balance\n"
-            "/sales\n"
-            "/negative"
+            "/negative\n\n"
+            "GGSEL API-команды пока отключены, чтобы бот работал стабильно."
         )
         return
 
@@ -802,6 +617,7 @@ def handle_command(text: str):
                 f"  Заказ: {safe(row['invoice_id'])}\n"
                 f"  Почта: {safe(row['buyer_email'])}\n"
                 f"  Аккаунт: {safe(row['buyer_account'])}\n"
+                f"  Статус: {safe(row['invoice_state'])}\n"
                 f"  Сумма: {safe(row['amount'])} {safe(row['currency_type'])}\n"
                 f"  Дата: {safe(row['purchase_date'])}\n"
             )
@@ -820,6 +636,7 @@ def handle_command(text: str):
             lines.append(
                 f"• {safe(row['product_name'])}\n"
                 f"  Заказ: {safe(row['invoice_id'])}\n"
+                f"  Статус: {safe(row['invoice_state'])}\n"
                 f"  Сумма: {safe(row['amount'])} {safe(row['currency_type'])}\n"
                 f"  Дата: {safe(row['purchase_date'])}\n"
             )
@@ -831,19 +648,7 @@ def handle_command(text: str):
         local = get_order_local(invoice_id)
 
         if not local:
-            try:
-                raw_order = get_order_info(invoice_id)
-                if isinstance(raw_order, dict):
-                    raw_order["invoice_id"] = invoice_id
-                    upsert_order_from_api(raw_order, invoice_id)
-                local = get_order_local(invoice_id)
-            except Exception as e:
-                print("ORDER COMMAND ERROR:", traceback.format_exc(), flush=True)
-                send_message(f"Не удалось получить заказ {safe(invoice_id)}\n<code>{safe(e)}</code>")
-                return
-
-        if not local:
-            send_message(f"Заказ не найден: <b>{safe(invoice_id)}</b>")
+            send_message(f"Заказ не найден локально: <b>{safe(invoice_id)}</b>")
             return
 
         msgs = get_messages_for_order(invoice_id)
@@ -851,90 +656,42 @@ def handle_command(text: str):
 
         debate_id = get_latest_debate_id_for_order(invoice_id)
         if debate_id:
-            lines.append(f"<b>DebateId:</b> {safe(debate_id)}\n")
+            lines.append(f"\n<b>DebateId:</b> {safe(debate_id)}\n")
 
         if msgs:
             lines.append("<b>Последние сообщения:</b>")
             for m in msgs[:5]:
-                body = m["message_text"] or "[изображение]"
+                body = m["message_text"] or "[файл/изображение]"
+                flags = []
+                if m["is_buyer"]:
+                    flags.append("buyer")
+                if m["is_seller"]:
+                    flags.append("seller")
+                if m["is_img"]:
+                    flags.append("img")
+                if m["is_file"]:
+                    flags.append("file")
+
+                suffix = f" ({', '.join(flags)})" if flags else ""
                 lines.append(
-                    f"• {safe(m['message_date'])}\n"
+                    f"• {safe(m['message_date'])}{suffix}\n"
                     f"  {safe(body)}"
                 )
+
+                if m["filename"]:
+                    lines.append(f"  Файл: {safe(m['filename'])}")
+                if m["file_url"]:
+                    lines.append(f"  URL: {safe(m['file_url'])}")
 
         send_message("\n".join(lines))
         return
 
     if text.startswith("/reply "):
-        parts = text.split(maxsplit=2)
-        if len(parts) < 3:
-            send_message("Формат: <code>/reply НОМЕР_ЗАКАЗА текст ответа</code>")
-            return
-
-        invoice_id = parts[1].strip()
-        reply_text = parts[2].strip()
-
-        debate_id = get_latest_debate_id_for_order(invoice_id)
-        if not debate_id:
-            send_message(f"Не найден debate_id для заказа <b>{safe(invoice_id)}</b>")
-            return
-
-        try:
-            send_reply_to_buyer(debate_id, reply_text)
-            send_message(
-                f"✅ Ответ отправлен\n\n"
-                f"<b>Заказ:</b> {safe(invoice_id)}\n"
-                f"<b>Диалог:</b> {safe(debate_id)}\n"
-                f"<b>Текст:</b>\n{safe(reply_text)}"
-            )
-        except Exception as e:
-            print("REPLY ERROR:", traceback.format_exc(), flush=True)
-            send_message(
-                f"❌ Не удалось отправить ответ\n\n"
-                f"<b>Заказ:</b> {safe(invoice_id)}\n"
-                f"<b>Диалог:</b> {safe(debate_id)}\n"
-                f"<code>{safe(e)}</code>"
-            )
+        send_message("Отправка ответа в GGSEL пока отключена, пока не будет точной авторизации API.")
         return
 
     if text.startswith("/tpl "):
-        parts = text.split(maxsplit=2)
-        if len(parts) < 3:
-            send_message("Формат: <code>/tpl НОМЕР_ЗАКАЗА template_name</code>")
-            return
-
-        invoice_id = parts[1].strip()
-        template_name = parts[2].strip().lower()
-
-        template_text = REPLY_TEMPLATES.get(template_name)
-        if not template_text:
-            send_message(
-                "Неизвестный шаблон.\n\n"
-                "Доступно:\n"
-                "instruction\nreplace\nwait\nphoto\ndetails"
-            )
-            return
-
-        debate_id = get_latest_debate_id_for_order(invoice_id)
-        if not debate_id:
-            send_message(f"Не найден debate_id для заказа <b>{safe(invoice_id)}</b>")
-            return
-
-        try:
-            send_reply_to_buyer(debate_id, template_text)
-            send_message(
-                f"✅ Шаблон отправлен\n\n"
-                f"<b>Заказ:</b> {safe(invoice_id)}\n"
-                f"<b>Шаблон:</b> {safe(template_name)}\n"
-                f"<b>Текст:</b>\n{safe(template_text)}"
-            )
-        except Exception as e:
-            print("TPL ERROR:", traceback.format_exc(), flush=True)
-            send_message(
-                f"❌ Не удалось отправить шаблон\n\n"
-                f"<b>Заказ:</b> {safe(invoice_id)}\n"
-                f"<code>{safe(e)}</code>"
-            )
+        send_message("Шаблонные ответы в GGSEL пока отключены, пока не будет точной авторизации API.")
         return
 
     if text == "/top":
@@ -950,20 +707,11 @@ def handle_command(text: str):
         return
 
     if text == "/balance":
-        try:
-            data = get_balance_info()
-            send_message(f"<b>Баланс</b>\n\n<code>{safe(data)}</code>")
-        except Exception as e:
-            print("BALANCE ERROR TRACE:", traceback.format_exc(), flush=True)
-            send_message(f"Не удалось получить баланс\n<code>{safe(e)}</code>")
+        send_message("Команда временно отключена: GGSEL API авторизация ещё не настроена.")
         return
 
     if text == "/sales":
-        try:
-            send_message(sync_last_sales())
-        except Exception as e:
-            print("SALES ERROR TRACE:", traceback.format_exc(), flush=True)
-            send_message(f"Не удалось получить продажи\n<code>{safe(e)}</code>")
+        send_message("Команда временно отключена: GGSEL API авторизация ещё не настроена.")
         return
 
     if text == "/negative":
@@ -1004,32 +752,22 @@ def telegram_webhook():
             if callback_id:
                 answer_callback(callback_id, "Открываю…")
 
-            if data == "balance":
-                handle_command("/balance")
-            elif data == "sales":
-                handle_command("/sales")
-            elif data == "top":
+            if data == "top":
                 handle_command("/top")
             elif data == "negative":
                 handle_command("/negative")
             elif data == "templates":
                 send_message(
-                    "Шаблоны быстрых ответов:\n\n"
-                    "Используй так:\n"
-                    "<code>/tpl НОМЕР_ЗАКАЗА instruction</code>\n"
-                    "<code>/tpl НОМЕР_ЗАКАЗА replace</code>\n"
-                    "<code>/tpl НОМЕР_ЗАКАЗА wait</code>\n"
-                    "<code>/tpl НОМЕР_ЗАКАЗА photo</code>\n"
-                    "<code>/tpl НОМЕР_ЗАКАЗА details</code>",
+                    "Шаблоны быстрых ответов сохранены, но отправка в GGSEL пока выключена.\n\n"
+                    "Доступно:\n"
+                    "instruction\nreplace\nwait\nphoto\ndetails",
                     reply_markup=templates_menu()
                 )
             elif data.startswith("tpl:"):
                 template_name = data.split(":", 1)[1]
                 send_message(
                     f"Шаблон <b>{safe(template_name)}</b>\n\n"
-                    f"Используй команду:\n"
-                    f"<code>/tpl НОМЕР_ЗАКАЗА {safe(template_name)}</code>\n\n"
-                    f"Текст шаблона:\n{safe(REPLY_TEMPLATES.get(template_name, ''))}"
+                    f"Текст:\n{safe(REPLY_TEMPLATES.get(template_name, ''))}"
                 )
 
             return jsonify({"ok": True}), 200
