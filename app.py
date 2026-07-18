@@ -1,791 +1,1742 @@
-import os
+from __future__ import annotations
+
+import hashlib
 import html
+import json
+import logging
+import os
+import secrets
 import sqlite3
-import traceback
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Iterable, Optional
 
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 
-app = Flask(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")  # твой telegram user/chat id
+# ============================================================
+# Configuration
+# ============================================================
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+OWNER_ID = os.environ.get("OWNER_ID", os.environ.get("CHAT_ID", "")).strip()
 APP_URL = os.environ.get("APP_URL", "").rstrip("/")
 
-if not BOT_TOKEN or not CHAT_ID:
-    raise RuntimeError("BOT_TOKEN and CHAT_ID must be set")
+GGSEL_SELLER_ID = os.environ.get("GGSEL_SELLER_ID", "").strip()
+GGSEL_API_KEY = os.environ.get("GGSEL_API_KEY", "").strip()
+GGSEL_BASE_URL = os.environ.get("GGSEL_BASE_URL", "https://seller.ggsel.com").rstrip("/")
+
+DB_PATH = os.environ.get("DB_PATH", "/data/ggsel_bot.sqlite3")
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "15"))
+RECEIPTS_MAX_PAGES = int(os.environ.get("RECEIPTS_MAX_PAGES", "15"))
+
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
+GGSEL_WEBHOOK_SECRET = os.environ.get("GGSEL_WEBHOOK_SECRET", "").strip()
+SETUP_SECRET = os.environ.get("SETUP_SECRET", "").strip()
+
+if not BOT_TOKEN or not OWNER_ID:
+    raise RuntimeError("BOT_TOKEN and OWNER_ID (or CHAT_ID) must be set")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-DB_PATH = "crm.sqlite3"
 
-NEGATIVE_PATTERNS = [
-    "не работает",
-    "не пришло",
-    "обман",
-    "верните деньги",
-    "возврат",
-    "refund",
-    "scam",
-    "bad",
-    "problem",
-    "ошибка",
-    "не могу",
-    "не получается",
-]
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("ggsel-bot")
 
-REPLY_TEMPLATES = {
-    "instruction": "Здравствуйте! Отправляю инструкцию. Выполните, пожалуйста, все шаги по порядку и напишите результат.",
-    "replace": "Здравствуйте! Сейчас проверю ситуацию. Если проблема подтвердится, выдам замену.",
-    "wait": "Здравствуйте! Принял ваш запрос. Пожалуйста, ожидайте, я проверяю информацию.",
-    "photo": "Здравствуйте! Пожалуйста, отправьте фото или скриншот ошибки, чтобы я быстрее помог.",
-    "details": "Здравствуйте! Уточните, пожалуйста, в чем именно проблема: что вы делаете и на каком шаге возникает ошибка?",
-}
+app = Flask(__name__)
+executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bot-worker")
 
 
-# -------------------- DB --------------------
+# ============================================================
+# Errors and helpers
+# ============================================================
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+
+class APIError(RuntimeError):
+    def __init__(self, service: str, status: int, message: str, payload: Any = None):
+        super().__init__(f"{service}: HTTP {status}: {message}")
+        self.service = service
+        self.status = status
+        self.payload = payload
+
+
+def safe(value: Any) -> str:
+    if value is None or value == "":
+        return "—"
+    return html.escape(str(value))
+
+
+def as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return default
+
+
+def compact_json(value: Any, limit: int = 3500) -> str:
+    text = json.dumps(value, ensure_ascii=False, indent=2, default=str)
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text
+
+
+def parse_json_argument(text: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Некорректный JSON: {exc.msg}, позиция {exc.pos}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("JSON должен быть объектом {...}")
+    return parsed
+
+
+def parse_id_list(value: str) -> list[int]:
+    result: list[int] = []
+    for part in value.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        item = int(part)
+        if item <= 0:
+            raise ValueError("ID должен быть положительным числом")
+        result.append(item)
+    if not result:
+        raise ValueError("Не указано ни одного ID")
+    # preserve order, remove duplicates
+    return list(dict.fromkeys(result))
+
+
+def parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    text = str(value).strip()
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def extract_list(data: Any, preferred: Iterable[str] = ()) -> list[Any]:
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+
+    keys = list(preferred) + [
+        "items",
+        "rows",
+        "offers",
+        "products",
+        "sales",
+        "reviews",
+        "category",
+        "categories",
+        "data",
+        "content",
+        "result",
+    ]
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = extract_list(value, preferred)
+            if nested:
+                return nested
+    return []
+
+
+def unwrap_v1(data: Any) -> Any:
+    if isinstance(data, dict) and "content" in data:
+        return data["content"]
+    return data
+
+
+def run_background(func, *args) -> None:
+    future = executor.submit(func, *args)
+
+    def done_callback(done):
+        try:
+            done.result()
+        except Exception:
+            logger.exception("Background task failed")
+
+    future.add_done_callback(done_callback)
+
+
+# ============================================================
+# SQLite
+# ============================================================
+
+
+def db_connect() -> sqlite3.Connection:
+    directory = os.path.dirname(DB_PATH)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=20, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
 
-def init_db():
-    conn = db()
-    cur = conn.cursor()
+def init_db() -> None:
+    with db_connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS webhook_events (
+                event_key TEXT PRIMARY KEY,
+                received_at TEXT NOT NULL
+            );
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS orders (
-        invoice_id TEXT PRIMARY KEY,
-        product_name TEXT,
-        buyer_email TEXT,
-        buyer_account TEXT,
-        buyer_phone TEXT,
-        buyer_skype TEXT,
-        buyer_whatsapp TEXT,
-        buyer_ip_address TEXT,
-        payment_aggregator TEXT,
-        amount TEXT,
-        currency_type TEXT,
-        invoice_state TEXT,
-        purchase_date TEXT,
-        date_pay TEXT,
-        external_order_id TEXT,
-        item_id TEXT,
-        content_id TEXT,
-        profit TEXT,
-        unique_code_state TEXT,
-        feedback_text TEXT,
-        feedback_type TEXT,
-        feedback_comment TEXT,
-        raw_json TEXT,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
+            CREATE TABLE IF NOT EXISTS orders (
+                invoice_id TEXT PRIMARY KEY,
+                item_id TEXT,
+                product_name TEXT,
+                buyer_email TEXT,
+                buyer_account TEXT,
+                buyer_phone TEXT,
+                amount REAL,
+                currency TEXT,
+                profit REAL,
+                invoice_state INTEGER,
+                purchase_date TEXT,
+                date_pay TEXT,
+                external_order_id TEXT,
+                raw_json TEXT,
+                updated_at TEXT NOT NULL
+            );
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        debate_id TEXT,
-        invoice_id TEXT,
-        message_id TEXT,
-        message_date TEXT,
-        message_text TEXT,
-        image_path TEXT,
-        is_buyer INTEGER DEFAULT 0,
-        is_seller INTEGER DEFAULT 0,
-        is_file INTEGER DEFAULT 0,
-        is_img INTEGER DEFAULT 0,
-        filename TEXT,
-        file_url TEXT,
-        preview TEXT,
-        is_negative INTEGER DEFAULT 0,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id TEXT,
+                debate_id TEXT,
+                invoice_id TEXT,
+                sender TEXT,
+                message_text TEXT,
+                image_url TEXT,
+                message_date TEXT,
+                created_at TEXT NOT NULL
+            );
 
-    conn.commit()
-    conn.close()
+            CREATE TABLE IF NOT EXISTS sales (
+                invoice_id TEXT PRIMARY KEY,
+                sale_date TEXT,
+                product_id TEXT,
+                product_name TEXT,
+                price_rub REAL,
+                price_usd REAL,
+                price_eur REAL,
+                raw_json TEXT,
+                updated_at TEXT NOT NULL
+            );
 
-
-# -------------------- Utils --------------------
-
-def safe(value: Any) -> str:
-    return html.escape(str(value)) if value not in (None, "") else "—"
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                action_id TEXT PRIMARY KEY,
+                action_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL
+            );
+            """
+        )
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def remember_event(event_key: str) -> bool:
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT INTO webhook_events(event_key, received_at) VALUES (?, ?)",
+                (event_key, datetime.now(timezone.utc).isoformat()),
+            )
+        return True
+    except sqlite3.IntegrityError:
+        return False
 
 
-def is_negative_text(text: str) -> bool:
-    lower = (text or "").lower()
-    return any(p in lower for p in NEGATIVE_PATTERNS)
-
-
-def shorten(text: str, limit: int = 3900) -> str:
-    text = text or ""
-    return text if len(text) <= limit else text[:limit - 3] + "..."
-
-
-def is_owner_telegram_update(update: Dict[str, Any]) -> bool:
-    owner = str(CHAT_ID)
-
-    if "callback_query" in update:
-        cq = update.get("callback_query", {})
-        from_user = cq.get("from", {}) or {}
-        message = cq.get("message", {}) or {}
-        chat = message.get("chat", {}) or {}
-
-        return str(from_user.get("id", "")) == owner and str(chat.get("id", "")) == owner
-
-    message = update.get("message", {}) or {}
-    from_user = message.get("from", {}) or {}
-    chat = message.get("chat", {}) or {}
-
-    return str(from_user.get("id", "")) == owner and str(chat.get("id", "")) == owner
-
-
-# -------------------- Telegram --------------------
-
-def tg_request(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{TELEGRAM_API}/{method}"
-    r = requests.post(url, json=payload, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-
-def send_message(text: str, reply_markup: Optional[Dict[str, Any]] = None):
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": shorten(text),
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    return tg_request("sendMessage", payload)
-
-
-def send_photo(photo_url: str, caption: str = ""):
-    payload = {
-        "chat_id": CHAT_ID,
-        "photo": photo_url,
-        "parse_mode": "HTML",
-        "caption": caption[:1024],
-    }
-    return tg_request("sendPhoto", payload)
-
-
-def answer_callback(callback_query_id: str, text: str = ""):
-    payload = {
-        "callback_query_id": callback_query_id,
-        "text": text[:200],
-        "show_alert": False,
-    }
-    return tg_request("answerCallbackQuery", payload)
-
-
-def set_telegram_webhook():
-    if not APP_URL:
-        return {"ok": False, "error": "APP_URL is not set"}
-    payload = {"url": f"{APP_URL}/telegram"}
-    return tg_request("setWebhook", payload)
-
-
-def main_menu():
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "🏆 Топ товаров", "callback_data": "top"},
-                {"text": "🚨 Проблемные", "callback_data": "negative"},
-            ],
-            [
-                {"text": "🧩 Шаблоны", "callback_data": "templates"},
-            ],
-        ]
-    }
-
-
-def templates_menu():
-    return {
-        "inline_keyboard": [
-            [
-                {"text": "Инструкция", "callback_data": "tpl:instruction"},
-                {"text": "Замена", "callback_data": "tpl:replace"},
-            ],
-            [
-                {"text": "Подождать", "callback_data": "tpl:wait"},
-                {"text": "Фото ошибки", "callback_data": "tpl:photo"},
-            ],
-            [
-                {"text": "Уточнить детали", "callback_data": "tpl:details"},
-            ],
-        ]
-    }
-
-
-# -------------------- Persistence --------------------
-
-def upsert_order_from_webhook(invoice_id: str, raw: Dict[str, Any]):
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO orders (
-            invoice_id, raw_json, updated_at
-        ) VALUES (?, ?, ?)
-        ON CONFLICT(invoice_id) DO UPDATE SET
-            raw_json=excluded.raw_json,
-            updated_at=excluded.updated_at
-    """, (
-        str(invoice_id),
-        str(raw),
-        now_iso(),
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-def upsert_order_from_api_shape(order: Dict[str, Any], invoice_id: str):
-    buyer_info = order.get("buyer_info", {}) if isinstance(order.get("buyer_info"), dict) else {}
-    feedback = order.get("feedback", {}) if isinstance(order.get("feedback"), dict) else {}
-
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO orders (
-            invoice_id, product_name, buyer_email, buyer_account, buyer_phone,
-            buyer_skype, buyer_whatsapp, buyer_ip_address, payment_aggregator,
-            amount, currency_type, invoice_state, purchase_date, date_pay,
-            external_order_id, item_id, content_id, profit, unique_code_state,
-            feedback_text, feedback_type, feedback_comment, raw_json, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(invoice_id) DO UPDATE SET
-            product_name=excluded.product_name,
-            buyer_email=excluded.buyer_email,
-            buyer_account=excluded.buyer_account,
-            buyer_phone=excluded.buyer_phone,
-            buyer_skype=excluded.buyer_skype,
-            buyer_whatsapp=excluded.buyer_whatsapp,
-            buyer_ip_address=excluded.buyer_ip_address,
-            payment_aggregator=excluded.payment_aggregator,
-            amount=excluded.amount,
-            currency_type=excluded.currency_type,
-            invoice_state=excluded.invoice_state,
-            purchase_date=excluded.purchase_date,
-            date_pay=excluded.date_pay,
-            external_order_id=excluded.external_order_id,
-            item_id=excluded.item_id,
-            content_id=excluded.content_id,
-            profit=excluded.profit,
-            unique_code_state=excluded.unique_code_state,
-            feedback_text=excluded.feedback_text,
-            feedback_type=excluded.feedback_type,
-            feedback_comment=excluded.feedback_comment,
-            raw_json=excluded.raw_json,
-            updated_at=excluded.updated_at
-    """, (
-        str(invoice_id),
-        str(order.get("name", "") or ""),
-        str(buyer_info.get("email", "") or ""),
-        str(buyer_info.get("account", "") or ""),
-        str(buyer_info.get("phone", "") or ""),
-        str(buyer_info.get("skype", "") or ""),
-        str(buyer_info.get("whatsapp", "") or ""),
-        str(buyer_info.get("ip_address", "") or ""),
-        str(buyer_info.get("payment_aggregator", "") or ""),
-        str(order.get("amount", "") or ""),
-        str(order.get("currency_type", "") or ""),
-        str(order.get("invoice_state", "") or ""),
-        str(order.get("purchase_date", "") or ""),
-        str(order.get("date_pay", "") or ""),
-        str(order.get("external_order_id", "") or ""),
-        str(order.get("item_id", "") or ""),
-        str(order.get("content_id", "") or ""),
-        str(order.get("profit", "") or ""),
-        str(order.get("unique_code_state", "") or ""),
-        str(feedback.get("feedback", "") or ""),
-        str(feedback.get("feedback_type", "") or ""),
-        str(feedback.get("comment", "") or ""),
-        str(order),
-        now_iso(),
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-def save_message(
+def save_message_record(
+    *,
+    message_id: str,
     debate_id: str,
     invoice_id: str,
-    message_date: str,
+    sender: str,
     message_text: str,
-    image_path: str,
-    message_id: str = "",
-    is_buyer: int = 0,
-    is_seller: int = 0,
-    is_file: int = 0,
-    is_img: int = 0,
-    filename: str = "",
-    file_url: str = "",
-    preview: str = "",
-):
-    negative = 1 if is_negative_text(message_text) else 0
-
-    conn = db()
-    cur = conn.cursor()
-
-    cur.execute("""
-        INSERT INTO messages (
-            debate_id, invoice_id, message_id, message_date, message_text, image_path,
-            is_buyer, is_seller, is_file, is_img, filename, file_url, preview, is_negative
+    image_url: str,
+    message_date: str,
+) -> None:
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO messages(
+                message_id, debate_id, invoice_id, sender, message_text,
+                image_url, message_date, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message_id,
+                debate_id,
+                invoice_id,
+                sender,
+                message_text,
+                image_url,
+                message_date,
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        str(debate_id or ""),
-        str(invoice_id or ""),
-        str(message_id or ""),
-        str(message_date or ""),
-        str(message_text or ""),
-        str(image_path or ""),
-        int(is_buyer or 0),
-        int(is_seller or 0),
-        int(is_file or 0),
-        int(is_img or 0),
-        str(filename or ""),
-        str(file_url or ""),
-        str(preview or ""),
-        negative,
-    ))
-
-    conn.commit()
-    conn.close()
 
 
-# -------------------- Queries --------------------
-
-def find_orders_by_text(query: str) -> List[sqlite3.Row]:
-    conn = db()
-    cur = conn.cursor()
-    like = f"%{query.lower()}%"
-    cur.execute("""
-        SELECT invoice_id, product_name, buyer_email, buyer_account,
-               amount, currency_type, purchase_date, invoice_state
-        FROM orders
-        WHERE lower(coalesce(product_name, '')) LIKE ?
-           OR lower(coalesce(buyer_email, '')) LIKE ?
-           OR lower(coalesce(buyer_account, '')) LIKE ?
-           OR lower(coalesce(external_order_id, '')) LIKE ?
-        ORDER BY updated_at DESC
-        LIMIT 15
-    """, (like, like, like, like))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def get_order_local(invoice_id: str) -> Optional[sqlite3.Row]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM orders WHERE invoice_id = ?", (invoice_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
-
-
-def get_messages_for_order(invoice_id: str) -> List[sqlite3.Row]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT *
-        FROM messages
-        WHERE invoice_id = ?
-        ORDER BY id DESC
-        LIMIT 10
-    """, (invoice_id,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
-def get_latest_debate_id_for_order(invoice_id: str) -> Optional[str]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT debate_id
-        FROM messages
-        WHERE invoice_id = ? AND debate_id IS NOT NULL AND debate_id != ''
-        ORDER BY id DESC
-        LIMIT 1
-    """, (invoice_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row["debate_id"] if row else None
+def upsert_order(invoice_id: str, response: dict[str, Any]) -> dict[str, Any]:
+    order = response.get("content") if isinstance(response.get("content"), dict) else response
+    if not isinstance(order, dict):
+        return {}
+    buyer = order.get("buyer_info") if isinstance(order.get("buyer_info"), dict) else {}
+    now = datetime.now(timezone.utc).isoformat()
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO orders(
+                invoice_id, item_id, product_name, buyer_email, buyer_account,
+                buyer_phone, amount, currency, profit, invoice_state,
+                purchase_date, date_pay, external_order_id, raw_json, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(invoice_id) DO UPDATE SET
+                item_id=excluded.item_id,
+                product_name=excluded.product_name,
+                buyer_email=excluded.buyer_email,
+                buyer_account=excluded.buyer_account,
+                buyer_phone=excluded.buyer_phone,
+                amount=excluded.amount,
+                currency=excluded.currency,
+                profit=excluded.profit,
+                invoice_state=excluded.invoice_state,
+                purchase_date=excluded.purchase_date,
+                date_pay=excluded.date_pay,
+                external_order_id=excluded.external_order_id,
+                raw_json=excluded.raw_json,
+                updated_at=excluded.updated_at
+            """,
+            (
+                invoice_id,
+                str(order.get("item_id") or ""),
+                str(order.get("name") or ""),
+                str(buyer.get("email") or ""),
+                str(buyer.get("account") or ""),
+                str(buyer.get("phone") or ""),
+                as_float(order.get("amount")),
+                str(order.get("currency_type") or ""),
+                as_float(order.get("profit")),
+                as_int(order.get("invoice_state")),
+                str(order.get("purchase_date") or ""),
+                str(order.get("date_pay") or ""),
+                str(order.get("external_order_id") or ""),
+                json.dumps(response, ensure_ascii=False, default=str),
+                now,
+            ),
+        )
+    return order
 
 
-def top_products() -> List[sqlite3.Row]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT product_name, COUNT(*) as cnt
-        FROM orders
-        WHERE product_name IS NOT NULL AND product_name != ''
-        GROUP BY product_name
-        ORDER BY cnt DESC, product_name ASC
-        LIMIT 10
-    """)
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def upsert_sales(data: Any) -> int:
+    sales = extract_list(data, ("sales",))
+    now = datetime.now(timezone.utc).isoformat()
+    count = 0
+    with db_connect() as conn:
+        for sale in sales:
+            if not isinstance(sale, dict):
+                continue
+            invoice_id = str(sale.get("invoice_id") or "")
+            product = sale.get("product") if isinstance(sale.get("product"), dict) else {}
+            if not invoice_id:
+                continue
+            conn.execute(
+                """
+                INSERT INTO sales(
+                    invoice_id, sale_date, product_id, product_name,
+                    price_rub, price_usd, price_eur, raw_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(invoice_id) DO UPDATE SET
+                    sale_date=excluded.sale_date,
+                    product_id=excluded.product_id,
+                    product_name=excluded.product_name,
+                    price_rub=excluded.price_rub,
+                    price_usd=excluded.price_usd,
+                    price_eur=excluded.price_eur,
+                    raw_json=excluded.raw_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    invoice_id,
+                    str(sale.get("date") or ""),
+                    str(product.get("id") or ""),
+                    str(product.get("name") or ""),
+                    as_float(product.get("price_rub")),
+                    as_float(product.get("price_usd")),
+                    as_float(product.get("price_eur")),
+                    json.dumps(sale, ensure_ascii=False, default=str),
+                    now,
+                ),
+            )
+            count += 1
+    return count
 
 
-def recent_negative_messages() -> List[sqlite3.Row]:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT invoice_id, debate_id, message_text, message_date
-        FROM messages
-        WHERE is_negative = 1
-        ORDER BY id DESC
-        LIMIT 10
-    """)
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def create_pending_action(action_type: str, payload: dict[str, Any], ttl: int = 600) -> str:
+    action_id = secrets.token_hex(6)
+    now = int(time.time())
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO pending_actions(action_id, action_type, payload_json, created_at, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (action_id, action_type, json.dumps(payload, ensure_ascii=False), now, now + ttl),
+        )
+    return action_id
 
 
-# -------------------- Formatters --------------------
+def pop_pending_action(action_id: str) -> Optional[tuple[str, dict[str, Any]]]:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT action_type, payload_json, expires_at FROM pending_actions WHERE action_id = ?",
+            (action_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute("DELETE FROM pending_actions WHERE action_id = ?", (action_id,))
+    if int(row["expires_at"]) < int(time.time()):
+        return None
+    return str(row["action_type"]), json.loads(row["payload_json"])
 
-def format_local_order(row: sqlite3.Row) -> str:
-    parts = [
-        f"<b>Товар:</b> {safe(row['product_name'])}",
-        f"<b>Заказ:</b> {safe(row['invoice_id'])}",
-        f"<b>Внешний ID:</b> {safe(row['external_order_id'])}",
-        f"<b>Статус:</b> {safe(row['invoice_state'])}",
-        f"<b>Дата покупки:</b> {safe(row['purchase_date'])}",
-        f"<b>Дата оплаты:</b> {safe(row['date_pay'])}",
-        f"<b>Сумма:</b> {safe(row['amount'])} {safe(row['currency_type'])}",
-        f"<b>Прибыль:</b> {safe(row['profit'])}",
-        f"<b>Item ID:</b> {safe(row['item_id'])}",
-        f"<b>Content ID:</b> {safe(row['content_id'])}",
-        "",
-        f"<b>Почта:</b> {safe(row['buyer_email'])}",
-        f"<b>Аккаунт:</b> {safe(row['buyer_account'])}",
-        f"<b>Телефон:</b> {safe(row['buyer_phone'])}",
-        f"<b>Skype:</b> {safe(row['buyer_skype'])}",
-        f"<b>WhatsApp:</b> {safe(row['buyer_whatsapp'])}",
-        f"<b>IP:</b> {safe(row['buyer_ip_address'])}",
-        f"<b>Агрегатор оплаты:</b> {safe(row['payment_aggregator'])}",
-        "",
-        f"<b>Отзыв:</b> {safe(row['feedback_text'])}",
-        f"<b>Тип отзыва:</b> {safe(row['feedback_type'])}",
-        f"<b>Комментарий:</b> {safe(row['feedback_comment'])}",
+
+def cancel_pending_action(action_id: str) -> bool:
+    with db_connect() as conn:
+        cursor = conn.execute("DELETE FROM pending_actions WHERE action_id = ?", (action_id,))
+        return cursor.rowcount > 0
+
+
+# ============================================================
+# GGSEL API client
+# ============================================================
+
+
+@dataclass
+class CachedToken:
+    value: str = ""
+    valid_until: float = 0.0
+
+
+class GGSELClient:
+    def __init__(self) -> None:
+        self.session = requests.Session()
+        self._token = CachedToken()
+        self._token_lock = threading.Lock()
+
+    def _decode_response(self, response: requests.Response, service: str) -> Any:
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = response.text
+        if not response.ok:
+            message = compact_json(payload, 700) if not isinstance(payload, str) else payload[:700]
+            raise APIError(service, response.status_code, message, payload)
+        if isinstance(payload, dict):
+            retval = payload.get("retval")
+            if retval not in (None, 0, "0"):
+                raise APIError(service, response.status_code, compact_json(payload, 700), payload)
+        return payload
+
+    def _parse_valid_thru(self, value: Any) -> float:
+        dt = parse_iso_datetime(value)
+        if dt is None:
+            return time.time() + 20 * 60
+        return max(time.time() + 30, dt.timestamp() - 60)
+
+    def get_v1_token(self, force: bool = False) -> str:
+        if not GGSEL_SELLER_ID or not GGSEL_API_KEY:
+            raise RuntimeError("GGSEL_SELLER_ID and GGSEL_API_KEY must be set")
+
+        with self._token_lock:
+            if not force and self._token.value and time.time() < self._token.valid_until:
+                return self._token.value
+
+            timestamp = str(int(time.time() * 1000))
+            sign = hashlib.sha256((GGSEL_API_KEY + timestamp).encode("utf-8")).hexdigest()
+            payload = {
+                "seller_id": int(GGSEL_SELLER_ID),
+                "timestamp": timestamp,
+                "sign": sign,
+            }
+            response = self.session.post(
+                f"{GGSEL_BASE_URL}/api_sellers/api/apilogin",
+                json=payload,
+                timeout=REQUEST_TIMEOUT,
+            )
+            data = self._decode_response(response, "GGSEL ApiLogin")
+            if not isinstance(data, dict) or not data.get("token"):
+                raise RuntimeError(f"GGSEL did not return token: {compact_json(data, 700)}")
+            self._token = CachedToken(
+                value=str(data["token"]),
+                valid_until=self._parse_valid_thru(data.get("valid_thru")),
+            )
+            return self._token.value
+
+    def v1_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        json_body: Any = None,
+        form_body: Optional[dict[str, Any]] = None,
+        retry_auth: bool = True,
+    ) -> Any:
+        token = self.get_v1_token()
+        url = f"{GGSEL_BASE_URL}{path}"
+
+        # Documentation UI calls the authorization field "Authorization".
+        # Raw token is tried first; Bearer is a compatibility fallback.
+        header_variants = [
+            {"Authorization": token, "Accept": "application/json"},
+            {"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        ]
+        last_error: Optional[APIError] = None
+
+        for headers in header_variants:
+            response = self.session.request(
+                method,
+                url,
+                headers=headers,
+                params=params,
+                json=json_body,
+                data=form_body,
+                timeout=REQUEST_TIMEOUT,
+            )
+            try:
+                return self._decode_response(response, "GGSEL V1")
+            except APIError as exc:
+                last_error = exc
+                if exc.status != 401:
+                    raise
+
+        if retry_auth and last_error and last_error.status == 401:
+            self.get_v1_token(force=True)
+            return self.v1_request(
+                method,
+                path,
+                params=params,
+                json_body=json_body,
+                form_body=form_body,
+                retry_auth=False,
+            )
+        raise last_error or RuntimeError("GGSEL V1 request failed")
+
+    def v2_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[dict[str, Any]] = None,
+        json_body: Any = None,
+    ) -> Any:
+        if not GGSEL_API_KEY:
+            raise RuntimeError("GGSEL_API_KEY must be set")
+        response = self.session.request(
+            method,
+            f"{GGSEL_BASE_URL}{path}",
+            headers={"Authorization": GGSEL_API_KEY, "Accept": "application/json"},
+            params=params,
+            json=json_body,
+            timeout=REQUEST_TIMEOUT,
+        )
+        return self._decode_response(response, "GGSEL V2")
+
+    # ---------- V1: account/categories ----------
+
+    def balance(self) -> Any:
+        return self.v1_request("GET", "/api_sellers/api/sellers/account/balance/info")
+
+    def receipts(self, page: int = 1, count: int = 50) -> Any:
+        try:
+            return self.v1_request(
+                "GET",
+                "/api_sellers/api/sellers/account/receipts",
+                params={"page": page, "count": count},
+            )
+        except APIError as exc:
+            if exc.status not in (400, 422):
+                raise
+            return self.v1_request(
+                "GET",
+                "/api_sellers/api/sellers/account/receipts",
+                params={"Page": page, "Count": count},
+            )
+
+    def categories_v1(self) -> Any:
+        return self.v1_request("GET", "/api_sellers/api/categories")
+
+    # ---------- V1: products ----------
+
+    def products_v1(self, page: int = 1, count: int = 30) -> Any:
+        return self.v1_request(
+            "GET",
+            "/api_sellers/api/products/list",
+            params={"page": page, "count": count},
+        )
+
+    def product_v1(self, product_id: int) -> Any:
+        return self.v1_request("GET", f"/api_sellers/api/products/{product_id}/data")
+
+    def bulk_prices_v1(self, payload: dict[str, Any]) -> Any:
+        return self.v1_request(
+            "POST", "/api_sellers/api/product/edit/prices", json_body=payload
+        )
+
+    def bulk_price_status_v1(self, task_id: str) -> Any:
+        return self.v1_request(
+            "GET",
+            "/api_sellers/api/product/edit/UpdateProductsTaskStatus",
+            params={"task_id": task_id},
+        )
+
+    # ---------- V1: orders/reviews ----------
+
+    def last_sales(self) -> Any:
+        return self.v1_request("GET", "/api_sellers/api/seller-last-sales")
+
+    def order_info(self, invoice_id: str) -> Any:
+        return self.v1_request("GET", f"/api_sellers/api/purchase/info/{invoice_id}")
+
+    def unique_code(self, code: str) -> Any:
+        return self.v1_request("GET", f"/api_sellers/api/purchases/unique-code/{code}")
+
+    def reviews(self, page: int = 1) -> Any:
+        return self.v1_request("GET", "/api_sellers/api/reviews", params={"page": page})
+
+    # ---------- V1: chats ----------
+
+    def chats(self, page: int = 1) -> Any:
+        return self.v1_request(
+            "GET", "/api_sellers/api/debates/v2/chats", params={"page": page}
+        )
+
+    def chat_messages(self, debate_id: str) -> Any:
+        return self.v1_request(
+            "GET", "/api_sellers/api/debates/v2", params={"id_i": debate_id}
+        )
+
+    def send_chat_message(self, debate_id: str, message: str) -> Any:
+        path = "/api_sellers/api/debates/v2"
+        params = {"id_i": debate_id}
+        try:
+            return self.v1_request(
+                "POST",
+                path,
+                params=params,
+                json_body={"message": message, "files": []},
+            )
+        except APIError as exc:
+            if exc.status not in (400, 415, 422):
+                raise
+            return self.v1_request(
+                "POST", path, params=params, form_body={"message": message}
+            )
+
+    # ---------- V2: categories/offers/products ----------
+
+    def categories_v2(self) -> Any:
+        return self.v2_request("GET", "/api_sellers/v2/categories")
+
+    def search_categories_v2(self, query: str) -> Any:
+        try:
+            return self.v2_request(
+                "GET", "/api_sellers/v2/categories/search", params={"query": query}
+            )
+        except APIError as exc:
+            if exc.status not in (400, 422):
+                raise
+            return self.v2_request(
+                "GET", "/api_sellers/v2/categories/search", params={"q": query}
+            )
+
+    def offers_v2(self, page: int = 1, limit: int = 20) -> Any:
+        return self.v2_request(
+            "GET", "/api_sellers/v2/offers", params={"page": page, "limit": limit}
+        )
+
+    def offer_v2(self, offer_id: int) -> Any:
+        return self.v2_request("GET", f"/api_sellers/v2/offers/{offer_id}")
+
+    def create_offer_v2(self, payload: dict[str, Any]) -> Any:
+        return self.v2_request("POST", "/api_sellers/v2/offers", json_body=payload)
+
+    def patch_offer_v2(self, offer_id: int, payload: dict[str, Any]) -> Any:
+        return self.v2_request(
+            "PATCH", f"/api_sellers/v2/offers/{offer_id}", json_body=payload
+        )
+
+    def batch_offers_v2(self, action: str, offer_ids: list[int]) -> Any:
+        if action not in {"activate", "pause", "delete"}:
+            raise ValueError("Unknown batch action")
+        return self.v2_request(
+            "POST",
+            f"/api_sellers/v2/offers/batch_{action}",
+            json_body={"offer_ids": offer_ids},
+        )
+
+    def products_v2(self, offer_id: int, page: int = 1, limit: int = 30) -> Any:
+        return self.v2_request(
+            "GET",
+            f"/api_sellers/v2/offers/{offer_id}/products",
+            params={"page": page, "limit": limit},
+        )
+
+    def add_products_v2(self, offer_id: int, values: list[str]) -> Any:
+        return self.v2_request(
+            "POST",
+            f"/api_sellers/v2/offers/{offer_id}/products",
+            json_body={"products": [{"value": value} for value in values]},
+        )
+
+    def archive_products_v2(
+        self, offer_id: int, product_ids: Optional[list[int]] = None, delete_all: bool = False
+    ) -> Any:
+        payload: dict[str, Any] = {
+            "product_ids": product_ids or [],
+            "delete_all": "true" if delete_all else "false",
+        }
+        return self.v2_request(
+            "DELETE", f"/api_sellers/v2/offers/{offer_id}/products", json_body=payload
+        )
+
+    def async_job_v2(self, job_id: str) -> Any:
+        return self.v2_request("GET", f"/api_sellers/v2/async_job_results/{job_id}")
+
+
+ggsel = GGSELClient()
+
+
+# ============================================================
+# Telegram API
+# ============================================================
+
+
+def telegram_call(method: str, payload: dict[str, Any]) -> Any:
+    response = requests.post(
+        f"{TELEGRAM_API}/{method}", json=payload, timeout=REQUEST_TIMEOUT
+    )
+    try:
+        data = response.json()
+    except ValueError:
+        data = response.text
+    if not response.ok or not isinstance(data, dict) or not data.get("ok"):
+        raise APIError("Telegram", response.status_code, compact_json(data, 700), data)
+    return data
+
+
+def split_text(text: str, limit: int = 3900) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        cut = remaining.rfind("\n", 0, limit)
+        if cut < limit // 2:
+            cut = limit
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def send_text(
+    text: str,
+    *,
+    reply_markup: Optional[dict[str, Any]] = None,
+    parse_mode: str = "HTML",
+) -> None:
+    chunks = split_text(text)
+    for index, chunk in enumerate(chunks):
+        payload: dict[str, Any] = {
+            "chat_id": OWNER_ID,
+            "text": chunk,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True,
+        }
+        if reply_markup and index == len(chunks) - 1:
+            payload["reply_markup"] = reply_markup
+        telegram_call("sendMessage", payload)
+
+
+def send_photo(photo_url: str, caption: str) -> None:
+    telegram_call(
+        "sendPhoto",
+        {
+            "chat_id": OWNER_ID,
+            "photo": photo_url,
+            "caption": caption[:1024],
+            "parse_mode": "HTML",
+        },
+    )
+
+
+def answer_callback(callback_id: str, text: str = "") -> None:
+    telegram_call(
+        "answerCallbackQuery",
+        {"callback_query_id": callback_id, "text": text[:200], "show_alert": False},
+    )
+
+
+def confirm_keyboard(action_id: str) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Подтвердить", "callback_data": f"confirm:{action_id}"},
+                {"text": "❌ Отмена", "callback_data": f"cancel:{action_id}"},
+            ]
+        ]
+    }
+
+
+def main_menu() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "💰 Баланс", "callback_data": "cmd:balance"},
+                {"text": "🧾 Продажи", "callback_data": "cmd:lastsales"},
+            ],
+            [
+                {"text": "📦 Офферы", "callback_data": "cmd:offers"},
+                {"text": "💬 Чаты", "callback_data": "cmd:chats"},
+            ],
+            [
+                {"text": "⭐ Отзывы", "callback_data": "cmd:reviews"},
+                {"text": "📚 Категории", "callback_data": "cmd:categories"},
+            ],
+        ]
+    }
+
+
+# ============================================================
+# Formatters
+# ============================================================
+
+
+INVOICE_STATES = {
+    1: "создан",
+    2: "отменён",
+    3: "оплачен",
+    4: "выполнен",
+    5: "возвращён",
+}
+
+
+def format_balance(data: Any) -> str:
+    content = unwrap_v1(data)
+    if not isinstance(content, dict):
+        return f"<b>Баланс</b>\n<pre>{safe(compact_json(data))}</pre>"
+    return (
+        "<b>💰 Баланс GGSEL</b>\n\n"
+        f"Доступно: <b>{safe(content.get('amount_t_free'))}</b> WMT\n"
+        f"Заблокировано: {safe(content.get('amount_t_lock'))} WMT\n"
+        f"С ограничением: {safe(content.get('amount_t_plus'))} WMT"
+    )
+
+
+def localized_name(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        ru = next(
+            (
+                item.get("value")
+                for item in value
+                if isinstance(item, dict) and item.get("locale") in ("ru", "ru-RU")
+            ),
+            None,
+        )
+        if ru:
+            return str(ru)
+        for item in value:
+            if isinstance(item, dict) and item.get("value"):
+                return str(item["value"])
+    return "—"
+
+
+def format_receipts(data: Any) -> str:
+    content = unwrap_v1(data)
+    items = extract_list(content, ("items",))
+    if not items:
+        return "<b>🧾 Чеки</b>\nНет данных."
+    lines = ["<b>🧾 Последние чеки</b>"]
+    for item in items[:20]:
+        if not isinstance(item, dict):
+            continue
+        operation = item.get("operation") if isinstance(item.get("operation"), dict) else {}
+        product = item.get("product") if isinstance(item.get("product"), dict) else {}
+        lines.append(
+            "\n"
+            f"<b>{safe(localized_name(product.get('name')))}</b>\n"
+            f"Дата: {safe(operation.get('datetime'))}\n"
+            f"Операция: {safe(operation.get('type'))}\n"
+            f"Сумма: {safe(operation.get('price'))} {safe(operation.get('currency'))}\n"
+            f"На счёт: {safe(operation.get('on_account'))}"
+        )
+    return "\n".join(lines)
+
+
+def category_title(category: dict[str, Any]) -> str:
+    return str(
+        category.get("title")
+        or category.get("name")
+        or category.get("title_ru")
+        or category.get("tree")
+        or "—"
+    )
+
+
+def format_categories(data: Any, query: str = "") -> str:
+    categories = extract_list(data, ("category", "categories", "items"))
+    if query:
+        needle = query.casefold()
+        categories = [
+            item
+            for item in categories
+            if isinstance(item, dict) and needle in category_title(item).casefold()
+        ]
+    if not categories:
+        return "<b>📚 Категории</b>\nНичего не найдено."
+    lines = ["<b>📚 Категории</b>"]
+    for item in categories[:50]:
+        if not isinstance(item, dict):
+            continue
+        lines.append(
+            f"• <code>{safe(item.get('id'))}</code> — {safe(category_title(item))}"
+            + (f" ({safe(item.get('cnt'))})" if item.get("cnt") is not None else "")
+        )
+    if len(categories) > 50:
+        lines.append(f"\nПоказано 50 из {len(categories)}.")
+    return "\n".join(lines)
+
+
+def offer_name(item: dict[str, Any]) -> str:
+    return str(item.get("title_ru") or item.get("name_goods") or item.get("name") or "—")
+
+
+def offer_id(item: dict[str, Any]) -> Any:
+    return item.get("id") or item.get("id_goods") or item.get("product_id")
+
+
+def format_offers(data: Any, title: str = "📦 Офферы") -> str:
+    offers = extract_list(data, ("items", "offers", "rows"))
+    if not offers:
+        return f"<b>{title}</b>\nНет данных."
+    lines = [f"<b>{title}</b>"]
+    for item in offers[:30]:
+        if not isinstance(item, dict):
+            continue
+        category = item.get("category") if isinstance(item.get("category"), dict) else {}
+        lines.append(
+            "\n"
+            f"<b>{safe(offer_name(item))}</b>\n"
+            f"ID: <code>{safe(offer_id(item))}</code>"
+            + (f" · {safe(item.get('status'))}" if item.get("status") else "")
+            + "\n"
+            f"Цена: {safe(item.get('price') or item.get('price_rur'))} {safe(item.get('currency') or 'RUB')}\n"
+            f"Остаток: {safe(item.get('quantity') or item.get('num_in_stock') or item.get('in_stock'))}"
+            + (f"\nКатегория: {safe(category.get('title'))}" if category else "")
+        )
+    return "\n".join(lines)
+
+
+def format_offer(data: Any) -> str:
+    item = data.get("content") if isinstance(data, dict) and isinstance(data.get("content"), dict) else data
+    if isinstance(item, dict) and isinstance(item.get("product"), dict):
+        item = item["product"]
+    if not isinstance(item, dict):
+        return f"<pre>{safe(compact_json(data))}</pre>"
+    category = item.get("category") if isinstance(item.get("category"), dict) else {}
+    return (
+        f"<b>📦 {safe(offer_name(item))}</b>\n\n"
+        f"ID: <code>{safe(offer_id(item))}</code>\n"
+        f"Статус: {safe(item.get('status'))}\n"
+        f"Цена: {safe(item.get('price'))} {safe(item.get('currency'))}\n"
+        f"Остаток: {safe(item.get('quantity') or item.get('num_in_stock'))}\n"
+        f"Автовыдача: {safe(item.get('is_autoselling'))}\n"
+        f"Категория: {safe(category.get('title') or category.get('id'))}\n"
+        f"Продано: {safe(item.get('sold_products_count'))}\n"
+        f"Создан: {safe(item.get('created_at'))}\n"
+        f"Обновлён: {safe(item.get('updated_at'))}\n\n"
+        f"{safe(item.get('description_ru') or item.get('info'))}"
+    )
+
+
+def format_sales(data: Any) -> str:
+    sales = extract_list(data, ("sales",))
+    if not sales:
+        return "<b>🧾 Последние продажи</b>\nНет данных."
+    lines = ["<b>🧾 Последние продажи</b>"]
+    total_rub = 0.0
+    for sale in sales[:30]:
+        if not isinstance(sale, dict):
+            continue
+        product = sale.get("product") if isinstance(sale.get("product"), dict) else {}
+        price_rub = as_float(product.get("price_rub"))
+        total_rub += price_rub
+        lines.append(
+            "\n"
+            f"<b>{safe(product.get('name'))}</b>\n"
+            f"Заказ: <code>{safe(sale.get('invoice_id'))}</code>\n"
+            f"Дата: {safe(sale.get('date'))}\n"
+            f"Сумма: {price_rub:g} ₽"
+        )
+    lines.append(f"\n<b>Итого в показанном списке: {total_rub:g} ₽</b>")
+    return "\n".join(lines)
+
+
+def format_order(invoice_id: str, data: Any) -> str:
+    order = data.get("content") if isinstance(data, dict) and isinstance(data.get("content"), dict) else data
+    if not isinstance(order, dict):
+        return f"<pre>{safe(compact_json(data))}</pre>"
+    buyer = order.get("buyer_info") if isinstance(order.get("buyer_info"), dict) else {}
+    feedback = order.get("feedback") if isinstance(order.get("feedback"), dict) else {}
+    state = as_int(order.get("invoice_state"))
+    return (
+        f"<b>📦 Заказ {safe(invoice_id)}</b>\n\n"
+        f"Товар: <b>{safe(order.get('name'))}</b>\n"
+        f"ID товара: <code>{safe(order.get('item_id'))}</code>\n"
+        f"Статус: {safe(INVOICE_STATES.get(state, state))}\n"
+        f"Зачислено: <b>{safe(order.get('amount'))} {safe(order.get('currency_type'))}</b>\n"
+        f"Прибыль: {safe(order.get('profit'))}\n"
+        f"Покупка: {safe(order.get('purchase_date'))}\n"
+        f"Оплата: {safe(order.get('date_pay'))}\n"
+        f"Внешний ID: {safe(order.get('external_order_id'))}\n\n"
+        f"Почта: {safe(buyer.get('email'))}\n"
+        f"Аккаунт: {safe(buyer.get('account'))}\n"
+        f"Телефон: {safe(buyer.get('phone'))}\n"
+        f"Способ оплаты: {safe(buyer.get('payment_method'))}\n"
+        f"Агрегатор: {safe(buyer.get('payment_aggregator'))}\n\n"
+        f"Отзыв: {safe(feedback.get('feedback'))}\n"
+        f"Тип: {safe(feedback.get('feedback_type'))}\n"
+        f"Ответ продавца: {safe(feedback.get('comment'))}"
+    )
+
+
+def format_unique_code(data: Any) -> str:
+    item = unwrap_v1(data)
+    if not isinstance(item, dict):
+        item = data if isinstance(data, dict) else {}
+    state = item.get("unique_code_state") if isinstance(item.get("unique_code_state"), dict) else {}
+    return (
+        "<b>🔐 Уникальный код</b>\n\n"
+        f"Заказ: <code>{safe(item.get('inv'))}</code>\n"
+        f"Товар ID: {safe(item.get('id_goods'))}\n"
+        f"Сумма: {safe(item.get('amount'))} {safe(item.get('type_curr'))}\n"
+        f"Прибыль: {safe(item.get('profit'))}\n"
+        f"Почта: {safe(item.get('email'))}\n"
+        f"Статус кода: {safe(state.get('state'))}\n"
+        f"Проверен: {safe(state.get('date_check'))}\n"
+        f"Доставлен: {safe(state.get('date_delivery'))}\n"
+        f"Подтверждён: {safe(state.get('date_confirmed'))}"
+    )
+
+
+def format_reviews(data: Any) -> str:
+    reviews = extract_list(data, ("reviews",))
+    if not reviews:
+        return "<b>⭐ Отзывы</b>\nНет данных."
+    lines = [
+        "<b>⭐ Отзывы</b>",
+        f"Всего: {safe(data.get('totalItems') if isinstance(data, dict) else '')} · "
+        f"Положительных: {safe(data.get('totalGood') if isinstance(data, dict) else '')} · "
+        f"Отрицательных: {safe(data.get('totalBad') if isinstance(data, dict) else '')}",
     ]
-    return "\n".join(parts)
+    for item in reviews[:20]:
+        if not isinstance(item, dict):
+            continue
+        icon = "👍" if as_int(item.get("good")) else "👎"
+        lines.append(
+            "\n"
+            f"{icon} <b>{safe(item.get('name'))}</b>\n"
+            f"{safe(item.get('info'))}\n"
+            f"Заказ: <code>{safe(item.get('invoice_id'))}</code> · {safe(item.get('date'))}\n"
+            f"Ответ: {safe(item.get('comment'))}"
+        )
+    return "\n".join(lines)
 
 
-# -------------------- Web routes --------------------
+def format_chats(data: Any) -> str:
+    chats = extract_list(data, ("items",))
+    if not chats:
+        return "<b>💬 Чаты</b>\nНет данных."
+    lines = ["<b>💬 Чаты покупателей</b>"]
+    for item in chats[:30]:
+        if not isinstance(item, dict):
+            continue
+        lines.append(
+            "\n"
+            f"Диалог: <code>{safe(item.get('id_i'))}</code>\n"
+            f"Email: {safe(item.get('email'))}\n"
+            f"Товар ID: {safe(item.get('product'))}\n"
+            f"Новых: <b>{safe(item.get('cnt_new'))}</b> · Всего: {safe(item.get('cnt_msg'))}\n"
+            f"Последнее: {safe(item.get('last_message'))}"
+        )
+    return "\n".join(lines)
+
+
+def format_messages(debate_id: str, data: Any) -> str:
+    messages = extract_list(data)
+    if not messages:
+        return f"<b>💬 Диалог {safe(debate_id)}</b>\nСообщений нет."
+    lines = [f"<b>💬 Диалог {safe(debate_id)}</b>"]
+    for item in messages[-30:]:
+        if not isinstance(item, dict):
+            continue
+        sender = "Покупатель" if as_int(item.get("buyer")) else "Вы"
+        text = item.get("message") or "[файл/изображение]"
+        lines.append(
+            "\n"
+            f"<b>{sender}</b> · {safe(item.get('date_written'))}\n"
+            f"{safe(text)}"
+        )
+        if item.get("filename"):
+            lines.append(f"Файл: {safe(item.get('filename'))}")
+        if item.get("url"):
+            lines.append(f"URL: {safe(item.get('url'))}")
+        elif item.get("preview"):
+            lines.append(f"Изображение: {safe(item.get('preview'))}")
+    return "\n".join(lines)
+
+
+def format_products(data: Any, offer_id_value: int) -> str:
+    products = extract_list(data, ("items", "products"))
+    if not products:
+        return f"<b>🔑 Склад оффера {offer_id_value}</b>\nНет товаров."
+    lines = [f"<b>🔑 Склад оффера {offer_id_value}</b>"]
+    for item in products[:50]:
+        if not isinstance(item, dict):
+            continue
+        value = str(item.get("value") or "")
+        masked = value if len(value) <= 18 else value[:8] + "…" + value[-6:]
+        lines.append(
+            f"• <code>{safe(item.get('id'))}</code> · {safe(item.get('status'))} · {safe(masked)}"
+        )
+    return "\n".join(lines)
+
+
+# ============================================================
+# Revenue calculation from receipts
+# ============================================================
+
+
+def parse_period(args: list[str]) -> tuple[date, date, str]:
+    today = datetime.now().date()
+    if not args or args[0].lower() == "today":
+        return today, today, "сегодня"
+    keyword = args[0].lower()
+    if keyword in {"7d", "7", "week"}:
+        return today - timedelta(days=6), today, "за 7 дней"
+    if keyword in {"30d", "30", "month"}:
+        return today - timedelta(days=29), today, "за 30 дней"
+    if len(args) == 1:
+        start = datetime.strptime(args[0], "%Y-%m-%d").date()
+        return start, start, start.isoformat()
+    start = datetime.strptime(args[0], "%Y-%m-%d").date()
+    end = datetime.strptime(args[1], "%Y-%m-%d").date()
+    if end < start:
+        start, end = end, start
+    return start, end, f"{start.isoformat()} — {end.isoformat()}"
+
+
+def calculate_receipts_period(start: date, end: date) -> tuple[float, float, int, bool]:
+    total_received = 0.0
+    total_price = 0.0
+    matched = 0
+    complete = False
+
+    for page in range(1, RECEIPTS_MAX_PAGES + 1):
+        data = ggsel.receipts(page=page, count=100)
+        content = unwrap_v1(data)
+        items = extract_list(content, ("items",))
+        if not items:
+            complete = True
+            break
+
+        oldest: Optional[date] = None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            operation = item.get("operation") if isinstance(item.get("operation"), dict) else {}
+            product = item.get("product") if isinstance(item.get("product"), dict) else None
+            dt = parse_iso_datetime(operation.get("datetime"))
+            if dt is None:
+                continue
+            operation_date = dt.date()
+            oldest = operation_date if oldest is None else min(oldest, operation_date)
+            if start <= operation_date <= end and product:
+                received = as_float(operation.get("on_account"))
+                price = as_float(operation.get("price"))
+                if received > 0 or price > 0:
+                    total_received += received
+                    total_price += price
+                    matched += 1
+
+        has_next = bool(content.get("has_next_page")) if isinstance(content, dict) else False
+        if oldest is not None and oldest < start:
+            complete = True
+            break
+        if not has_next:
+            complete = True
+            break
+
+    return total_received, total_price, matched, complete
+
+
+# ============================================================
+# Pending action execution
+# ============================================================
+
+
+def action_description(action_type: str, payload: dict[str, Any]) -> str:
+    if action_type == "reply":
+        return (
+            f"Отправить ответ в чат <code>{safe(payload['debate_id'])}</code>?\n\n"
+            f"{safe(payload['message'])}"
+        )
+    if action_type == "prices":
+        pairs = ", ".join(f"{item['id']} → {item['price']} ₽" for item in payload["items"])
+        return f"Изменить цены офферов?\n\n{safe(pairs)}"
+    if action_type in {"activate", "pause", "delete"}:
+        return f"Действие <b>{safe(action_type)}</b> для офферов: {safe(payload['offer_ids'])}?"
+    if action_type == "stock_add":
+        return (
+            f"Добавить {len(payload['values'])} позиций на склад оффера "
+            f"<code>{safe(payload['offer_id'])}</code>?"
+        )
+    if action_type == "stock_archive":
+        target = "весь склад" if payload.get("delete_all") else payload.get("product_ids")
+        return f"Архивировать {safe(target)} у оффера <code>{safe(payload['offer_id'])}</code>?"
+    if action_type == "offer_create":
+        return f"Создать новый оффер?\n<pre>{safe(compact_json(payload['data'], 2500))}</pre>"
+    if action_type == "offer_patch":
+        return (
+            f"Изменить оффер <code>{safe(payload['offer_id'])}</code>?\n"
+            f"<pre>{safe(compact_json(payload['data'], 2500))}</pre>"
+        )
+    if action_type == "v1_bulk_prices":
+        return f"Отправить массовое обновление цен V1?\n<pre>{safe(compact_json(payload['data'], 2500))}</pre>"
+    return f"Выполнить действие {safe(action_type)}?"
+
+
+def execute_action(action_type: str, payload: dict[str, Any]) -> str:
+    if action_type == "reply":
+        result = ggsel.send_chat_message(str(payload["debate_id"]), str(payload["message"]))
+        return f"✅ Сообщение отправлено.\n<pre>{safe(compact_json(result, 1000))}</pre>"
+
+    if action_type == "prices":
+        results = []
+        for item in payload["items"]:
+            results.append(
+                {
+                    "id": item["id"],
+                    "result": ggsel.patch_offer_v2(int(item["id"]), {"price": item["price"]}),
+                }
+            )
+        return f"✅ Цены обновлены.\n<pre>{safe(compact_json(results, 2500))}</pre>"
+
+    if action_type in {"activate", "pause", "delete"}:
+        result = ggsel.batch_offers_v2(action_type, [int(x) for x in payload["offer_ids"]])
+        return f"✅ Задача создана.\n<pre>{safe(compact_json(result, 2000))}</pre>"
+
+    if action_type == "stock_add":
+        result = ggsel.add_products_v2(int(payload["offer_id"]), list(payload["values"]))
+        return f"✅ Товары добавлены.\n<pre>{safe(compact_json(result, 1500))}</pre>"
+
+    if action_type == "stock_archive":
+        result = ggsel.archive_products_v2(
+            int(payload["offer_id"]),
+            [int(x) for x in payload.get("product_ids", [])],
+            bool(payload.get("delete_all")),
+        )
+        return f"✅ Архивация запущена.\n<pre>{safe(compact_json(result, 1500))}</pre>"
+
+    if action_type == "offer_create":
+        result = ggsel.create_offer_v2(dict(payload["data"]))
+        return f"✅ Оффер создан.\n<pre>{safe(compact_json(result, 2500))}</pre>"
+
+    if action_type == "offer_patch":
+        result = ggsel.patch_offer_v2(int(payload["offer_id"]), dict(payload["data"]))
+        return f"✅ Оффер изменён.\n<pre>{safe(compact_json(result, 2500))}</pre>"
+
+    if action_type == "v1_bulk_prices":
+        result = ggsel.bulk_prices_v1(dict(payload["data"]))
+        return f"✅ Массовое обновление отправлено.\n<pre>{safe(compact_json(result, 2500))}</pre>"
+
+    raise ValueError(f"Unknown action: {action_type}")
+
+
+def propose_action(action_type: str, payload: dict[str, Any]) -> None:
+    action_id = create_pending_action(action_type, payload)
+    send_text(
+        "<b>⚠️ Подтверждение операции</b>\n\n" + action_description(action_type, payload),
+        reply_markup=confirm_keyboard(action_id),
+    )
+
+
+# ============================================================
+# Telegram commands
+# ============================================================
+
+
+HELP_TEXT = """<b>GGSEL Seller Bot</b>
+
+<b>Просмотр</b>
+/categories [текст] — категории
+/balance — баланс
+/receipts [страница] [количество] — чеки
+/offers [страница] — офферы V2
+/offer ID — карточка оффера
+/search текст — поиск среди офферов
+/lastsales — последние продажи
+/sum today|7d|30d|ДАТА ДАТА — полученные средства
+/order INVOICE — заказ
+/code UNIQUE_CODE — проверка кода
+/reviews [страница] — отзывы
+/chats [страница] — чаты
+/chat ID — сообщения диалога
+/v2products OFFER_ID [страница] — склад
+/job JOB_ID — результат фоновой задачи
+
+<b>Изменения с подтверждением</b>
+/reply CHAT_ID текст — ответ покупателю
+/prices 123=499,124=599 — несколько цен
+/activate 1,2,3 — активировать офферы
+/pause 1,2,3 — приостановить
+/delete 1,2,3 — архивировать офферы
+/v2add OFFER_ID + новые строки с товарами
+/v2archive OFFER_ID all|1,2,3
+/v2create {JSON}
+/v2patch OFFER_ID {JSON}
+/v1bulk {JSON} — сырой V1 bulk price payload
+"""
+
+
+def normalize_command(text: str) -> tuple[str, str]:
+    text = text.strip()
+    if not text.startswith("/"):
+        return "", text
+    first, _, rest = text.partition(" ")
+    command = first.split("@", 1)[0].lower()
+    return command, rest.strip()
+
+
+def handle_command(text: str) -> None:
+    command, arg_text = normalize_command(text)
+    try:
+        if command in {"/start", "/help"}:
+            send_text(HELP_TEXT, reply_markup=main_menu())
+            return
+
+        if command == "/categories":
+            if arg_text:
+                data = ggsel.search_categories_v2(arg_text)
+                send_text(format_categories(data, arg_text))
+            else:
+                data = ggsel.categories_v2()
+                send_text(format_categories(data))
+            return
+
+        if command == "/balance":
+            send_text(format_balance(ggsel.balance()))
+            return
+
+        if command == "/receipts":
+            parts = arg_text.split()
+            page = int(parts[0]) if parts else 1
+            count = int(parts[1]) if len(parts) > 1 else 20
+            count = max(1, min(count, 100))
+            send_text(format_receipts(ggsel.receipts(page, count)))
+            return
+
+        if command == "/offers":
+            page = int(arg_text or "1")
+            send_text(format_offers(ggsel.offers_v2(page=page, limit=30)))
+            return
+
+        if command == "/offer":
+            if not arg_text:
+                raise ValueError("Формат: /offer ID")
+            send_text(format_offer(ggsel.offer_v2(int(arg_text))))
+            return
+
+        if command == "/search":
+            if not arg_text:
+                raise ValueError("Формат: /search название")
+            needle = arg_text.casefold()
+            found: list[dict[str, Any]] = []
+            for page in range(1, 11):
+                data = ggsel.offers_v2(page=page, limit=100)
+                items = [x for x in extract_list(data, ("items", "offers")) if isinstance(x, dict)]
+                found.extend([x for x in items if needle in offer_name(x).casefold()])
+                pagination = data.get("pagination") if isinstance(data, dict) else None
+                total_pages = as_int(pagination.get("total_pages")) if isinstance(pagination, dict) else 0
+                if not items or (total_pages and page >= total_pages):
+                    break
+            send_text(format_offers(found, title=f"🔎 Поиск: {safe(arg_text)}"))
+            return
+
+        if command == "/lastsales":
+            data = ggsel.last_sales()
+            upsert_sales(data)
+            send_text(format_sales(data))
+            return
+
+        if command == "/sum":
+            args = arg_text.split()
+            start, end, label = parse_period(args)
+            received, price, count, complete = calculate_receipts_period(start, end)
+            warning = "" if complete else "\n⚠️ Достигнут лимит страниц; результат может быть неполным."
+            send_text(
+                f"<b>💵 Средства {safe(label)}</b>\n\n"
+                f"Зачислено на счёт: <b>{received:.2f}</b>\n"
+                f"Сумма операций: {price:.2f}\n"
+                f"Товарных операций: {count}{warning}"
+            )
+            return
+
+        if command == "/order":
+            if not arg_text:
+                raise ValueError("Формат: /order НОМЕР_ЗАКАЗА")
+            data = ggsel.order_info(arg_text)
+            upsert_order(arg_text, data if isinstance(data, dict) else {})
+            send_text(format_order(arg_text, data))
+            return
+
+        if command == "/code":
+            if not arg_text:
+                raise ValueError("Формат: /code УНИКАЛЬНЫЙ_КОД")
+            send_text(format_unique_code(ggsel.unique_code(arg_text)))
+            return
+
+        if command == "/reviews":
+            page = int(arg_text or "1")
+            send_text(format_reviews(ggsel.reviews(page)))
+            return
+
+        if command == "/chats":
+            page = int(arg_text or "1")
+            send_text(format_chats(ggsel.chats(page)))
+            return
+
+        if command == "/chat":
+            if not arg_text:
+                raise ValueError("Формат: /chat ID_ДИАЛОГА")
+            send_text(format_messages(arg_text, ggsel.chat_messages(arg_text)))
+            return
+
+        if command == "/reply":
+            debate_id, separator, message = arg_text.partition(" ")
+            if not separator or not message.strip():
+                raise ValueError("Формат: /reply ID_ДИАЛОГА текст")
+            propose_action("reply", {"debate_id": debate_id, "message": message.strip()})
+            return
+
+        if command == "/prices":
+            if not arg_text:
+                raise ValueError("Формат: /prices 123=499,124=599")
+            items = []
+            for pair in arg_text.split(","):
+                item_id, separator, price = pair.partition("=")
+                if not separator:
+                    raise ValueError(f"Нет '=' в {pair}")
+                items.append({"id": int(item_id.strip()), "price": as_float(price.strip())})
+            propose_action("prices", {"items": items})
+            return
+
+        if command in {"/activate", "/pause", "/delete"}:
+            action = command[1:]
+            propose_action(action, {"offer_ids": parse_id_list(arg_text)})
+            return
+
+        if command == "/v2products":
+            parts = arg_text.split()
+            if not parts:
+                raise ValueError("Формат: /v2products OFFER_ID [страница]")
+            offer = int(parts[0])
+            page = int(parts[1]) if len(parts) > 1 else 1
+            send_text(format_products(ggsel.products_v2(offer, page, 50), offer))
+            return
+
+        if command == "/v2add":
+            first_line, separator, values_text = arg_text.partition("\n")
+            if not separator:
+                raise ValueError("Формат: /v2add OFFER_ID, затем каждый товар с новой строки")
+            offer = int(first_line.strip())
+            values = [line.strip() for line in values_text.splitlines() if line.strip()]
+            if not values:
+                raise ValueError("Список товаров пуст")
+            propose_action("stock_add", {"offer_id": offer, "values": values})
+            return
+
+        if command == "/v2archive":
+            parts = arg_text.split(maxsplit=1)
+            if len(parts) != 2:
+                raise ValueError("Формат: /v2archive OFFER_ID all|1,2,3")
+            offer = int(parts[0])
+            if parts[1].strip().lower() == "all":
+                payload = {"offer_id": offer, "delete_all": True, "product_ids": []}
+            else:
+                payload = {
+                    "offer_id": offer,
+                    "delete_all": False,
+                    "product_ids": parse_id_list(parts[1]),
+                }
+            propose_action("stock_archive", payload)
+            return
+
+        if command == "/job":
+            if not arg_text:
+                raise ValueError("Формат: /job JOB_ID")
+            send_text(f"<pre>{safe(compact_json(ggsel.async_job_v2(arg_text), 3500))}</pre>")
+            return
+
+        if command == "/v2create":
+            if not arg_text:
+                raise ValueError("Формат: /v2create {JSON}")
+            propose_action("offer_create", {"data": parse_json_argument(arg_text)})
+            return
+
+        if command == "/v2patch":
+            offer_text, separator, json_text = arg_text.partition(" ")
+            if not separator:
+                raise ValueError("Формат: /v2patch OFFER_ID {JSON}")
+            propose_action(
+                "offer_patch",
+                {"offer_id": int(offer_text), "data": parse_json_argument(json_text)},
+            )
+            return
+
+        if command == "/v1bulk":
+            if not arg_text:
+                raise ValueError("Формат: /v1bulk {JSON}")
+            propose_action("v1_bulk_prices", {"data": parse_json_argument(arg_text)})
+            return
+
+        if command == "/v1task":
+            if not arg_text:
+                raise ValueError("Формат: /v1task TASK_ID")
+            send_text(
+                f"<pre>{safe(compact_json(ggsel.bulk_price_status_v1(arg_text), 3500))}</pre>"
+            )
+            return
+
+        if command:
+            send_text("Неизвестная команда. Нажми /help")
+    except (ValueError, APIError, RuntimeError, requests.RequestException) as exc:
+        logger.warning("Command failed: %s", exc)
+        send_text(f"❌ <b>Ошибка</b>\n<code>{safe(exc)}</code>")
+    except Exception as exc:
+        logger.exception("Unexpected command error")
+        send_text(f"❌ Непредвиденная ошибка: <code>{safe(exc)}</code>")
+
+
+# ============================================================
+# GGSEL incoming message webhook
+# ============================================================
+
+
+def process_ggsel_event(data: dict[str, Any]) -> None:
+    debate_id = str(data.get("DebateId") or "")
+    message_id = str(data.get("MessageId") or "")
+    invoice_id = str(data.get("InvoiceId") or "")
+    message_date = str(data.get("MessageDate") or "")
+    message_text = str(data.get("Message") or "")
+    image_url = str(data.get("ImagePath") or "")
+
+    save_message_record(
+        message_id=message_id,
+        debate_id=debate_id,
+        invoice_id=invoice_id,
+        sender="buyer",
+        message_text=message_text,
+        image_url=image_url,
+        message_date=message_date,
+    )
+
+    order: dict[str, Any] = {}
+    if invoice_id:
+        try:
+            response = ggsel.order_info(invoice_id)
+            if isinstance(response, dict):
+                order = upsert_order(invoice_id, response)
+        except Exception:
+            logger.exception("Unable to load order %s", invoice_id)
+
+    buyer = order.get("buyer_info") if isinstance(order.get("buyer_info"), dict) else {}
+    prefix = "🚨 <b>ПРОБЛЕМНОЕ СООБЩЕНИЕ</b>\n\n" if any(
+        word in message_text.casefold()
+        for word in ("не работает", "возврат", "обман", "ошибка", "не пришло")
+    ) else ""
+
+    text = (
+        prefix
+        + "📩 <b>Новое сообщение GGSEL</b>\n\n"
+        + f"Товар: <b>{safe(order.get('name'))}</b>\n"
+        + f"Заказ: <code>{safe(invoice_id)}</code>\n"
+        + f"Диалог: <code>{safe(debate_id)}</code>\n"
+        + f"Почта: {safe(buyer.get('email'))}\n"
+        + f"Аккаунт: {safe(buyer.get('account'))}\n"
+        + f"Зачислено: {safe(order.get('amount'))} {safe(order.get('currency_type'))}\n"
+        + f"Дата: {safe(message_date)}\n\n"
+        + f"<b>Сообщение:</b>\n{safe(message_text or '[изображение]')}"
+    )
+    send_text(text)
+
+    if image_url:
+        caption = (
+            "🖼 <b>Изображение покупателя</b>\n\n"
+            f"Товар: {safe(order.get('name'))}\n"
+            f"Заказ: <code>{safe(invoice_id)}</code>\n"
+            f"Диалог: <code>{safe(debate_id)}</code>\n"
+            f"Почта: {safe(buyer.get('email'))}"
+        )
+        try:
+            send_photo(image_url, caption)
+        except Exception:
+            logger.exception("Unable to send photo")
+            send_text(caption + f"\n\nСсылка: {safe(image_url)}")
+
+
+# ============================================================
+# Flask routes
+# ============================================================
+
 
 @app.get("/")
-def home():
-    return "OK", 200
+def health():
+    return jsonify({"ok": True, "service": "ggsel-telegram-bot-v3"})
 
 
 @app.get("/setup-telegram-webhook")
-def setup_telegram_webhook_route():
-    try:
-        result = set_telegram_webhook()
-        return jsonify(result), 200
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+def setup_telegram_webhook():
+    if SETUP_SECRET and request.args.get("secret") != SETUP_SECRET:
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+    if not APP_URL:
+        return jsonify({"ok": False, "error": "APP_URL is not set"}), 400
+    payload: dict[str, Any] = {
+        "url": f"{APP_URL}/telegram",
+        "allowed_updates": ["message", "callback_query"],
+        "drop_pending_updates": False,
+    }
+    if TELEGRAM_WEBHOOK_SECRET:
+        payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
+    result = telegram_call("setWebhook", payload)
+    return jsonify(result)
+
+
+@app.post("/telegram")
+def telegram_webhook():
+    if TELEGRAM_WEBHOOK_SECRET:
+        received = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not secrets.compare_digest(received, TELEGRAM_WEBHOOK_SECRET):
+            return jsonify({"ok": False}), 403
+
+    update = request.get_json(silent=True) or {}
+
+    if "callback_query" in update:
+        query = update.get("callback_query") or {}
+        user_id = str((query.get("from") or {}).get("id") or "")
+        chat_id = str((((query.get("message") or {}).get("chat") or {}).get("id")) or "")
+        if user_id != OWNER_ID or chat_id != OWNER_ID:
+            return jsonify({"ok": True, "ignored": True})
+
+        callback_id = str(query.get("id") or "")
+        data = str(query.get("data") or "")
+        try:
+            answer_callback(callback_id, "Принято")
+        except Exception:
+            logger.exception("Unable to answer callback")
+
+        if data.startswith("confirm:"):
+            action_id = data.split(":", 1)[1]
+
+            def confirm_task():
+                action = pop_pending_action(action_id)
+                if action is None:
+                    send_text("⌛ Операция не найдена или подтверждение истекло.")
+                    return
+                action_type, payload = action
+                try:
+                    send_text(execute_action(action_type, payload))
+                except Exception as exc:
+                    logger.exception("Action failed")
+                    send_text(f"❌ Операция не выполнена: <code>{safe(exc)}</code>")
+
+            run_background(confirm_task)
+        elif data.startswith("cancel:"):
+            cancel_pending_action(data.split(":", 1)[1])
+            run_background(send_text, "Операция отменена.")
+        elif data.startswith("cmd:"):
+            run_background(handle_command, "/" + data.split(":", 1)[1])
+        return jsonify({"ok": True})
+
+    message = update.get("message") or {}
+    user_id = str((message.get("from") or {}).get("id") or "")
+    chat_id = str((message.get("chat") or {}).get("id") or "")
+    if user_id != OWNER_ID or chat_id != OWNER_ID:
+        return jsonify({"ok": True, "ignored": True})
+
+    text = str(message.get("text") or "")
+    if text:
+        run_background(handle_command, text)
+    return jsonify({"ok": True})
 
 
 @app.route("/ggsel", methods=["POST", "GET"])
 def ggsel_webhook():
-    try:
-        data = request.get_json(silent=True)
-        if not data:
-            data = request.form.to_dict()
-        if not data:
-            data = request.args.to_dict()
+    if GGSEL_WEBHOOK_SECRET:
+        provided = request.args.get("secret") or request.headers.get("X-GGSEL-Webhook-Secret", "")
+        if not secrets.compare_digest(str(provided), GGSEL_WEBHOOK_SECRET):
+            return jsonify({"ok": False}), 403
 
-        debate_id = str(data.get("DebateId", "") or "")
-        message_date = str(data.get("MessageDate", "") or "")
-        message = str(data.get("Message", "") or "")
-        invoice_id = str(data.get("InvoiceId", "") or "")
-        image_path = str(data.get("ImagePath", "") or "")
-        message_id = str(data.get("MessageId", "") or "")
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = request.form.to_dict() or request.args.to_dict()
 
-        if invoice_id:
-            upsert_order_from_webhook(invoice_id, data)
-
-        save_message(
-            debate_id=debate_id,
-            invoice_id=invoice_id,
-            message_date=message_date,
-            message_text=message,
-            image_path=image_path,
-            message_id=message_id,
-            is_buyer=1,
-            is_img=1 if image_path else 0,
-            preview=image_path,
-        )
-
-        danger = "🚨 <b>ПРОБЛЕМНОЕ СООБЩЕНИЕ</b>\n\n" if is_negative_text(message) else ""
-
-        text = (
-            f"{danger}"
-            "📩 <b>Новое сообщение с GGSEL</b>\n\n"
-            f"<b>Заказ:</b> {safe(invoice_id)}\n"
-            f"<b>Диалог:</b> {safe(debate_id)}\n"
-            f"<b>Дата сообщения:</b> {safe(message_date)}\n\n"
-            f"<b>Сообщение:</b>\n{safe(message)}"
-        )
-
-        send_message(text, reply_markup=main_menu())
-
-        if image_path:
-            caption = (
-                ("🚨 Проблемное сообщение\n\n" if is_negative_text(message) else "")
-                + "🖼 <b>Изображение от покупателя</b>\n\n"
-                + f"<b>Заказ:</b> {safe(invoice_id)}\n"
-                + f"<b>Диалог:</b> {safe(debate_id)}\n"
-                + f"<b>Дата:</b> {safe(message_date)}"
-            )
-            try:
-                send_photo(image_path, caption=caption)
-            except Exception:
-                send_message(f"{caption}\n\n<b>Ссылка на изображение:</b>\n{safe(image_path)}")
-
-        return jsonify({"ok": True}), 200
-
-    except Exception as e:
-        print("GGSEL WEBHOOK ERROR:", traceback.format_exc(), flush=True)
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-# -------------------- Telegram commands --------------------
-
-def handle_command(text: str):
-    text = (text or "").strip()
-
-    if text == "/start":
-        send_message(
-            "Готово ✅\n\n"
-            "Команды:\n"
-            "/find слово — поиск по товару/email\n"
-            "/order 123456 — карточка заказа\n"
-            "/user email@example.com — поиск по покупателю\n"
-            "/top — топ товаров\n"
-            "/negative — проблемные сообщения\n"
-            "/balance — временно отключено\n"
-            "/sales — временно отключено\n"
-            "/reply — временно отключено",
-            reply_markup=main_menu()
-        )
-        return
-
-    if text == "/help":
-        send_message(
-            "Команды:\n"
-            "/find windows\n"
-            "/order 123456\n"
-            "/user buyer@mail.com\n"
-            "/top\n"
-            "/negative\n\n"
-            "GGSEL API-команды пока отключены, чтобы бот работал стабильно."
-        )
-        return
-
-    if text.startswith("/find "):
-        query = text[6:].strip()
-        rows = find_orders_by_text(query)
-        if not rows:
-            send_message(f"Ничего не найдено по запросу: <b>{safe(query)}</b>")
-            return
-
-        lines = [f"<b>Результаты поиска:</b> {safe(query)}\n"]
-        for row in rows:
-            lines.append(
-                f"• <b>{safe(row['product_name'])}</b>\n"
-                f"  Заказ: {safe(row['invoice_id'])}\n"
-                f"  Почта: {safe(row['buyer_email'])}\n"
-                f"  Аккаунт: {safe(row['buyer_account'])}\n"
-                f"  Статус: {safe(row['invoice_state'])}\n"
-                f"  Сумма: {safe(row['amount'])} {safe(row['currency_type'])}\n"
-                f"  Дата: {safe(row['purchase_date'])}\n"
-            )
-        send_message("\n".join(lines))
-        return
-
-    if text.startswith("/user "):
-        query = text[6:].strip()
-        rows = find_orders_by_text(query)
-        if not rows:
-            send_message(f"По покупателю ничего не найдено: <b>{safe(query)}</b>")
-            return
-
-        lines = [f"<b>Заказы покупателя:</b> {safe(query)}\n"]
-        for row in rows:
-            lines.append(
-                f"• {safe(row['product_name'])}\n"
-                f"  Заказ: {safe(row['invoice_id'])}\n"
-                f"  Статус: {safe(row['invoice_state'])}\n"
-                f"  Сумма: {safe(row['amount'])} {safe(row['currency_type'])}\n"
-                f"  Дата: {safe(row['purchase_date'])}\n"
-            )
-        send_message("\n".join(lines))
-        return
-
-    if text.startswith("/order "):
-        invoice_id = text[7:].strip()
-        local = get_order_local(invoice_id)
-
-        if not local:
-            send_message(f"Заказ не найден локально: <b>{safe(invoice_id)}</b>")
-            return
-
-        msgs = get_messages_for_order(invoice_id)
-        lines = [f"<b>Карточка заказа</b>\n\n{format_local_order(local)}\n"]
-
-        debate_id = get_latest_debate_id_for_order(invoice_id)
-        if debate_id:
-            lines.append(f"\n<b>DebateId:</b> {safe(debate_id)}\n")
-
-        if msgs:
-            lines.append("<b>Последние сообщения:</b>")
-            for m in msgs[:5]:
-                body = m["message_text"] or "[файл/изображение]"
-                flags = []
-                if m["is_buyer"]:
-                    flags.append("buyer")
-                if m["is_seller"]:
-                    flags.append("seller")
-                if m["is_img"]:
-                    flags.append("img")
-                if m["is_file"]:
-                    flags.append("file")
-
-                suffix = f" ({', '.join(flags)})" if flags else ""
-                lines.append(
-                    f"• {safe(m['message_date'])}{suffix}\n"
-                    f"  {safe(body)}"
-                )
-
-                if m["filename"]:
-                    lines.append(f"  Файл: {safe(m['filename'])}")
-                if m["file_url"]:
-                    lines.append(f"  URL: {safe(m['file_url'])}")
-
-        send_message("\n".join(lines))
-        return
-
-    if text.startswith("/reply "):
-        send_message("Отправка ответа в GGSEL пока отключена, пока не будет точной авторизации API.")
-        return
-
-    if text.startswith("/tpl "):
-        send_message("Шаблонные ответы в GGSEL пока отключены, пока не будет точной авторизации API.")
-        return
-
-    if text == "/top":
-        rows = top_products()
-        if not rows:
-            send_message("Пока нет данных по товарам.")
-            return
-
-        lines = ["<b>Топ товаров</b>\n"]
-        for i, row in enumerate(rows, start=1):
-            lines.append(f"{i}. {safe(row['product_name'])} — {safe(row['cnt'])}")
-        send_message("\n".join(lines))
-        return
-
-    if text == "/balance":
-        send_message("Команда временно отключена: GGSEL API авторизация ещё не настроена.")
-        return
-
-    if text == "/sales":
-        send_message("Команда временно отключена: GGSEL API авторизация ещё не настроена.")
-        return
-
-    if text == "/negative":
-        rows = recent_negative_messages()
-        if not rows:
-            send_message("Проблемных сообщений пока нет.")
-            return
-
-        lines = ["<b>Проблемные сообщения</b>\n"]
-        for row in rows:
-            lines.append(
-                f"• Заказ: {safe(row['invoice_id'])}\n"
-                f"  Диалог: {safe(row['debate_id'])}\n"
-                f"  Дата: {safe(row['message_date'])}\n"
-                f"  Текст: {safe(row['message_text'])}\n"
-            )
-        send_message("\n".join(lines))
-        return
-
-    send_message("Не понял команду. Нажми /help")
-
-
-# -------------------- Telegram webhook --------------------
-
-@app.post("/telegram")
-def telegram_webhook():
-    try:
-        update = request.get_json(silent=True) or {}
-
-        if not is_owner_telegram_update(update):
-            return jsonify({"ok": True, "ignored": "not owner"}), 200
-
-        if "callback_query" in update:
-            cq = update["callback_query"]
-            data = cq.get("data", "")
-            callback_id = cq.get("id")
-
-            if callback_id:
-                answer_callback(callback_id, "Открываю…")
-
-            if data == "top":
-                handle_command("/top")
-            elif data == "negative":
-                handle_command("/negative")
-            elif data == "templates":
-                send_message(
-                    "Шаблоны быстрых ответов сохранены, но отправка в GGSEL пока выключена.\n\n"
-                    "Доступно:\n"
-                    "instruction\nreplace\nwait\nphoto\ndetails",
-                    reply_markup=templates_menu()
-                )
-            elif data.startswith("tpl:"):
-                template_name = data.split(":", 1)[1]
-                send_message(
-                    f"Шаблон <b>{safe(template_name)}</b>\n\n"
-                    f"Текст:\n{safe(REPLY_TEMPLATES.get(template_name, ''))}"
-                )
-
-            return jsonify({"ok": True}), 200
-
-        message = update.get("message", {}) or {}
-        text = message.get("text", "") or ""
-
-        if text:
-            handle_command(text)
-
-        return jsonify({"ok": True}), 200
-
-    except Exception as e:
-        print("TELEGRAM WEBHOOK ERROR:", traceback.format_exc(), flush=True)
-        return jsonify({"ok": False, "error": str(e)}), 500
+    identity = "|".join(
+        str(data.get(key) or "")
+        for key in ("MessageId", "DebateId", "InvoiceId", "MessageDate", "Message", "ImagePath")
+    )
+    event_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    if remember_event(event_key):
+        run_background(process_ggsel_event, data)
+    return jsonify({"ok": True})
 
 
 init_db()
 
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "3000")))
