@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import hmac
+import io
 import html
 import json
 import logging
@@ -36,16 +38,21 @@ GGSEL_BASE_URL = os.environ.get("GGSEL_BASE_URL", "https://seller.ggsel.com").rs
 
 DB_PATH = os.environ.get("DB_PATH", "/data/ggsel_bot.sqlite3")
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "15"))
-RECEIPTS_MAX_PAGES = int(os.environ.get("RECEIPTS_MAX_PAGES", "15"))
+RECEIPTS_MAX_PAGES = int(os.environ.get("RECEIPTS_MAX_PAGES", "30"))
 MINIAPP_AUTH_MAX_AGE = int(os.environ.get("MINIAPP_AUTH_MAX_AGE", "86400"))
 MINIAPP_OFFERS_MAX_PAGES = int(os.environ.get("MINIAPP_OFFERS_MAX_PAGES", "20"))
 MINIAPP_OFFERS_CACHE_SECONDS = int(os.environ.get("MINIAPP_OFFERS_CACHE_SECONDS", "30"))
+DASHBOARD_ANALYTICS_CACHE_SECONDS = int(os.environ.get("DASHBOARD_ANALYTICS_CACHE_SECONDS", "60"))
 # GGSEL V2 may return HTTP 500 for an oversized page instead of a validation error.
 # Keep this conservative; the client also retries compatible pagination formats.
 MINIAPP_OFFERS_API_PAGE_SIZE = max(5, min(int(os.environ.get("MINIAPP_OFFERS_API_PAGE_SIZE", "20")), 50))
 
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
 GGSEL_WEBHOOK_SECRET = os.environ.get("GGSEL_WEBHOOK_SECRET", "").strip()
+# Backward-compatible mode accepts the legacy /ggsel URL without ?secret=.
+# Disable after updating the GGSEL redirect URL to the signed version.
+GGSEL_WEBHOOK_COMPAT_MODE = os.environ.get("GGSEL_WEBHOOK_COMPAT_MODE", "true").strip().lower() in {"1", "true", "yes", "on"}
+LOW_STOCK_DEFAULT = max(0, int(os.environ.get("LOW_STOCK_DEFAULT", "3")))
 SETUP_SECRET = os.environ.get("SETUP_SECRET", "").strip()
 
 if not BOT_TOKEN or not OWNER_ID:
@@ -58,6 +65,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("ggsel-bot")
+
+_dashboard_cache_lock = threading.Lock()
+_dashboard_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
 
 app = Flask(__name__)
 executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bot-worker")
@@ -130,9 +140,19 @@ def parse_id_list(value: str) -> list[int]:
 
 
 def parse_iso_datetime(value: Any) -> Optional[datetime]:
-    if not value:
+    if value in (None, ""):
         return None
     text = str(value).strip()
+    # GGSEL webhook installations may send Unix time in seconds or milliseconds.
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        try:
+            numeric = float(text)
+            if numeric > 10_000_000_000:  # milliseconds
+                numeric /= 1000.0
+            if numeric > 0:
+                return datetime.fromtimestamp(numeric, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            pass
     try:
         if text.endswith("Z"):
             text = text[:-1] + "+00:00"
@@ -140,12 +160,22 @@ def parse_iso_datetime(value: Any) -> Optional[datetime]:
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except ValueError:
         pass
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M:%S", "%Y-%m-%d"):
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%d.%m.%Y %H:%M:%S",
+        "%d.%m.%Y %H:%M",
+        "%Y-%m-%d",
+    ):
         try:
             return datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             continue
     return None
+
+
+def normalize_datetime_text(value: Any) -> str:
+    parsed = parse_iso_datetime(value)
+    return parsed.isoformat() if parsed else str(value or "")
 
 
 def extract_list(data: Any, preferred: Iterable[str] = ()) -> list[Any]:
@@ -279,6 +309,38 @@ def init_db() -> None:
                 payload_json TEXT,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS offer_settings (
+                offer_id TEXT PRIMARY KEY,
+                min_stock INTEGER NOT NULL DEFAULT 3,
+                auto_activate INTEGER NOT NULL DEFAULT 0,
+                auto_pause INTEGER NOT NULL DEFAULT 0,
+                alert_sent INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS async_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT,
+                operation TEXT NOT NULL,
+                target TEXT,
+                status TEXT NOT NULL DEFAULT 'queued',
+                result_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_labels (
+                debate_id TEXT PRIMARY KEY,
+                label TEXT NOT NULL DEFAULT 'new',
+                note TEXT,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_messages_debate ON messages(debate_id, id);
+            CREATE INDEX IF NOT EXISTS idx_messages_invoice ON messages(invoice_id, id);
+            CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+            CREATE INDEX IF NOT EXISTS idx_operations_created ON async_operations(created_at);
             """
         )
 
@@ -320,7 +382,7 @@ def save_message_record(
                 sender,
                 message_text,
                 image_url,
-                message_date,
+                normalize_datetime_text(message_date),
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
@@ -897,6 +959,208 @@ def audit_miniapp(user_id: Any, action: str, target: Any = "", payload: Any = No
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+
+
+def get_offer_settings_map() -> dict[str, dict[str, Any]]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT offer_id, min_stock, auto_activate, auto_pause, alert_sent FROM offer_settings"
+        ).fetchall()
+    return {
+        str(row["offer_id"]): {
+            "min_stock": as_int(row["min_stock"], LOW_STOCK_DEFAULT),
+            "auto_activate": bool(row["auto_activate"]),
+            "auto_pause": bool(row["auto_pause"]),
+            "alert_sent": bool(row["alert_sent"]),
+        }
+        for row in rows
+    }
+
+
+def get_offer_settings(offer_id_value: Any) -> dict[str, Any]:
+    key = str(offer_id_value)
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT min_stock, auto_activate, auto_pause, alert_sent FROM offer_settings WHERE offer_id = ?",
+            (key,),
+        ).fetchone()
+    if not row:
+        return {
+            "min_stock": LOW_STOCK_DEFAULT,
+            "auto_activate": False,
+            "auto_pause": False,
+            "alert_sent": False,
+        }
+    return {
+        "min_stock": as_int(row["min_stock"], LOW_STOCK_DEFAULT),
+        "auto_activate": bool(row["auto_activate"]),
+        "auto_pause": bool(row["auto_pause"]),
+        "alert_sent": bool(row["alert_sent"]),
+    }
+
+
+def save_offer_settings(offer_id_value: Any, settings: dict[str, Any]) -> dict[str, Any]:
+    current = get_offer_settings(offer_id_value)
+    min_stock = max(0, as_int(settings.get("min_stock"), current["min_stock"]))
+    auto_activate = bool(settings.get("auto_activate", current["auto_activate"]))
+    auto_pause = bool(settings.get("auto_pause", current["auto_pause"]))
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO offer_settings(offer_id, min_stock, auto_activate, auto_pause, alert_sent, updated_at)
+            VALUES (?, ?, ?, ?, 0, ?)
+            ON CONFLICT(offer_id) DO UPDATE SET
+                min_stock=excluded.min_stock,
+                auto_activate=excluded.auto_activate,
+                auto_pause=excluded.auto_pause,
+                alert_sent=0,
+                updated_at=excluded.updated_at
+            """,
+            (
+                str(offer_id_value),
+                min_stock,
+                int(auto_activate),
+                int(auto_pause),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+    return get_offer_settings(offer_id_value)
+
+
+def enrich_offer_settings(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    settings_map = get_offer_settings_map()
+    enriched: list[dict[str, Any]] = []
+    for item in items:
+        copy = dict(item)
+        settings = settings_map.get(str(copy.get("id") or ""), {
+            "min_stock": LOW_STOCK_DEFAULT,
+            "auto_activate": False,
+            "auto_pause": False,
+            "alert_sent": False,
+        })
+        copy["settings"] = settings
+        copy["low_stock"] = as_int(copy.get("quantity")) <= as_int(settings.get("min_stock"), LOW_STOCK_DEFAULT)
+        enriched.append(copy)
+    return enriched
+
+
+def extract_job_id(payload: Any) -> str:
+    if isinstance(payload, dict):
+        for key in ("job_id", "id", "task_id"):
+            value = payload.get(key)
+            if value not in (None, ""):
+                return str(value)
+        for key in ("content", "data", "result"):
+            nested = payload.get(key)
+            if isinstance(nested, dict):
+                found = extract_job_id(nested)
+                if found:
+                    return found
+    return ""
+
+
+def record_operation(operation: str, target: Any, result: Any, status: str = "queued") -> dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat()
+    job_id = extract_job_id(result)
+    with db_connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO async_operations(job_id, operation, target, status, result_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                str(operation),
+                str(target or ""),
+                str(status),
+                json.dumps(result, ensure_ascii=False, default=str),
+                now,
+                now,
+            ),
+        )
+        operation_id = cursor.lastrowid
+    return {"id": operation_id, "job_id": job_id, "status": status}
+
+
+def refresh_operations() -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT id, job_id, operation, target, status, result_json, created_at, updated_at FROM async_operations ORDER BY id DESC LIMIT 100"
+        ).fetchall()
+    output: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        if item.get("job_id") and item.get("status") in {"queued", "running"}:
+            try:
+                result = ggsel.async_job_v2(str(item["job_id"]))
+                text = json.dumps(result, ensure_ascii=False, default=str).casefold()
+                if any(word in text for word in ("completed", "success", "done", "успеш")):
+                    status = "completed"
+                elif any(word in text for word in ("failed", "error", "ошиб")):
+                    status = "failed"
+                else:
+                    status = "running"
+                now = datetime.now(timezone.utc).isoformat()
+                with db_connect() as conn:
+                    conn.execute(
+                        "UPDATE async_operations SET status=?, result_json=?, updated_at=? WHERE id=?",
+                        (status, json.dumps(result, ensure_ascii=False, default=str), now, item["id"]),
+                    )
+                item.update({"status": status, "result_json": json.dumps(result, ensure_ascii=False, default=str), "updated_at": now})
+            except Exception as exc:
+                logger.info("Async operation %s not ready: %s", item.get("job_id"), exc)
+        try:
+            item["result"] = json.loads(item.get("result_json") or "{}")
+        except json.JSONDecodeError:
+            item["result"] = item.get("result_json") or ""
+        output.append(item)
+    return output
+
+
+def maybe_send_low_stock_alerts(offers: list[dict[str, Any]]) -> None:
+    configured = get_offer_settings_map()
+    for item in enrich_offer_settings(offers):
+        offer_id_value = str(item.get("id") or "")
+        if offer_id_value not in configured:
+            continue
+        settings = item.get("settings") or {}
+        quantity = as_int(item.get("quantity"))
+        threshold = as_int(settings.get("min_stock"), LOW_STOCK_DEFAULT)
+        low = quantity <= threshold
+        if not offer_id_value:
+            continue
+        if low and not settings.get("alert_sent"):
+            try:
+                send_text(
+                    "⚠️ <b>Заканчивается товар</b>\n\n"
+                    f"{safe(item.get('title'))}\n"
+                    f"Остаток: <b>{quantity}</b>\n"
+                    f"Минимум: <b>{threshold}</b>\n"
+                    f"ID: <code>{safe(offer_id_value)}</code>"
+                )
+            except Exception:
+                logger.exception("Unable to send low stock alert")
+            with db_connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO offer_settings(offer_id, min_stock, auto_activate, auto_pause, alert_sent, updated_at)
+                    VALUES (?, ?, ?, ?, 1, ?)
+                    ON CONFLICT(offer_id) DO UPDATE SET alert_sent=1, updated_at=excluded.updated_at
+                    """,
+                    (
+                        offer_id_value,
+                        threshold,
+                        int(bool(settings.get("auto_activate"))),
+                        int(bool(settings.get("auto_pause"))),
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+        elif not low and settings.get("alert_sent"):
+            with db_connect() as conn:
+                conn.execute(
+                    "UPDATE offer_settings SET alert_sent=0, updated_at=? WHERE offer_id=?",
+                    (datetime.now(timezone.utc).isoformat(), offer_id_value),
+                )
 
 
 def _offer_quantity(item: dict[str, Any]) -> int:
@@ -1614,6 +1878,341 @@ def calculate_receipts_period(start: date, end: date) -> tuple[float, float, int
     return total_received, total_price, matched, complete
 
 
+def calculate_receipts_analytics(start: date, end: date) -> dict[str, Any]:
+    received = 0.0
+    gross = 0.0
+    count = 0
+    complete = False
+    daily: dict[str, dict[str, float]] = {}
+    products: dict[str, dict[str, Any]] = {}
+
+    for page in range(1, RECEIPTS_MAX_PAGES + 1):
+        data = ggsel.receipts(page=page, count=100)
+        content = unwrap_v1(data)
+        items = extract_list(content, ("items",))
+        if not items:
+            complete = True
+            break
+        oldest: Optional[date] = None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            operation = item.get("operation") if isinstance(item.get("operation"), dict) else {}
+            product = item.get("product") if isinstance(item.get("product"), dict) else {}
+            dt = parse_iso_datetime(operation.get("datetime"))
+            if dt is None:
+                continue
+            day = dt.date()
+            oldest = day if oldest is None else min(oldest, day)
+            if not (start <= day <= end) or not product:
+                continue
+            received_value = as_float(operation.get("on_account"))
+            gross_value = as_float(operation.get("price"))
+            if received_value <= 0 and gross_value <= 0:
+                continue
+            received += received_value
+            gross += gross_value
+            count += 1
+            day_key = day.isoformat()
+            bucket = daily.setdefault(day_key, {"received": 0.0, "gross": 0.0, "count": 0})
+            bucket["received"] += received_value
+            bucket["gross"] += gross_value
+            bucket["count"] += 1
+            name_value = product.get("name")
+            if isinstance(name_value, dict):
+                name_value = name_value.get("value") or name_value.get("ru")
+            if isinstance(name_value, list) and name_value:
+                first = name_value[0]
+                name_value = first.get("value") if isinstance(first, dict) else first
+            product_name = str(name_value or product.get("title") or product.get("id") or "Товар")
+            p = products.setdefault(product_name, {"name": product_name, "received": 0.0, "gross": 0.0, "count": 0})
+            p["received"] += received_value
+            p["gross"] += gross_value
+            p["count"] += 1
+
+        has_next = bool(content.get("has_next_page")) if isinstance(content, dict) else False
+        if oldest is not None and oldest < start:
+            complete = True
+            break
+        if not has_next:
+            complete = True
+            break
+
+    top_products = sorted(products.values(), key=lambda item: (item["received"], item["count"]), reverse=True)[:15]
+    daily_rows = [{"date": key, **value} for key, value in sorted(daily.items())]
+    return {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "received": round(received, 2),
+        "gross": round(gross, 2),
+        "count": count,
+        "average": round(received / count, 2) if count else 0.0,
+        "complete": complete,
+        "daily": daily_rows,
+        "top_products": top_products,
+    }
+
+
+_RU_MONTHS_SHORT = ("янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек")
+
+
+def _receipt_product_name(product: dict[str, Any]) -> str:
+    value: Any = product.get("name")
+    if isinstance(value, dict):
+        value = value.get("value") or value.get("ru") or value.get("title")
+    elif isinstance(value, list) and value:
+        first = value[0]
+        value = first.get("value") if isinstance(first, dict) else first
+    return str(value or product.get("title") or product.get("id") or "Товар")
+
+
+def _receipt_product_id(product: dict[str, Any]) -> str:
+    return str(product.get("id") or product.get("item_id") or product.get("product_id") or "")
+
+
+def _empty_period_metrics() -> dict[str, float | int]:
+    return {"received": 0.0, "gross": 0.0, "count": 0}
+
+
+def _finalize_period_metrics(metrics: dict[str, float | int]) -> dict[str, Any]:
+    received = float(metrics.get("received") or 0.0)
+    gross = float(metrics.get("gross") or 0.0)
+    count = int(metrics.get("count") or 0)
+    return {
+        "received": round(received, 2),
+        "gross": round(gross, 2),
+        "count": count,
+        "average": round(gross / count, 2) if count else 0.0,
+        "average_received": round(received / count, 2) if count else 0.0,
+        "net_rate": round(received / gross * 100, 2) if gross else 0.0,
+    }
+
+
+def _percent_delta(current: float, previous: float) -> Optional[float]:
+    if previous == 0:
+        return None
+    return round((current - previous) / abs(previous) * 100, 2)
+
+
+def _dashboard_bucket(day: date, span_days: int) -> tuple[str, date, date, str]:
+    if span_days <= 14:
+        return day.isoformat(), day, day, day.strftime("%d.%m")
+    if span_days <= 120:
+        bucket_start = day - timedelta(days=day.weekday())
+        bucket_end = bucket_start + timedelta(days=6)
+        label = f"{bucket_start.strftime('%d.%m')}–{bucket_end.strftime('%d.%m')}"
+        return bucket_start.isoformat(), bucket_start, bucket_end, label
+    bucket_start = day.replace(day=1)
+    if bucket_start.month == 12:
+        next_month = bucket_start.replace(year=bucket_start.year + 1, month=1)
+    else:
+        next_month = bucket_start.replace(month=bucket_start.month + 1)
+    bucket_end = next_month - timedelta(days=1)
+    label = f"{_RU_MONTHS_SHORT[bucket_start.month - 1]} {str(bucket_start.year)[2:]}"
+    return bucket_start.strftime("%Y-%m"), bucket_start, bucket_end, label
+
+
+def _dashboard_chat_stats() -> dict[str, Any]:
+    result = {"new": 0, "waiting": 0, "replacement": 0, "resolved": 0, "messages_today": 0}
+    try:
+        today_prefix = datetime.now().date().isoformat()
+        with db_connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT COALESCE(cl.label, 'new') AS label, COUNT(DISTINCT m.debate_id) AS cnt
+                FROM messages AS m
+                LEFT JOIN chat_labels AS cl ON cl.debate_id = m.debate_id
+                WHERE m.debate_id IS NOT NULL AND m.debate_id != ''
+                GROUP BY COALESCE(cl.label, 'new')
+                """
+            ).fetchall()
+            for row in rows:
+                label = str(row["label"] or "new")
+                if label in result:
+                    result[label] = as_int(row["cnt"])
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM messages WHERE sender='buyer' AND (message_date LIKE ? OR created_at LIKE ?)",
+                (today_prefix + "%", today_prefix + "%"),
+            ).fetchone()
+            result["messages_today"] = as_int(row["cnt"] if row else 0)
+    except Exception:
+        logger.exception("Unable to calculate dashboard chat stats")
+    return result
+
+
+def calculate_dashboard_analytics(
+    start: date,
+    end: date,
+    *,
+    product_id: str = "",
+    product_name: str = "",
+    force: bool = False,
+) -> dict[str, Any]:
+    if end < start:
+        start, end = end, start
+    product_id = str(product_id or "").strip()
+    product_name_key = str(product_name or "").strip().casefold()
+    cache_key = (start.isoformat(), end.isoformat(), product_id or product_name_key)
+    now = time.time()
+    if not force:
+        with _dashboard_cache_lock:
+            cached = _dashboard_cache.get(cache_key)
+            if cached and float(cached.get("_expires_at", 0)) > now:
+                return {key: value for key, value in cached.items() if key != "_expires_at"}
+
+    span_days = max(1, (end - start).days + 1)
+    previous_end = start - timedelta(days=1)
+    previous_start = previous_end - timedelta(days=span_days - 1)
+    scan_start = previous_start
+
+    current_raw = _empty_period_metrics()
+    previous_raw = _empty_period_metrics()
+    daily: dict[str, dict[str, float | int]] = {}
+    products: dict[str, dict[str, Any]] = {}
+    complete = False
+
+    for page in range(1, RECEIPTS_MAX_PAGES + 1):
+        data = ggsel.receipts(page=page, count=100)
+        content = unwrap_v1(data)
+        items = extract_list(content, ("items",))
+        if not items:
+            complete = True
+            break
+        oldest: Optional[date] = None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            operation = item.get("operation") if isinstance(item.get("operation"), dict) else {}
+            product = item.get("product") if isinstance(item.get("product"), dict) else {}
+            dt = parse_iso_datetime(operation.get("datetime"))
+            if dt is None:
+                continue
+            day = dt.date()
+            oldest = day if oldest is None else min(oldest, day)
+            if day < scan_start or day > end or not product:
+                continue
+
+            receipt_product_id = _receipt_product_id(product)
+            receipt_product_name = _receipt_product_name(product)
+            if product_id and receipt_product_id != product_id:
+                if not product_name_key or receipt_product_name.casefold() != product_name_key:
+                    continue
+
+            received_value = as_float(operation.get("on_account"))
+            gross_value = as_float(operation.get("price"))
+            if received_value <= 0 and gross_value <= 0:
+                continue
+
+            target = current_raw if start <= day <= end else previous_raw if previous_start <= day <= previous_end else None
+            if target is None:
+                continue
+            target["received"] = float(target["received"]) + received_value
+            target["gross"] = float(target["gross"]) + gross_value
+            target["count"] = int(target["count"]) + 1
+
+            if start <= day <= end:
+                day_key = day.isoformat()
+                bucket = daily.setdefault(day_key, {"received": 0.0, "gross": 0.0, "count": 0})
+                bucket["received"] = float(bucket["received"]) + received_value
+                bucket["gross"] = float(bucket["gross"]) + gross_value
+                bucket["count"] = int(bucket["count"]) + 1
+                product_key = receipt_product_id or receipt_product_name
+                product_bucket = products.setdefault(
+                    product_key,
+                    {
+                        "id": receipt_product_id,
+                        "name": receipt_product_name,
+                        "received": 0.0,
+                        "gross": 0.0,
+                        "count": 0,
+                    },
+                )
+                product_bucket["received"] += received_value
+                product_bucket["gross"] += gross_value
+                product_bucket["count"] += 1
+
+        has_next = bool(content.get("has_next_page")) if isinstance(content, dict) else False
+        if oldest is not None and oldest < scan_start:
+            complete = True
+            break
+        if not has_next:
+            complete = True
+            break
+
+    current = _finalize_period_metrics(current_raw)
+    previous = _finalize_period_metrics(previous_raw)
+    deltas = {
+        "gross": _percent_delta(current["gross"], previous["gross"]),
+        "received": _percent_delta(current["received"], previous["received"]),
+        "count": _percent_delta(float(current["count"]), float(previous["count"])),
+        "average": _percent_delta(current["average"], previous["average"]),
+        "net_rate": round(current["net_rate"] - previous["net_rate"], 2),
+    }
+
+    series_map: dict[str, dict[str, Any]] = {}
+    cursor = start
+    while cursor <= end:
+        bucket_key, bucket_start, bucket_end, label = _dashboard_bucket(cursor, span_days)
+        bucket = series_map.setdefault(
+            bucket_key,
+            {
+                "key": bucket_key,
+                "label": label,
+                "start": max(bucket_start, start).isoformat(),
+                "end": min(bucket_end, end).isoformat(),
+                "received": 0.0,
+                "gross": 0.0,
+                "count": 0,
+            },
+        )
+        raw = daily.get(cursor.isoformat())
+        if raw:
+            bucket["received"] += float(raw.get("received") or 0)
+            bucket["gross"] += float(raw.get("gross") or 0)
+            bucket["count"] += int(raw.get("count") or 0)
+        cursor += timedelta(days=1)
+
+    series = list(series_map.values())
+    for row in series:
+        row["received"] = round(row["received"], 2)
+        row["gross"] = round(row["gross"], 2)
+
+    top_products = sorted(
+        products.values(),
+        key=lambda item: (float(item["gross"]), int(item["count"])),
+        reverse=True,
+    )[:10]
+    for item in top_products:
+        item["received"] = round(float(item["received"]), 2)
+        item["gross"] = round(float(item["gross"]), 2)
+        item["average"] = round(float(item["gross"]) / int(item["count"]), 2) if item["count"] else 0.0
+
+    result = {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "previous_start": previous_start.isoformat(),
+        "previous_end": previous_end.isoformat(),
+        "product_id": product_id,
+        "product_name": product_name,
+        "current": current,
+        "previous": previous,
+        "deltas": deltas,
+        "series": series,
+        "top_products": top_products,
+        "complete": complete,
+        "granularity": "day" if span_days <= 14 else "week" if span_days <= 120 else "month",
+        "api_limits": {
+            "views": False,
+            "checkout_clicks": False,
+            "conversion": False,
+            "note": "Seller API не передаёт просмотры и конверсию. Панель показывает продажи, зачисления и операционные показатели.",
+        },
+    }
+    with _dashboard_cache_lock:
+        _dashboard_cache[cache_key] = {**result, "_expires_at": now + DASHBOARD_ANALYTICS_CACHE_SECONDS}
+    return result
+
+
 # ============================================================
 # Pending action execution
 # ============================================================
@@ -2049,6 +2648,7 @@ def _sales_payload(data: Any) -> list[dict[str, Any]]:
             {
                 "invoice_id": sale.get("invoice_id") or sale.get("inv"),
                 "date": sale.get("date") or sale.get("purchase_date"),
+                "item_id": product.get("id") or product.get("item_id") or sale.get("item_id"),
                 "name": product.get("name") or sale.get("name"),
                 "price_rub": as_float(product.get("price_rub") or sale.get("price_rub")),
                 "price_usd": as_float(product.get("price_usd") or sale.get("price_usd")),
@@ -2276,6 +2876,12 @@ def _chat_payload(data: Any) -> list[dict[str, Any]]:
         combined["cnt_msg"] = current.get("cnt_msg", combined.get("cnt_msg"))
         merged[debate_id] = combined
 
+    with db_connect() as conn:
+        label_rows = conn.execute("SELECT debate_id, label, note FROM chat_labels").fetchall()
+    labels = {str(row["debate_id"]): {"label": row["label"], "note": row["note"] or ""} for row in label_rows}
+    for debate_id, item in merged.items():
+        item.update(labels.get(debate_id, {"label": "new", "note": ""}))
+
     def sort_key(item: dict[str, Any]) -> float:
         parsed = parse_iso_datetime(item.get("last_message"))
         return parsed.timestamp() if parsed else 0.0
@@ -2362,31 +2968,117 @@ def miniapp_me(user: dict[str, Any]):
 @miniapp_api
 def miniapp_dashboard(user: dict[str, Any]):
     errors: dict[str, str] = {}
+    force = request.args.get("refresh") == "1"
+    end_text = str(request.args.get("end") or date.today().isoformat())
+    start_text = str(request.args.get("start") or (date.today() - timedelta(days=29)).isoformat())
+    try:
+        start_date = datetime.strptime(start_text, "%Y-%m-%d").date()
+        end_date = datetime.strptime(end_text, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError("Дата должна быть в формате YYYY-MM-DD") from exc
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+    # Protect the API from accidental multi-year scans in a mobile UI.
+    if (end_date - start_date).days > 370:
+        start_date = end_date - timedelta(days=370)
+
+    product_id = str(request.args.get("product_id") or "").strip()
     balance_data: dict[str, Any] = {}
     sales_data: list[dict[str, Any]] = []
     offers_data: list[dict[str, Any]] = []
 
+    balance_future = executor.submit(lambda: _balance_payload(ggsel.balance()))
+    sales_future = executor.submit(lambda: _sales_payload(ggsel.last_sales()))
+    offers_future = executor.submit(lambda: collect_all_offers(force=force))
+
     try:
-        balance_data = _balance_payload(ggsel.balance())
+        balance_data = balance_future.result(timeout=max(REQUEST_TIMEOUT * 2, 20))
     except Exception as exc:
         errors["balance"] = str(exc)
     try:
-        sales_data = _sales_payload(ggsel.last_sales())[:10]
+        sales_data = sales_future.result(timeout=max(REQUEST_TIMEOUT * 2, 20))
     except Exception as exc:
         errors["sales"] = str(exc)
     try:
-        offers_data = collect_all_offers()
+        offers_data = offers_future.result(timeout=max(REQUEST_TIMEOUT * 3, 30))
     except Exception as exc:
         errors["offers"] = str(exc)
 
+    enriched_offers = enrich_offer_settings(offers_data)
+    product_options = [
+        {"id": str(item.get("id") or ""), "title": str(item.get("title") or item.get("id") or "Товар")}
+        for item in enriched_offers
+        if item.get("id")
+    ]
+    product_options.sort(key=lambda item: item["title"].casefold())
+    selected_offer = next((item for item in enriched_offers if str(item.get("id") or "") == product_id), None)
+    product_name = str(selected_offer.get("title") or "") if selected_offer else ""
+
+    try:
+        analytics = calculate_dashboard_analytics(
+            start_date,
+            end_date,
+            product_id=product_id,
+            product_name=product_name,
+            force=force,
+        )
+    except Exception as exc:
+        errors["analytics"] = str(exc)
+        analytics = {
+            "start": start_date.isoformat(),
+            "end": end_date.isoformat(),
+            "current": _finalize_period_metrics(_empty_period_metrics()),
+            "previous": _finalize_period_metrics(_empty_period_metrics()),
+            "deltas": {},
+            "series": [],
+            "top_products": [],
+            "complete": False,
+            "api_limits": {
+                "views": False,
+                "checkout_clicks": False,
+                "conversion": False,
+                "note": "Аналитика временно недоступна.",
+            },
+        }
+
+    if product_id:
+        sales_data = [item for item in sales_data if str(item.get("item_id") or "") == product_id]
+
     stats = {
-        "offers": len(offers_data),
-        "active": sum(1 for x in offers_data if x.get("status") == "active"),
-        "paused": sum(1 for x in offers_data if x.get("status") == "paused"),
-        "out_of_stock": sum(1 for x in offers_data if as_int(x.get("quantity")) <= 0),
+        "offers": len(enriched_offers),
+        "active": sum(1 for x in enriched_offers if x.get("status") == "active"),
+        "paused": sum(1 for x in enriched_offers if x.get("status") == "paused"),
+        "out_of_stock": sum(1 for x in enriched_offers if as_int(x.get("quantity")) <= 0),
+        "low_stock": sum(1 for x in enriched_offers if x.get("low_stock")),
     }
+    low_stock_items = sorted(
+        [item for item in enriched_offers if item.get("low_stock")],
+        key=lambda item: (as_int(item.get("quantity")), str(item.get("title") or "").casefold()),
+    )[:8]
+    low_stock_payload = [
+        {
+            "id": item.get("id"),
+            "title": item.get("title"),
+            "quantity": as_int(item.get("quantity")),
+            "min_stock": as_int(item.get("min_stock"), LOW_STOCK_DEFAULT),
+            "status": item.get("status"),
+        }
+        for item in low_stock_items
+    ]
+    support = _dashboard_chat_stats()
+    run_background(maybe_send_low_stock_alerts, offers_data)
     return miniapp_success(
-        {"balance": balance_data, "sales": sales_data, "stats": stats}, errors=errors
+        {
+            "balance": balance_data,
+            "sales": sales_data[:12],
+            "stats": stats,
+            "analytics": analytics,
+            "products": product_options,
+            "selected_product": {"id": product_id, "title": product_name},
+            "low_stock_items": low_stock_payload,
+            "support": support,
+        },
+        errors=errors,
     )
 
 
@@ -2399,7 +3091,8 @@ def miniapp_offers(user: dict[str, Any]):
     page = max(1, as_int(request.args.get("page"), 1))
     per_page = max(10, min(as_int(request.args.get("per_page"), 30), 100))
 
-    offers = collect_all_offers(force=force)
+    offers = enrich_offer_settings(collect_all_offers(force=force))
+    run_background(maybe_send_low_stock_alerts, offers)
     if query:
         offers = [
             item
@@ -2410,6 +3103,8 @@ def miniapp_offers(user: dict[str, Any]):
         ]
     if status == "out_of_stock":
         offers = [item for item in offers if as_int(item.get("quantity")) <= 0]
+    elif status == "low_stock":
+        offers = [item for item in offers if item.get("low_stock")]
     elif status != "all":
         offers = [item for item in offers if str(item.get("status")) == status]
 
@@ -2586,8 +3281,11 @@ def miniapp_offer(user: dict[str, Any], offer_id_value: int):
         raw.setdefault("category_id", normalized["category_id"])
     raw.setdefault("id", normalized.get("id") or offer_id_value)
 
+    settings = get_offer_settings(offer_id_value)
+    normalized["settings"] = settings
+    normalized["low_stock"] = as_int(normalized.get("quantity")) <= as_int(settings.get("min_stock"), LOW_STOCK_DEFAULT)
     return miniapp_success(
-        {"normalized": normalized, "raw": raw},
+        {"normalized": normalized, "raw": raw, "settings": settings},
         source_errors=source_errors,
     )
 
@@ -2619,9 +3317,16 @@ def miniapp_add_products(user: dict[str, Any], offer_id_value: int):
     results: list[Any] = []
     for index in range(0, len(values), 100):
         results.append(ggsel.add_products_v2(offer_id_value, values[index : index + 100]))
+    operation = record_operation("stock_add", offer_id_value, {"batches": results, "count": len(values)}, "completed")
+    settings = get_offer_settings(offer_id_value)
+    activation_result: Any = None
+    activate_once = body.get("auto_activate") is True
+    if settings.get("auto_activate") or activate_once:
+        activation_result = ggsel.batch_offers_v2("activate", [offer_id_value])
+        record_operation("offer_activate", offer_id_value, activation_result)
     invalidate_offer_cache()
-    audit_miniapp(user.get("id"), "stock_add", offer_id_value, {"count": len(values)})
-    return miniapp_success({"added": len(values), "batches": len(results), "results": results})
+    audit_miniapp(user.get("id"), "stock_add", offer_id_value, {"count": len(values), "auto_activate": bool(activation_result)})
+    return miniapp_success({"added": len(values), "batches": len(results), "results": results, "operation": operation, "auto_activation": activation_result})
 
 
 @app.delete("/app/api/offers/<int:offer_id_value>/products")
@@ -2635,11 +3340,16 @@ def miniapp_archive_products(user: dict[str, Any], offer_id_value: int):
     if not delete_all and not product_ids:
         raise ValueError("Выберите позиции или укажите delete_all")
     result = ggsel.archive_products_v2(offer_id_value, product_ids, delete_all)
+    record_operation("stock_archive", offer_id_value, result)
+    pause_result: Any = None
+    if delete_all and get_offer_settings(offer_id_value).get("auto_pause"):
+        pause_result = ggsel.batch_offers_v2("pause", [offer_id_value])
+        record_operation("offer_pause", offer_id_value, pause_result)
     invalidate_offer_cache()
     audit_miniapp(
-        user.get("id"), "stock_archive", offer_id_value, {"delete_all": delete_all, "product_ids": product_ids}
+        user.get("id"), "stock_archive", offer_id_value, {"delete_all": delete_all, "product_ids": product_ids, "auto_pause": bool(pause_result)}
     )
-    return miniapp_success(result)
+    return miniapp_success({"result": result, "auto_pause": pause_result})
 
 
 @app.patch("/app/api/offers/<int:offer_id_value>")
@@ -2660,6 +3370,7 @@ def miniapp_patch_offer(user: dict[str, Any], offer_id_value: int):
     if unknown:
         raise ValueError("Недопустимые поля: " + ", ".join(sorted(unknown)))
     result = ggsel.patch_offer_v2(offer_id_value, patch)
+    record_operation("offer_patch", offer_id_value, result, "completed")
     invalidate_offer_cache()
     audit_miniapp(user.get("id"), "offer_patch", offer_id_value, patch)
     return miniapp_success(result)
@@ -2677,6 +3388,7 @@ def miniapp_create_offer(user: dict[str, Any]):
         if data.get(field) in (None, ""):
             raise ValueError(f"Обязательное поле: {field}")
     result = ggsel.create_offer_v2(data)
+    record_operation("offer_create", "", result)
     invalidate_offer_cache()
     audit_miniapp(user.get("id"), "offer_create", "", data)
     return miniapp_success(result)
@@ -2691,9 +3403,26 @@ def miniapp_offer_action(user: dict[str, Any], offer_id_value: int):
     if action not in {"activate", "pause", "delete"}:
         raise ValueError("Недопустимое действие")
     result = ggsel.batch_offers_v2(action, [offer_id_value])
+    operation = record_operation(f"offer_{action}", offer_id_value, result)
     invalidate_offer_cache()
     audit_miniapp(user.get("id"), f"offer_{action}", offer_id_value, result)
-    return miniapp_success(result)
+    return miniapp_success({"result": result, "operation": operation})
+
+
+@app.get("/app/api/offers/<int:offer_id_value>/settings")
+@miniapp_api
+def miniapp_offer_settings_get(user: dict[str, Any], offer_id_value: int):
+    return miniapp_success(get_offer_settings(offer_id_value))
+
+
+@app.put("/app/api/offers/<int:offer_id_value>/settings")
+@miniapp_api
+def miniapp_offer_settings_put(user: dict[str, Any], offer_id_value: int):
+    body = request.get_json(silent=True) or {}
+    require_confirmation(body)
+    settings = save_offer_settings(offer_id_value, body)
+    audit_miniapp(user.get("id"), "offer_settings", offer_id_value, settings)
+    return miniapp_success(settings)
 
 
 @app.post("/app/api/offers/batch-action")
@@ -2708,9 +3437,10 @@ def miniapp_batch_action(user: dict[str, Any]):
     if not offer_ids or len(offer_ids) > 100:
         raise ValueError("Выберите от 1 до 100 офферов")
     result = ggsel.batch_offers_v2(action, offer_ids)
+    operation = record_operation(f"offers_{action}", ",".join(map(str, offer_ids)), result)
     invalidate_offer_cache()
     audit_miniapp(user.get("id"), f"offers_{action}", ",".join(map(str, offer_ids)), result)
-    return miniapp_success(result)
+    return miniapp_success({"result": result, "operation": operation})
 
 
 @app.get("/app/api/categories")
@@ -2758,6 +3488,40 @@ def miniapp_revenue(user: dict[str, Any]):
     )
 
 
+@app.get("/app/api/analytics")
+@miniapp_api
+def miniapp_analytics(user: dict[str, Any]):
+    start_text = str(request.args.get("start") or date.today().isoformat())
+    end_text = str(request.args.get("end") or start_text)
+    start = datetime.strptime(start_text, "%Y-%m-%d").date()
+    end = datetime.strptime(end_text, "%Y-%m-%d").date()
+    if end < start:
+        start, end = end, start
+    return miniapp_success(calculate_receipts_analytics(start, end))
+
+
+@app.get("/app/api/operations")
+@miniapp_api
+def miniapp_operations(user: dict[str, Any]):
+    refresh = request.args.get("refresh") == "1"
+    if refresh:
+        items = refresh_operations()
+    else:
+        with db_connect() as conn:
+            rows = conn.execute(
+                "SELECT id, job_id, operation, target, status, result_json, created_at, updated_at FROM async_operations ORDER BY id DESC LIMIT 100"
+            ).fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["result"] = json.loads(item.get("result_json") or "{}")
+            except json.JSONDecodeError:
+                item["result"] = item.get("result_json") or ""
+            items.append(item)
+    return miniapp_success(items)
+
+
 @app.get("/app/api/sales")
 @miniapp_api
 def miniapp_sales(user: dict[str, Any]):
@@ -2780,6 +3544,46 @@ def miniapp_order(user: dict[str, Any], invoice_id: str):
 def miniapp_reviews(user: dict[str, Any]):
     page = max(1, as_int(request.args.get("page"), 1))
     return miniapp_success(_review_payload(ggsel.reviews(page)))
+
+
+@app.get("/app/api/chats/status")
+@miniapp_api
+def miniapp_chat_status(user: dict[str, Any]):
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT message_date, created_at, debate_id, invoice_id FROM messages WHERE sender='buyer' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        total = conn.execute("SELECT COUNT(DISTINCT debate_id) AS total FROM messages WHERE debate_id != ''").fetchone()
+    signed_url = f"{APP_URL}/ggsel" + (f"?secret={GGSEL_WEBHOOK_SECRET}" if GGSEL_WEBHOOK_SECRET else "")
+    return miniapp_success({
+        "last_webhook_message": dict(row) if row else None,
+        "local_chats": as_int(total["total"] if total else 0),
+        "webhook_url": signed_url,
+        "compat_mode": GGSEL_WEBHOOK_COMPAT_MODE,
+        "note": "GGSEL API возвращает только непрочитанные чаты. Прочитанные диалоги доступны, если сообщения пришли через webhook и сохранились в базе.",
+    })
+
+
+@app.put("/app/api/chats/<debate_id>/label")
+@miniapp_api
+def miniapp_chat_label(user: dict[str, Any], debate_id: str):
+    body = request.get_json(silent=True) or {}
+    require_confirmation(body)
+    label = str(body.get("label") or "new").strip().lower()
+    if label not in {"new", "waiting", "replacement", "resolved"}:
+        raise ValueError("Неизвестная метка")
+    note = str(body.get("note") or "").strip()[:1000]
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO chat_labels(debate_id, label, note, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(debate_id) DO UPDATE SET label=excluded.label, note=excluded.note, updated_at=excluded.updated_at
+            """,
+            (str(debate_id), label, note, datetime.now(timezone.utc).isoformat()),
+        )
+    audit_miniapp(user.get("id"), "chat_label", debate_id, {"label": label})
+    return miniapp_success({"debate_id": debate_id, "label": label, "note": note})
 
 
 @app.get("/app/api/chats")
@@ -2832,6 +3636,25 @@ def miniapp_send_chat_message(user: dict[str, Any], debate_id: str):
     )
     audit_miniapp(user.get("id"), "chat_reply", debate_id, {"length": len(message)})
     return miniapp_success(result)
+
+
+@app.get("/app/api/export/offers")
+@miniapp_api
+def miniapp_export_offers(user: dict[str, Any]):
+    offers = enrich_offer_settings(collect_all_offers())
+    return miniapp_success([
+        {
+            "id": item.get("id"),
+            "title": item.get("title"),
+            "status": item.get("status"),
+            "price": item.get("price"),
+            "currency": item.get("currency"),
+            "quantity": item.get("quantity"),
+            "category": item.get("category"),
+            "min_stock": (item.get("settings") or {}).get("min_stock"),
+        }
+        for item in offers
+    ])
 
 
 @app.get("/app/api/audit")
@@ -2956,14 +3779,19 @@ def telegram_webhook():
 
 @app.route("/ggsel", methods=["POST", "GET"])
 def ggsel_webhook():
-    if GGSEL_WEBHOOK_SECRET:
-        provided = request.args.get("secret") or request.headers.get("X-GGSEL-Webhook-Secret", "")
-        if not secrets.compare_digest(str(provided), GGSEL_WEBHOOK_SECRET):
-            return jsonify({"ok": False}), 403
-
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         data = request.form.to_dict() or request.args.to_dict()
+
+    if GGSEL_WEBHOOK_SECRET:
+        provided = request.args.get("secret") or request.headers.get("X-GGSEL-Webhook-Secret", "")
+        valid_secret = bool(provided) and secrets.compare_digest(str(provided), GGSEL_WEBHOOK_SECRET)
+        looks_like_ggsel = any(data.get(key) not in (None, "") for key in ("DebateId", "InvoiceId", "MessageDate", "Message", "ImagePath"))
+        if not valid_secret:
+            if GGSEL_WEBHOOK_COMPAT_MODE and not provided and looks_like_ggsel:
+                logger.warning("Accepted legacy GGSEL webhook without secret; update forwarding URL to the signed URL shown in Mini App")
+            else:
+                return jsonify({"ok": False}), 403
 
     identity = "|".join(
         str(data.get(key) or "")

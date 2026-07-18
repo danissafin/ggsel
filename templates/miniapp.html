@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>GGSEL Seller</title>
   <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
-  <link rel="stylesheet" href="{{ url_for('static', filename='miniapp.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='miniapp.css', v='47') }}">
 </head>
 <body>
   <div id="app" class="app-shell">
@@ -20,24 +20,70 @@
 
     <div id="authNotice" class="notice hidden"></div>
 
-    <nav class="tabs" aria-label="Разделы">
+    <nav class="quick-tabs" aria-label="Быстрые разделы">
       <button class="tab active" data-section="dashboard">Обзор</button>
       <button class="tab" data-section="offers">Товары</button>
       <button class="tab" data-section="orders">Заказы</button>
-      <button class="tab" data-section="finance">Финансы</button>
       <button class="tab" data-section="chats">Чаты</button>
-      <button class="tab" data-section="reviews">Отзывы</button>
-      <button class="tab" data-section="categories">Категории</button>
-      <button class="tab" data-section="audit">История</button>
+      <button class="tab" data-section="more">Ещё</button>
     </nav>
 
     <main>
       <section id="section-dashboard" class="section active">
         <div class="section-heading">
-          <div><span class="kicker">Сегодня</span><h2>Панель продавца</h2></div>
+          <div><span class="kicker">Аналитика</span><h2>Дашборд</h2></div>
           <span id="ownerName" class="muted"></span>
         </div>
-        <div id="dashboardCards" class="metric-grid skeleton-grid"></div>
+
+        <div class="dashboard-controls panel compact-panel">
+          <div id="dashboardPeriods" class="chips dashboard-periods">
+            <button class="chip" data-dashboard-period="today">Сегодня</button>
+            <button class="chip" data-dashboard-period="yesterday">Вчера</button>
+            <button class="chip" data-dashboard-period="7d">7 дней</button>
+            <button class="chip active" data-dashboard-period="30d">30 дней</button>
+            <button class="chip" data-dashboard-period="6m">6 мес.</button>
+            <button class="chip" data-dashboard-period="custom">По дате</button>
+          </div>
+          <label class="select-field"><span>Товар</span><select id="dashboardProduct"><option value="">Все товары</option></select></label>
+          <form id="dashboardDateForm" class="date-grid dashboard-custom-dates hidden">
+            <label>С<input id="dashboardStart" type="date"></label>
+            <label>По<input id="dashboardEnd" type="date"></label>
+            <button class="primary-button" type="submit">Применить</button>
+          </form>
+        </div>
+
+        <div id="dashboardKpis" class="metric-grid dashboard-kpis skeleton-grid"></div>
+
+        <div class="panel dashboard-chart-panel">
+          <div class="panel-heading"><div><h3>Сумма продаж</h3><span id="dashboardPeriodLabel" class="muted"></span></div><span id="dashboardGrossTotal" class="chart-total"></span></div>
+          <div id="dashboardRevenueChart" class="bar-chart"><div class="empty">Загрузка…</div></div>
+          <div class="chart-legend"><span><i class="legend-gross"></i>Продажи</span><span><i class="legend-received"></i>К зачислению</span></div>
+        </div>
+
+        <div class="panel dashboard-chart-panel">
+          <div class="panel-heading"><div><h3>Заказы</h3><span class="muted">Количество оплаченных продаж</span></div><span id="dashboardOrdersTotal" class="chart-total"></span></div>
+          <div id="dashboardOrdersChart" class="bar-chart orders-chart"><div class="empty">Загрузка…</div></div>
+        </div>
+
+        <div id="dashboardApiNote" class="notice info-notice hidden"></div>
+
+        <div class="panel">
+          <div class="panel-heading"><h3>Состояние магазина</h3><button class="link-button" data-goto="offers">Все товары</button></div>
+          <div id="dashboardInventoryCards" class="metric-grid compact-metrics"></div>
+          <div id="dashboardSupport" class="dashboard-support"></div>
+        </div>
+
+        <div class="dashboard-columns">
+          <div class="panel">
+            <div class="panel-heading"><h3>Топ товаров</h3><button class="link-button" data-goto="finance">Финансы</button></div>
+            <div id="dashboardTopProducts" class="list"><div class="empty">Загрузка…</div></div>
+          </div>
+          <div class="panel">
+            <div class="panel-heading"><h3>Заканчиваются</h3><button class="link-button" data-goto="offers">Пополнить</button></div>
+            <div id="dashboardLowStock" class="list"><div class="empty">Загрузка…</div></div>
+          </div>
+        </div>
+
         <div class="panel">
           <div class="panel-heading"><h3>Последние продажи</h3><button class="link-button" data-goto="orders">Все заказы</button></div>
           <div id="dashboardSales" class="list"><div class="empty">Загрузка…</div></div>
@@ -58,6 +104,7 @@
           <button class="chip" data-status="active">Активные</button>
           <button class="chip" data-status="paused">Приостановлены</button>
           <button class="chip" data-status="out_of_stock">Без остатка</button>
+          <button class="chip" data-status="low_stock">Заканчиваются</button>
           <button class="chip" data-status="archived">Архив</button>
         </div>
         <div class="selection-row">
@@ -94,12 +141,21 @@
         <div id="balanceCards" class="metric-grid"></div>
         <div class="panel">
           <div class="panel-heading"><h3>Доход за период</h3></div>
+          <div class="chips finance-presets">
+            <button class="chip" data-period="today">Сегодня</button>
+            <button class="chip" data-period="7d">7 дней</button>
+            <button class="chip" data-period="30d">30 дней</button>
+            <button class="chip" data-period="month">Месяц</button>
+          </div>
           <form id="revenueForm" class="date-grid">
             <label>С<input id="revenueStart" type="date"></label>
             <label>По<input id="revenueEnd" type="date"></label>
             <button class="primary-button" type="submit">Рассчитать</button>
           </form>
           <div id="revenueResult"></div>
+          <div id="financeDaily" class="mini-chart"></div>
+          <div class="panel-heading"><h3>Топ товаров</h3></div>
+          <div id="financeTopProducts" class="list"></div>
         </div>
         <div class="panel">
           <div class="panel-heading"><h3>Последние чеки</h3><button id="receiptsRefresh" class="link-button">Обновить</button></div>
@@ -109,6 +165,15 @@
 
       <section id="section-chats" class="section">
         <div class="section-heading"><div><span class="kicker">Поддержка</span><h2>Чаты</h2></div><button id="chatsRefresh" class="icon-button">↻</button></div>
+        <div id="chatStatus" class="notice"><div class="empty">Проверяю webhook…</div></div>
+        <label class="search-field"><span>⌕</span><input id="chatSearch" type="search" placeholder="Email, заказ, товар или текст"></label>
+        <div id="chatFilters" class="chips">
+          <button class="chip active" data-chat-label="all">Все</button>
+          <button class="chip" data-chat-label="new">Новые</button>
+          <button class="chip" data-chat-label="waiting">Ждём клиента</button>
+          <button class="chip" data-chat-label="replacement">Замена</button>
+          <button class="chip" data-chat-label="resolved">Решено</button>
+        </div>
         <div id="chatsList" class="card-list"><div class="empty">Загрузка…</div></div>
       </section>
 
@@ -124,6 +189,23 @@
           <button class="primary-button compact" type="submit">Найти</button>
         </form>
         <div id="categoriesList" class="list"><div class="empty">Введите запрос или откройте список</div></div>
+      </section>
+
+      <section id="section-operations" class="section">
+        <div class="section-heading"><div><span class="kicker">Очередь</span><h2>Операции</h2></div><button id="operationsRefresh" class="icon-button">↻</button></div>
+        <div id="operationsList" class="card-list"><div class="empty">Загрузка…</div></div>
+      </section>
+
+      <section id="section-more" class="section">
+        <div class="section-heading"><div><span class="kicker">Инструменты</span><h2>Ещё</h2></div></div>
+        <div class="more-grid">
+          <button class="more-card" data-goto="finance"><span>₽</span><b>Финансы</b><small>Доход и аналитика</small></button>
+          <button class="more-card" data-goto="reviews"><span>★</span><b>Отзывы</b><small>Репутация</small></button>
+          <button class="more-card" data-goto="categories"><span>⌗</span><b>Категории</b><small>Справочник</small></button>
+          <button class="more-card" data-goto="operations"><span>↻</span><b>Операции</b><small>Фоновые задачи</small></button>
+          <button class="more-card" data-goto="audit"><span>☰</span><b>История</b><small>Журнал действий</small></button>
+          <button id="exportOffersBtn" class="more-card"><span>⇩</span><b>Экспорт</b><small>Товары в JSON</small></button>
+        </div>
       </section>
 
       <section id="section-audit" class="section">
@@ -146,6 +228,7 @@
     <textarea id="stockValues" rows="10" placeholder="Каждый ключ или строка — с новой строки"></textarea>
     <div class="file-row"><label class="secondary-button file-button">Загрузить TXT<input id="stockFile" type="file" accept=".txt,text/plain"></label><span id="stockCount" class="muted">0 строк</span></div>
     <div id="stockWarnings" class="notice hidden"></div>
+    <label class="switch-row"><span>Сразу включить продажу после загрузки</span><input id="stockAutoActivate" type="checkbox"></label>
     <button id="stockSubmit" class="primary-button full">Добавить содержимое</button>
   </dialog>
 
@@ -176,11 +259,26 @@
 
   <dialog id="chatDialog" class="modal large-modal">
     <div class="modal-header"><div><span class="kicker">Диалог</span><h2 id="chatDialogTitle">Чат</h2></div><button class="close-button" data-close>×</button></div>
+    <div id="chatDialogMeta" class="chat-dialog-meta"></div>
+    <div class="chips chat-label-actions">
+      <button class="chip" data-set-chat-label="new">Новый</button>
+      <button class="chip" data-set-chat-label="waiting">Ждём клиента</button>
+      <button class="chip" data-set-chat-label="replacement">Замена</button>
+      <button class="chip" data-set-chat-label="resolved">Решено</button>
+    </div>
     <div id="chatMessages" class="messages"></div>
     <form id="chatReplyForm" class="reply-form"><textarea id="chatReplyText" rows="3" placeholder="Ответ покупателю"></textarea><button class="primary-button" type="submit">Отправить</button></form>
   </dialog>
 
+  <nav class="bottom-nav" aria-label="Основная навигация">
+    <button class="tab active" data-section="dashboard"><span>⌂</span><small>Обзор</small></button>
+    <button class="tab" data-section="offers"><span>▦</span><small>Товары</small></button>
+    <button class="tab" data-section="orders"><span>＃</span><small>Заказы</small></button>
+    <button class="tab" data-section="chats"><span>✉</span><small>Чаты</small></button>
+    <button class="tab" data-section="more"><span>•••</span><small>Ещё</small></button>
+  </nav>
+
   <div id="toast" class="toast hidden"></div>
-  <script src="{{ url_for('static', filename='miniapp.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='miniapp.js', v='47') }}" defer></script>
 </body>
 </html>

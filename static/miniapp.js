@@ -14,6 +14,14 @@
     selectedOffers: new Set(),
     currentOffer: null,
     currentChat: null,
+    currentChatInfo: null,
+    chats: [],
+    chatQuery: '',
+    chatLabel: 'all',
+    dashboardPeriod: '30d',
+    dashboardStart: '',
+    dashboardEnd: '',
+    dashboardProduct: '',
   };
 
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -93,6 +101,8 @@
         if (name === 'reviews') await loadReviews();
         if (name === 'categories') await loadCategories();
         if (name === 'audit') await loadAudit();
+        if (name === 'operations') await loadOperations();
+        if (name === 'more') return;
       } catch (error) { toast(error.message, true); }
     }
     window.scrollTo({top:0, behavior:'smooth'});
@@ -103,21 +113,146 @@
     $('#ownerName').textContent = data.first_name ? `${data.first_name} · ID ${data.seller_id || '—'}` : '';
   }
 
-  async function loadDashboard() {
-    $('#dashboardCards').innerHTML = '<div class="metric-card"><span class="label">Загрузка</span><span class="value">…</span></div>'.repeat(4);
-    const payload = await api('/app/api/dashboard');
-    const {balance = {}, stats = {}, sales = []} = payload.data || {};
-    $('#dashboardCards').innerHTML = [
-      ['Доступно', balance.amount_t_free ?? '—', true],
-      ['Активных товаров', stats.active ?? 0],
+  function localDateValue(value) {
+    const date = value instanceof Date ? value : new Date(value);
+    const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+    return local.toISOString().slice(0, 10);
+  }
+
+  function dashboardRange(period) {
+    const end = new Date();
+    const start = new Date(end);
+    if (period === 'today') return [localDateValue(end), localDateValue(end)];
+    if (period === 'yesterday') {
+      start.setDate(start.getDate() - 1);
+      return [localDateValue(start), localDateValue(start)];
+    }
+    if (period === '7d') start.setDate(start.getDate() - 6);
+    else if (period === '30d') start.setDate(start.getDate() - 29);
+    else if (period === '6m') { start.setMonth(start.getMonth() - 6); start.setDate(start.getDate() + 1); }
+    return [localDateValue(start), localDateValue(end)];
+  }
+
+  function formatPeriodLabel(start, end) {
+    if (!start || !end) return '';
+    const a = new Date(`${start}T00:00:00`);
+    const b = new Date(`${end}T00:00:00`);
+    const options = {day:'2-digit', month:'short'};
+    if (start === end) return a.toLocaleDateString('ru-RU', {day:'2-digit', month:'long', year:'numeric'});
+    return `${a.toLocaleDateString('ru-RU', options)} — ${b.toLocaleDateString('ru-RU', {...options, year:'numeric'})}`;
+  }
+
+  function compactMoney(value, currency = 'USD') {
+    const number = Number(value || 0);
+    const compact = new Intl.NumberFormat('ru-RU', {notation:'compact', maximumFractionDigits:1}).format(number);
+    return currency === 'USD' ? `$${compact}` : `${compact} ₽`;
+  }
+
+  function trendMarkup(value, suffix = '%') {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) return '<span class="metric-trend neutral">нет базы</span>';
+    const number = Number(value);
+    const cls = number > 0 ? 'up' : number < 0 ? 'down' : 'neutral';
+    const arrow = number > 0 ? '↑' : number < 0 ? '↓' : '→';
+    return `<span class="metric-trend ${cls}">${arrow} ${Math.abs(number).toLocaleString('ru-RU', {maximumFractionDigits:2})}${suffix}</span>`;
+  }
+
+  function renderVerticalChart(container, series, mode = 'money') {
+    if (!series?.length) { container.innerHTML = '<div class="empty">Нет данных за период</div>'; return; }
+    const max = Math.max(1, ...series.map(row => mode === 'orders' ? Number(row.count || 0) : Number(row.gross || 0)));
+    container.innerHTML = `<div class="bar-chart-scroll"><div class="bar-chart-grid">${series.map(row => {
+      const gross = Number(row.gross || 0);
+      const received = Number(row.received || 0);
+      const count = Number(row.count || 0);
+      const mainHeight = Math.max(mode === 'orders' && count > 0 ? 5 : gross > 0 ? 5 : 0, (mode === 'orders' ? count : gross) / max * 100);
+      const secondaryHeight = gross > 0 ? Math.min(mainHeight, received / max * 100) : 0;
+      const title = mode === 'orders'
+        ? `${row.label}: ${count} заказов`
+        : `${row.label}: продажи ${money(gross,'USD')}, к зачислению ${money(received,'USD')}`;
+      return `<div class="bar-column" title="${esc(title)}">
+        <div class="bar-value">${mode === 'orders' ? esc(count) : compactMoney(gross, 'USD')}</div>
+        <div class="bar-well">${mode === 'orders'
+          ? `<i class="bar-single" style="height:${mainHeight}%"></i>`
+          : `<i class="bar-gross" style="height:${mainHeight}%"></i><i class="bar-received" style="height:${secondaryHeight}%"></i>`}
+        </div>
+        <span>${esc(row.label)}</span>
+      </div>`;
+    }).join('')}</div></div>`;
+  }
+
+  function populateDashboardProducts(items) {
+    const select = $('#dashboardProduct');
+    const current = state.dashboardProduct;
+    select.innerHTML = '<option value="">Все товары</option>' + (items || []).map(item => `<option value="${esc(item.id)}">${esc(item.title)}</option>`).join('');
+    select.value = current;
+  }
+
+  function renderDashboardKpis(analytics) {
+    const current = analytics.current || {};
+    const delta = analytics.deltas || {};
+    const cards = [
+      ['Сумма продаж', money(current.gross, 'USD'), delta.gross, 'За выбранный период'],
+      ['Продажи', Number(current.count || 0).toLocaleString('ru-RU'), delta.count, 'Оплаченных заказов'],
+      ['К зачислению', money(current.received, 'USD'), delta.received, 'После комиссий'],
+      ['Средний чек', money(current.average, 'USD'), delta.average, 'На одну продажу'],
+    ];
+    $('#dashboardKpis').innerHTML = cards.map(([label,value,change,hint], index) => `<article class="metric-card dashboard-metric ${index === 0 ? 'accent' : ''}">
+      <div class="metric-top"><span class="label">${esc(label)}</span>${trendMarkup(change)}</div>
+      <span class="value">${value}</span><small>${esc(hint)}</small>
+    </article>`).join('');
+  }
+
+  async function loadDashboard(force = false) {
+    if (!state.dashboardStart || !state.dashboardEnd) [state.dashboardStart, state.dashboardEnd] = dashboardRange(state.dashboardPeriod);
+    $('#dashboardKpis').innerHTML = '<div class="metric-card"><span class="label">Загрузка</span><span class="value">…</span></div>'.repeat(4);
+    $('#dashboardRevenueChart').innerHTML = '<div class="empty">Считаю продажи…</div>';
+    $('#dashboardOrdersChart').innerHTML = '<div class="empty">Считаю заказы…</div>';
+    const params = new URLSearchParams({start:state.dashboardStart, end:state.dashboardEnd});
+    if (state.dashboardProduct) params.set('product_id', state.dashboardProduct);
+    if (force) params.set('refresh', '1');
+    const payload = await api(`/app/api/dashboard?${params}`);
+    const {balance = {}, stats = {}, sales = [], analytics = {}, products = [], low_stock_items = [], support = {}} = payload.data || {};
+    populateDashboardProducts(products);
+    renderDashboardKpis(analytics);
+    $('#dashboardPeriodLabel').textContent = formatPeriodLabel(analytics.start, analytics.end);
+    $('#dashboardGrossTotal').textContent = money(analytics.current?.gross, 'USD');
+    $('#dashboardOrdersTotal').textContent = `${Number(analytics.current?.count || 0).toLocaleString('ru-RU')} заказов`;
+    renderVerticalChart($('#dashboardRevenueChart'), analytics.series || [], 'money');
+    renderVerticalChart($('#dashboardOrdersChart'), analytics.series || [], 'orders');
+
+    $('#dashboardInventoryCards').innerHTML = [
+      ['Доступно', money(balance.amount_t_free, 'USD')],
+      ['Ожидают зачисления', money(balance.amount_t_lock, 'USD')],
+      ['Активных', stats.active ?? 0],
       ['На паузе', stats.paused ?? 0],
       ['Без остатка', stats.out_of_stock ?? 0],
-    ].map(([label, value, accent]) => `<div class="metric-card ${accent ? 'accent' : ''}"><span class="label">${esc(label)}</span><span class="value">${esc(value)}</span></div>`).join('');
+      ['Заканчиваются', stats.low_stock ?? 0],
+    ].map(([label,value]) => `<div class="metric-card compact-card"><span class="label">${esc(label)}</span><span class="value">${typeof value === 'number' ? value.toLocaleString('ru-RU') : value}</span></div>`).join('');
+
+    const supportOpen = Number(support.new || 0) + Number(support.waiting || 0) + Number(support.replacement || 0);
+    $('#dashboardSupport').innerHTML = `<button class="support-summary plain-button" data-goto="chats"><div><span class="label">Поддержка</span><strong>${supportOpen} активных диалогов</strong><small>${Number(support.messages_today || 0)} сообщений покупателей сегодня</small></div><span class="support-arrow">→</span></button>`;
+
+    $('#dashboardTopProducts').innerHTML = (analytics.top_products || []).slice(0,6).map((item,index) => `<button class="list-item plain-button dashboard-product-link" data-product-id="${esc(item.id)}"><div><strong>${index+1}. ${esc(item.name)}</strong><span class="muted">${esc(item.count)} продаж · средний чек ${money(item.average,'USD')}</span></div><span class="amount">${money(item.gross,'USD')}</span></button>`).join('') || '<div class="empty">Нет продаж за период</div>';
+    $('#dashboardLowStock').innerHTML = low_stock_items.map(item => `<button class="list-item plain-button dashboard-stock-link" data-offer-id="${esc(item.id)}"><div><strong>${esc(item.title)}</strong><span class="muted">Минимум: ${esc(item.min_stock)}</span></div><span class="badge warning">Остаток ${esc(item.quantity)}</span></button>`).join('') || '<div class="empty">Остатки в порядке</div>';
     renderSales(sales, $('#dashboardSales'), 8);
-    if (payload.errors && Object.keys(payload.errors).length) {
-      const message = Object.entries(payload.errors).map(([k,v]) => `${k}: ${v}`).join('\n');
-      console.warn(message);
-    }
+
+    const notes = [];
+    if (!analytics.complete) notes.push('История чеков загружена не полностью. Для длинных периодов увеличьте RECEIPTS_MAX_PAGES в Railway.');
+    if (analytics.api_limits?.note) notes.push(analytics.api_limits.note);
+    const noteNode = $('#dashboardApiNote');
+    if (notes.length) { noteNode.textContent = notes.join(' '); noteNode.classList.remove('hidden'); } else noteNode.classList.add('hidden');
+    if (payload.errors && Object.keys(payload.errors).length) console.warn(payload.errors);
+  }
+
+  async function setDashboardPeriod(period) {
+    state.dashboardPeriod = period;
+    $$('#dashboardPeriods [data-dashboard-period]').forEach(button => button.classList.toggle('active', button.dataset.dashboardPeriod === period));
+    const form = $('#dashboardDateForm');
+    if (period === 'custom') { form.classList.remove('hidden'); return; }
+    form.classList.add('hidden');
+    [state.dashboardStart, state.dashboardEnd] = dashboardRange(period);
+    $('#dashboardStart').value = state.dashboardStart;
+    $('#dashboardEnd').value = state.dashboardEnd;
+    await loadDashboard();
   }
 
   function renderSales(items, container, limit = 30) {
@@ -153,7 +288,7 @@
           ${state.selectionMode ? `<input class="offer-select" type="checkbox" ${selected ? 'checked' : ''} aria-label="Выбрать товар">` : ''}
           <div class="offer-main">
             <div class="offer-title">${esc(item.title)}</div>
-            <div class="offer-meta"><span class="badge ${esc(item.status)}">${esc(statusLabel(item.status))}</span><span class="badge ${stockClass}">Остаток: ${esc(item.quantity)}</span><span class="badge">ID ${esc(item.id)}</span></div>
+            <div class="offer-meta"><span class="badge ${esc(item.status)}">${esc(statusLabel(item.status))}</span><span class="badge ${stockClass}">Остаток: ${esc(item.quantity)}</span>${item.low_stock ? '<span class="badge warning">Заканчивается</span>' : ''}<span class="badge">ID ${esc(item.id)}</span></div>
           </div>
         </div>
         <div class="offer-bottom">
@@ -186,6 +321,7 @@
       ]);
       const item = offerResult.data?.normalized || {};
       const raw = offerResult.data?.raw || {};
+      const settings = offerResult.data?.settings || item.settings || {};
       const products = stockResult.data || [];
       $('#offerDialogTitle').textContent = item.title || `Товар #${id}`;
       $('#offerDialogBody').innerHTML = `
@@ -198,6 +334,13 @@
         </div>
         <p class="muted">${esc(item.category || '')}</p>
         <p>${esc(getAny(raw, ['description_ru','info','description'], 'Описание не указано'))}</p>
+        <div class="settings-card">
+          <div class="panel-heading"><h3>Контроль остатков</h3><span class="badge">мин. ${esc(settings.min_stock ?? 3)}</span></div>
+          <label>Минимальный остаток<input id="offerMinStock" type="number" min="0" value="${esc(settings.min_stock ?? 3)}"></label>
+          <label class="switch-row"><span>Автоматически включать после пополнения</span><input id="offerAutoActivate" type="checkbox" ${settings.auto_activate ? 'checked' : ''}></label>
+          <label class="switch-row"><span>Автоматически ставить на паузу при нуле</span><input id="offerAutoPause" type="checkbox" ${settings.auto_pause ? 'checked' : ''}></label>
+          <button class="secondary-button full" data-modal-action="save-settings">Сохранить настройки</button>
+        </div>
         <div class="offer-actions modal-actions">
           <button class="primary-button" data-modal-action="stock">＋ Добавить содержимое</button>
           <button class="secondary-button" data-modal-action="edit">Изменить</button>
@@ -206,7 +349,7 @@
         </div>
         <div class="panel-heading stock-heading"><h3>Содержимое (${products.length})</h3>${products.length ? '<button class="danger-button compact" data-modal-action="archive-all">Очистить склад</button>' : ''}</div>
         <div class="stock-list">${products.length ? products.map(product => `<div class="stock-row"><span>${esc(product.value)}</span><span>${esc(product.status || '')}</span></div>`).join('') : `<div class="empty">${esc(stockResult.stockError || 'Склад пуст')}</div>`}</div>`;
-      $('#offerDialog').dataset.offer = JSON.stringify({item, raw});
+      $('#offerDialog').dataset.offer = JSON.stringify({item, raw, settings});
     } catch (error) {
       $('#offerDialogBody').innerHTML = `<div class="notice">${esc(error.message)}</div>`;
     }
@@ -218,6 +361,9 @@
     $('#stockValues').value = '';
     $('#stockCount').textContent = '0 строк';
     $('#stockWarnings').classList.add('hidden');
+    let settings = {};
+    try { settings = JSON.parse($('#offerDialog').dataset.offer || '{}').settings || {}; } catch {}
+    $('#stockAutoActivate').checked = !!settings.auto_activate;
     openDialog($('#stockDialog'));
   }
 
@@ -234,13 +380,28 @@
     if (!ok) return;
     const button = $('#stockSubmit'); button.disabled = true; button.textContent = 'Добавляю…';
     try {
-      const result = await api(`/app/api/offers/${state.currentOffer}/products`, {method:'POST', body:JSON.stringify({values, confirm:true})});
-      toast(`Добавлено: ${result.data.added}`);
+      const result = await api(`/app/api/offers/${state.currentOffer}/products`, {method:'POST', body:JSON.stringify({values, auto_activate:$('#stockAutoActivate').checked, confirm:true})});
+      toast(result.data.auto_activation ? `Добавлено: ${result.data.added}. Активация запущена` : `Добавлено: ${result.data.added}`);
       closeDialog($('#stockDialog'));
       closeDialog($('#offerDialog'));
       await loadOffers(true);
     } catch (error) { toast(error.message, true); }
     finally { button.disabled = false; button.textContent = 'Добавить содержимое'; }
+  }
+
+  async function saveOfferSettings(id) {
+    const payload = {
+      min_stock: Number($('#offerMinStock').value || 0),
+      auto_activate: $('#offerAutoActivate').checked,
+      auto_pause: $('#offerAutoPause').checked,
+      confirm: true,
+    };
+    if (!await confirmAction('Сохранить настройки контроля остатков?')) return;
+    try {
+      await api(`/app/api/offers/${id}/settings`, {method:'PUT', body:JSON.stringify(payload)});
+      toast('Настройки сохранены');
+      await showOffer(id);
+    } catch (error) { toast(error.message, true); }
   }
 
   async function offerAction(id, action) {
@@ -357,12 +518,13 @@
     $('#revenueEnd').value = today.toISOString().slice(0,10);
     $('#revenueStart').value = start.toISOString().slice(0,10);
     await Promise.all([loadBalance(), loadReceipts()]);
+    await calculateRevenue({preventDefault(){}});
   }
 
   async function loadBalance() {
     const {data} = await api('/app/api/balance');
     $('#balanceCards').innerHTML = [
-      ['Доступно', data.amount_t_free, true], ['Заблокировано', data.amount_t_lock], ['С ограничением', data.amount_t_plus]
+      ['Доступно', money(data.amount_t_free, 'USD'), true], ['Заблокировано', money(data.amount_t_lock, 'USD')], ['С ограничением', money(data.amount_t_plus, 'USD')]
     ].map(([label,value,accent]) => `<div class="metric-card ${accent?'accent':''}"><span class="label">${label}</span><span class="value">${esc(value)}</span></div>`).join('');
   }
 
@@ -373,37 +535,85 @@
     $('#receiptsList').innerHTML = data.map(item => {
       const op = item.operation || {}; const product = item.product || {};
       const productName = typeof product.name === 'string' ? product.name : (product.name?.[0]?.value || 'Операция');
-      return `<div class="list-item"><div><strong>${esc(productName)}</strong><span class="muted">${formatDate(op.datetime)} · ${esc(op.type || '')}</span></div><div class="amount">${esc(op.on_account ?? op.price ?? '—')}</div></div>`;
+      return `<div class="list-item"><div><strong>${esc(productName)}</strong><span class="muted">${formatDate(op.datetime)} · ${esc(op.type || '')}</span></div><div class="amount">${money(op.on_account ?? op.price ?? 0, 'USD')}</div></div>`;
     }).join('');
   }
 
   async function calculateRevenue(event) {
-    event.preventDefault();
+    event?.preventDefault?.();
     $('#revenueResult').innerHTML = '<div class="empty">Считаю…</div>';
     try {
       const params = new URLSearchParams({start:$('#revenueStart').value, end:$('#revenueEnd').value});
-      const {data} = await api(`/app/api/revenue?${params}`);
-      $('#revenueResult').innerHTML = `<div class="detail-grid"><div class="detail"><span>Получено</span><b>${money(data.received,'RUB')}</b></div><div class="detail"><span>Оборот</span><b>${money(data.gross,'RUB')}</b></div><div class="detail"><span>Операций</span><b>${esc(data.count)}</b></div><div class="detail"><span>Данные</span><b>${data.complete ? 'Полные' : 'Частичные'}</b></div></div>`;
+      const {data} = await api(`/app/api/analytics?${params}`);
+      $('#revenueResult').innerHTML = `<div class="detail-grid"><div class="detail"><span>Получено</span><b>${money(data.received,'USD')}</b></div><div class="detail"><span>Оборот</span><b>${money(data.gross,'USD')}</b></div><div class="detail"><span>Продаж</span><b>${esc(data.count)}</b></div><div class="detail"><span>Средний чек</span><b>${money(data.average,'USD')}</b></div></div><p class="muted">Данные: ${data.complete ? 'полные' : 'частичные'}</p>`;
+      const max = Math.max(1, ...(data.daily || []).map(x => Number(x.received || 0)));
+      $('#financeDaily').innerHTML = (data.daily || []).map(row => `<div class="chart-row"><span>${esc(row.date.slice(5))}</span><div class="chart-track"><i style="width:${Math.max(2, Number(row.received || 0) / max * 100)}%"></i></div><b>${money(row.received,'USD')}</b></div>`).join('') || '<div class="empty">Нет продаж за период</div>';
+      $('#financeTopProducts').innerHTML = (data.top_products || []).map((item,index) => `<div class="list-item"><div><strong>${index+1}. ${esc(item.name)}</strong><span class="muted">${esc(item.count)} продаж</span></div><span class="amount">${money(item.received,'USD')}</span></div>`).join('') || '<div class="empty">Нет данных</div>';
     } catch (error) { $('#revenueResult').innerHTML = `<div class="notice">${esc(error.message)}</div>`; }
   }
 
-  async function loadChats() {
-    $('#chatsList').innerHTML = '<div class="empty">Загрузка…</div>';
-    const {data} = await api('/app/api/chats');
-    if (!data?.length) { $('#chatsList').innerHTML = '<div class="empty">Чатов нет</div>'; return; }
-    $('#chatsList').innerHTML = data.map(item => {
+  function applyFinancePeriod(period) {
+    const end = new Date();
+    const start = new Date(end);
+    if (period === 'today') start.setTime(end.getTime());
+    if (period === '7d') start.setDate(end.getDate() - 6);
+    if (period === '30d') start.setDate(end.getDate() - 29);
+    if (period === 'month') start.setDate(1);
+    $('#revenueStart').value = start.toISOString().slice(0,10);
+    $('#revenueEnd').value = end.toISOString().slice(0,10);
+    calculateRevenue({preventDefault(){}});
+  }
+
+
+  function chatLabelName(label) {
+    return ({new:'Новый', waiting:'Ждём клиента', replacement:'Замена', resolved:'Решено'})[label] || 'Новый';
+  }
+
+  function renderChats() {
+    const query = state.chatQuery.toLowerCase();
+    const items = (state.chats || []).filter(item => {
+      if (state.chatLabel !== 'all' && (item.label || 'new') !== state.chatLabel) return false;
+      if (!query) return true;
+      return [item.email,item.invoice_id,item.product_name,item.preview,item.id_i].some(value => String(value || '').toLowerCase().includes(query));
+    });
+    if (!items.length) { $('#chatsList').innerHTML = '<div class="empty">Чаты не найдены</div>'; return; }
+    $('#chatsList').innerHTML = items.map(item => {
       const id = getAny(item, ['id_i','debate_id','id','invoice_id']);
       const title = getAny(item, ['product_name','name','subject','email'], item.invoice_id ? `Заказ #${item.invoice_id}` : `Диалог #${id}`);
       const preview = getAny(item, ['preview','message','text'], 'Открыть переписку');
       const unread = Number(item.cnt_new || 0);
       const meta = [item.email, item.invoice_id ? `заказ #${item.invoice_id}` : '', formatDate(item.last_message)].filter(Boolean).join(' · ');
-      return `<button class="chat-card plain-button" data-chat="${esc(id)}"><div class="panel-heading"><strong>${esc(title)}</strong><span class="badge">#${esc(id)}${unread > 0 ? ` · ${unread} новых` : ''}</span></div><p>${esc(typeof preview === 'object' ? JSON.stringify(preview) : preview)}</p><span class="muted">${esc(meta)}</span></button>`;
+      return `<button class="chat-card plain-button" data-chat="${esc(id)}"><div class="panel-heading"><strong>${esc(title)}</strong><span class="badge">#${esc(id)}${unread > 0 ? ` · ${unread} новых` : ''}</span></div><p>${esc(typeof preview === 'object' ? JSON.stringify(preview) : preview)}</p><div class="chat-card-footer"><span class="badge chat-${esc(item.label || 'new')}">${esc(chatLabelName(item.label || 'new'))}</span><span class="muted">${esc(meta)}</span></div></button>`;
     }).join('');
+  }
+
+  async function loadChatStatus() {
+    try {
+      const {data} = await api('/app/api/chats/status');
+      const last = data.last_webhook_message;
+      const lastDate = last ? formatDate(last.message_date || last.created_at) : 'ещё не было';
+      const lastMs = last ? new Date(last.message_date || last.created_at).getTime() : NaN;
+      const stale = !last || Number.isNaN(lastMs) || (Date.now() - lastMs > 24*60*60*1000);
+      $('#chatStatus').className = `notice ${stale ? 'warning-notice' : 'success-notice'}`;
+      $('#chatStatus').innerHTML = `<b>Webhook: ${stale ? 'нужно проверить' : 'работает'}</b><br>Последнее входящее: ${esc(lastDate)} · Локальных диалогов: ${esc(data.local_chats)}<br><small>${esc(data.note)}</small><button id="copyWebhookUrl" class="link-button">Скопировать URL webhook</button>`;
+      $('#copyWebhookUrl')?.addEventListener('click', async () => { await navigator.clipboard.writeText(data.webhook_url); toast('URL скопирован'); });
+    } catch (error) { $('#chatStatus').innerHTML = `<b>Не удалось проверить webhook:</b> ${esc(error.message)}`; }
+  }
+
+  async function loadChats() {
+    $('#chatsList').innerHTML = '<div class="empty">Загрузка…</div>';
+    await loadChatStatus();
+    const {data} = await api('/app/api/chats');
+    state.chats = data || [];
+    renderChats();
   }
 
   async function openChat(id) {
     state.currentChat = String(id);
-    $('#chatDialogTitle').textContent = `Диалог #${id}`;
+    state.currentChatInfo = state.chats.find(item => String(getAny(item,['id_i','debate_id','id'])) === String(id)) || {};
+    $('#chatDialogTitle').textContent = state.currentChatInfo.product_name || state.currentChatInfo.email || `Диалог #${id}`;
+    $('#chatDialogMeta').innerHTML = `<b>${esc(state.currentChatInfo.email || '')}</b><span class="muted">${state.currentChatInfo.invoice_id ? `Заказ #${esc(state.currentChatInfo.invoice_id)} · ` : ''}Диалог #${esc(id)}</span>`;
+    $$('.chat-label-actions [data-set-chat-label]').forEach(btn => btn.classList.toggle('active', btn.dataset.setChatLabel === (state.currentChatInfo.label || 'new')));
     $('#chatMessages').innerHTML = '<div class="empty">Загрузка…</div>';
     openDialog($('#chatDialog'));
     try {
@@ -419,6 +629,19 @@
       $('#chatMessages').scrollTop = $('#chatMessages').scrollHeight;
     } catch (error) { $('#chatMessages').innerHTML = `<div class="notice">${esc(error.message)}</div>`; }
   }
+
+  async function setChatLabel(label) {
+    if (!state.currentChat) return;
+    try {
+      await api(`/app/api/chats/${encodeURIComponent(state.currentChat)}/label`, {method:'PUT', body:JSON.stringify({label, confirm:true})});
+      const item = state.chats.find(x => String(getAny(x,['id_i','debate_id','id'])) === String(state.currentChat));
+      if (item) item.label = label;
+      state.currentChatInfo = item || state.currentChatInfo;
+      $$('.chat-label-actions [data-set-chat-label]').forEach(btn => btn.classList.toggle('active', btn.dataset.setChatLabel === label));
+      renderChats(); toast('Метка сохранена');
+    } catch (error) { toast(error.message, true); }
+  }
+
 
   async function sendChatReply(event) {
     event.preventDefault();
@@ -453,6 +676,24 @@
     $('#categoriesList').innerHTML = data.slice(0,200).map(item => `<div class="list-item"><div><strong>${esc(item.title)}</strong><span class="muted">ID категории</span></div><span class="badge code">${esc(item.id)}</span></div>`).join('');
   }
 
+  async function loadOperations(force = false) {
+    $('#operationsList').innerHTML = '<div class="empty">Загрузка…</div>';
+    const {data} = await api(`/app/api/operations${force ? '?refresh=1' : ''}`);
+    if (!data?.length) { $('#operationsList').innerHTML = '<div class="empty">Операций пока нет</div>'; return; }
+    const labels = {queued:'В очереди',running:'Выполняется',completed:'Готово',failed:'Ошибка'};
+    $('#operationsList').innerHTML = data.map(item => `<article class="operation-card"><div class="panel-heading"><strong>${esc(item.operation)}</strong><span class="badge op-${esc(item.status)}">${esc(labels[item.status] || item.status)}</span></div><p>Цель: ${esc(item.target || '—')}</p><span class="muted">Job: ${esc(item.job_id || '—')} · ${formatDate(item.updated_at || item.created_at)}</span></article>`).join('');
+  }
+
+  async function exportOffers() {
+    try {
+      const {data} = await api('/app/api/export/offers');
+      const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a'); link.href = url; link.download = `ggsel-offers-${new Date().toISOString().slice(0,10)}.json`; link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000); toast('Экспорт готов');
+    } catch (error) { toast(error.message, true); }
+  }
+
   async function loadAudit() {
     $('#auditList').innerHTML = '<div class="empty">Загрузка…</div>';
     const {data} = await api('/app/api/audit');
@@ -462,7 +703,16 @@
 
   async function globalRefresh() {
     state.loaded.delete(state.section);
-    await switchSection(state.section);
+    if (state.section === 'dashboard') await loadDashboard(true);
+    else if (state.section === 'offers') await loadOffers(true);
+    else if (state.section === 'orders') await loadSales();
+    else if (state.section === 'finance') await loadFinance();
+    else if (state.section === 'chats') await loadChats();
+    else if (state.section === 'reviews') await loadReviews();
+    else if (state.section === 'categories') await loadCategories();
+    else if (state.section === 'operations') await loadOperations(true);
+    else if (state.section === 'audit') await loadAudit();
+    state.loaded.add(state.section);
     toast('Данные обновлены');
   }
 
@@ -470,6 +720,12 @@
     $$('.tab').forEach(tab => tab.addEventListener('click', () => switchSection(tab.dataset.section)));
     $$('[data-goto]').forEach(button => button.addEventListener('click', () => switchSection(button.dataset.goto)));
     $('#globalRefresh').addEventListener('click', globalRefresh);
+    $('#dashboardPeriods').addEventListener('click', event => { const button = event.target.closest('[data-dashboard-period]'); if (button) setDashboardPeriod(button.dataset.dashboardPeriod); });
+    $('#dashboardProduct').addEventListener('change', async event => { state.dashboardProduct = event.target.value; await loadDashboard(); });
+    $('#dashboardDateForm').addEventListener('submit', async event => { event.preventDefault(); state.dashboardStart = $('#dashboardStart').value; state.dashboardEnd = $('#dashboardEnd').value; if (!state.dashboardStart || !state.dashboardEnd) return; await loadDashboard(); });
+    $('#dashboardTopProducts').addEventListener('click', event => { const id = event.target.closest('[data-product-id]')?.dataset.productId; if (id) { state.dashboardProduct = id; $('#dashboardProduct').value = id; loadDashboard(); } });
+    $('#dashboardLowStock').addEventListener('click', event => { const id = event.target.closest('[data-offer-id]')?.dataset.offerId; if (id) switchSection('offers').then(() => showOffer(id)); });
+    $('#dashboardSupport').addEventListener('click', event => { if (event.target.closest('[data-goto="chats"]')) switchSection('chats'); });
 
     let searchTimer;
     $('#offerSearch').addEventListener('input', event => {
@@ -500,6 +756,7 @@
       const id = state.currentOffer;
       if (action === 'stock') openStock(id, $('#offerDialogTitle').textContent);
       if (action === 'edit') openEditOffer();
+      if (action === 'save-settings') saveOfferSettings(id);
       if (['activate','pause','delete'].includes(action)) offerAction(id, action);
       if (action === 'archive-all') archiveAllStock(id);
     });
@@ -515,13 +772,19 @@
     $('#dashboardSales').addEventListener('click', event => { const invoice = event.target.closest('[data-invoice]')?.dataset.invoice; if (invoice) { switchSection('orders').then(() => { $('#invoiceInput').value = invoice; findOrder(invoice); }); } });
 
     $('#revenueForm').addEventListener('submit', calculateRevenue);
+    $$('.finance-presets [data-period]').forEach(button => button.addEventListener('click', () => applyFinancePeriod(button.dataset.period)));
     $('#receiptsRefresh').addEventListener('click', loadReceipts);
     $('#chatsRefresh').addEventListener('click', loadChats);
+    $('#chatSearch').addEventListener('input', event => { state.chatQuery = event.target.value.trim(); renderChats(); });
+    $('#chatFilters').addEventListener('click', event => { const chip = event.target.closest('[data-chat-label]'); if (!chip) return; $$('#chatFilters .chip').forEach(x => x.classList.toggle('active', x === chip)); state.chatLabel = chip.dataset.chatLabel; renderChats(); });
+    $$('.chat-label-actions [data-set-chat-label]').forEach(button => button.addEventListener('click', () => setChatLabel(button.dataset.setChatLabel)));
     $('#chatsList').addEventListener('click', event => { const id = event.target.closest('[data-chat]')?.dataset.chat; if (id) openChat(id); });
     $('#chatReplyForm').addEventListener('submit', sendChatReply);
     $('#reviewsRefresh').addEventListener('click', loadReviews);
     $('#categorySearchForm').addEventListener('submit', event => { event.preventDefault(); loadCategories($('#categorySearch').value.trim()); });
     $('#auditRefresh').addEventListener('click', loadAudit);
+    $('#operationsRefresh').addEventListener('click', () => loadOperations(true));
+    $('#exportOffersBtn').addEventListener('click', exportOffers);
     $$('[data-close]').forEach(button => button.addEventListener('click', () => closeDialog(button.closest('dialog'))));
   }
 
@@ -537,7 +800,7 @@
       const notice = $('#authNotice'); notice.textContent = 'Откройте эту панель кнопкой «Управление» внутри Telegram-бота.'; notice.classList.remove('hidden');
       return;
     }
-    try { await loadIdentity(); await loadDashboard(); state.loaded.add('dashboard'); }
+    try { [state.dashboardStart, state.dashboardEnd] = dashboardRange(state.dashboardPeriod); $('#dashboardStart').value = state.dashboardStart; $('#dashboardEnd').value = state.dashboardEnd; await loadIdentity(); await loadDashboard(); state.loaded.add('dashboard'); }
     catch (error) { $('#authNotice').textContent = error.message; $('#authNotice').classList.remove('hidden'); toast(error.message, true); }
   }
 
