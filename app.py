@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import html
 import json
 import logging
@@ -12,10 +13,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from functools import wraps
 from typing import Any, Iterable, Optional
+from urllib.parse import parse_qsl
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template, request
 
 
 # ============================================================
@@ -33,6 +36,9 @@ GGSEL_BASE_URL = os.environ.get("GGSEL_BASE_URL", "https://seller.ggsel.com").rs
 DB_PATH = os.environ.get("DB_PATH", "/data/ggsel_bot.sqlite3")
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "15"))
 RECEIPTS_MAX_PAGES = int(os.environ.get("RECEIPTS_MAX_PAGES", "15"))
+MINIAPP_AUTH_MAX_AGE = int(os.environ.get("MINIAPP_AUTH_MAX_AGE", "86400"))
+MINIAPP_OFFERS_MAX_PAGES = int(os.environ.get("MINIAPP_OFFERS_MAX_PAGES", "20"))
+MINIAPP_OFFERS_CACHE_SECONDS = int(os.environ.get("MINIAPP_OFFERS_CACHE_SECONDS", "30"))
 
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
 GGSEL_WEBHOOK_SECRET = os.environ.get("GGSEL_WEBHOOK_SECRET", "").strip()
@@ -259,6 +265,15 @@ def init_db() -> None:
                 payload_json TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS miniapp_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target TEXT,
+                payload_json TEXT,
+                created_at TEXT NOT NULL
             );
             """
         )
@@ -736,6 +751,210 @@ class GGSELClient:
 
 ggsel = GGSELClient()
 
+# ============================================================
+# Telegram Mini App backend
+# ============================================================
+
+_offer_cache_lock = threading.Lock()
+_offer_cache: dict[str, Any] = {"expires_at": 0.0, "items": []}
+
+
+def validate_telegram_init_data(init_data: str) -> dict[str, Any]:
+    """Validate Telegram.WebApp.initData and return the verified user object."""
+    if not init_data:
+        raise APIError("Mini App", 401, "Откройте панель из Telegram-бота")
+
+    pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+    received_hash = str(pairs.pop("hash", ""))
+    # For bot-token validation Telegram excludes only the received hash.
+    # The optional signature field remains part of the alphabetically sorted data-check-string.
+    if not received_hash:
+        raise APIError("Mini App", 401, "В initData отсутствует hash")
+
+    data_check_string = "\n".join(f"{key}={pairs[key]}" for key in sorted(pairs))
+    secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode("utf-8"), hashlib.sha256).digest()
+    calculated_hash = hmac.new(
+        secret_key, data_check_string.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(calculated_hash, received_hash):
+        raise APIError("Mini App", 403, "Неверная подпись Telegram")
+
+    auth_date = as_int(pairs.get("auth_date"))
+    now = int(time.time())
+    if auth_date <= 0 or abs(now - auth_date) > MINIAPP_AUTH_MAX_AGE:
+        raise APIError("Mini App", 401, "Сессия Telegram устарела. Закройте и откройте панель заново")
+
+    try:
+        user = json.loads(pairs.get("user", "{}"))
+    except json.JSONDecodeError as exc:
+        raise APIError("Mini App", 401, "Некорректные данные пользователя Telegram") from exc
+    if not isinstance(user, dict) or str(user.get("id") or "") != OWNER_ID:
+        raise APIError("Mini App", 403, "Доступ разрешён только владельцу бота")
+    return user
+
+
+def miniapp_api(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        try:
+            authorization = request.headers.get("Authorization", "")
+            init_data = authorization[4:] if authorization.startswith("tma ") else ""
+            user = validate_telegram_init_data(init_data)
+            return func(user, *args, **kwargs)
+        except APIError as exc:
+            return jsonify({"ok": False, "error": str(exc), "service": exc.service}), exc.status
+        except (ValueError, RuntimeError, requests.RequestException) as exc:
+            logger.warning("Mini App request failed: %s", exc)
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        except Exception as exc:
+            logger.exception("Unexpected Mini App error")
+            return jsonify({"ok": False, "error": str(exc)}), 500
+
+    return wrapped
+
+
+def audit_miniapp(user_id: Any, action: str, target: Any = "", payload: Any = None) -> None:
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO miniapp_audit(user_id, action, target, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                str(user_id),
+                str(action),
+                str(target or ""),
+                json.dumps(payload, ensure_ascii=False, default=str) if payload is not None else "",
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+
+def _offer_quantity(item: dict[str, Any]) -> int:
+    for key in ("quantity", "num_in_stock", "in_stock", "products_count", "stock"):
+        if item.get(key) is not None:
+            return as_int(item.get(key))
+    return 0
+
+
+def _offer_status(item: dict[str, Any]) -> str:
+    value = item.get("status") or item.get("state") or item.get("offer_status") or "unknown"
+    text = str(value).strip().lower()
+    aliases = {
+        "1": "active",
+        "0": "paused",
+        "enabled": "active",
+        "disabled": "paused",
+        "pause": "paused",
+        "stopped": "paused",
+        "deleted": "archived",
+        "archive": "archived",
+    }
+    return aliases.get(text, text or "unknown")
+
+
+def normalize_offer_item(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {}
+    category = item.get("category") if isinstance(item.get("category"), dict) else {}
+    return {
+        "id": offer_id(item),
+        "title": offer_name(item),
+        "status": _offer_status(item),
+        "price": as_float(item.get("price") if item.get("price") is not None else item.get("price_rur")),
+        "currency": str(item.get("currency") or "RUB"),
+        "quantity": _offer_quantity(item),
+        "category": category.get("title") or category.get("name") or item.get("category_title") or "",
+        "category_id": category.get("id") or item.get("category_id"),
+        "is_autoselling": bool(item.get("is_autoselling")),
+        "sold_products_count": as_int(item.get("sold_products_count")),
+        "updated_at": item.get("updated_at"),
+        "created_at": item.get("created_at"),
+    }
+
+
+def _has_next_page(data: Any, items: list[Any], page: int, limit: int) -> bool:
+    candidates: list[dict[str, Any]] = []
+    if isinstance(data, dict):
+        candidates.append(data)
+        for key in ("content", "data", "pagination", "meta"):
+            if isinstance(data.get(key), dict):
+                candidates.append(data[key])
+    for obj in candidates:
+        for key in ("has_next_page", "has_next", "next_page"):
+            if key in obj:
+                value = obj.get(key)
+                if isinstance(value, bool):
+                    return value
+                return value not in (None, "", 0, "0", False)
+        total_pages = as_int(obj.get("total_pages") or obj.get("pages"))
+        if total_pages:
+            return page < total_pages
+        total = as_int(obj.get("total") or obj.get("total_count"))
+        if total:
+            return page * limit < total
+    return len(items) >= limit
+
+
+def collect_all_offers(force: bool = False) -> list[dict[str, Any]]:
+    now = time.time()
+    with _offer_cache_lock:
+        if not force and _offer_cache["items"] and now < float(_offer_cache["expires_at"]):
+            return list(_offer_cache["items"])
+
+    limit = 100
+    collected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for page in range(1, MINIAPP_OFFERS_MAX_PAGES + 1):
+        data = ggsel.offers_v2(page=page, limit=limit)
+        items = extract_list(data, ("items", "offers", "rows"))
+        new_count = 0
+        for item in items:
+            normalized = normalize_offer_item(item)
+            identifier = str(normalized.get("id") or "")
+            if not identifier or identifier in seen:
+                continue
+            seen.add(identifier)
+            collected.append(normalized)
+            new_count += 1
+        if not items or new_count == 0 or not _has_next_page(data, items, page, limit):
+            break
+
+    with _offer_cache_lock:
+        _offer_cache["items"] = list(collected)
+        _offer_cache["expires_at"] = now + MINIAPP_OFFERS_CACHE_SECONDS
+    return collected
+
+
+def invalidate_offer_cache() -> None:
+    with _offer_cache_lock:
+        _offer_cache["expires_at"] = 0.0
+        _offer_cache["items"] = []
+
+
+def normalize_product_item(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {}
+    value = str(item.get("value") or "")
+    masked = value if len(value) <= 22 else value[:9] + "…" + value[-7:]
+    return {
+        "id": item.get("id"),
+        "status": item.get("status"),
+        "value": masked,
+        "created_at": item.get("created_at"),
+    }
+
+
+def miniapp_success(data: Any = None, **extra: Any):
+    payload = {"ok": True, "data": data}
+    payload.update(extra)
+    return jsonify(payload)
+
+
+def require_confirmation(body: dict[str, Any]) -> None:
+    if body.get("confirm") is not True:
+        raise ValueError("Операция требует подтверждения")
+
 
 # ============================================================
 # Telegram API
@@ -821,8 +1040,10 @@ def confirm_keyboard(action_id: str) -> dict[str, Any]:
 
 
 def main_menu() -> dict[str, Any]:
-    return {
-        "inline_keyboard": [
+    rows: list[list[dict[str, Any]]] = []
+    if APP_URL:
+        rows.append([{"text": "🛍 Открыть панель управления", "web_app": {"url": f"{APP_URL}/app"}}])
+    rows.extend([
             [
                 {"text": "💰 Баланс", "callback_data": "cmd:balance"},
                 {"text": "🧾 Продажи", "callback_data": "cmd:lastsales"},
@@ -835,8 +1056,8 @@ def main_menu() -> dict[str, Any]:
                 {"text": "⭐ Отзывы", "callback_data": "cmd:reviews"},
                 {"text": "📚 Категории", "callback_data": "cmd:categories"},
             ],
-        ]
-    }
+        ])
+    return {"inline_keyboard": rows}
 
 
 # ============================================================
@@ -1630,13 +1851,398 @@ def process_ggsel_event(data: dict[str, Any]) -> None:
 
 
 # ============================================================
+# Mini App routes
+# ============================================================
+
+
+def _balance_payload(data: Any) -> dict[str, Any]:
+    content = unwrap_v1(data)
+    return content if isinstance(content, dict) else {"raw": data}
+
+
+def _sales_payload(data: Any) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for sale in extract_list(data, ("sales", "items")):
+        if not isinstance(sale, dict):
+            continue
+        product = sale.get("product") if isinstance(sale.get("product"), dict) else {}
+        result.append(
+            {
+                "invoice_id": sale.get("invoice_id") or sale.get("inv"),
+                "date": sale.get("date") or sale.get("purchase_date"),
+                "name": product.get("name") or sale.get("name"),
+                "price_rub": as_float(product.get("price_rub") or sale.get("price_rub")),
+                "price_usd": as_float(product.get("price_usd") or sale.get("price_usd")),
+                "price_eur": as_float(product.get("price_eur") or sale.get("price_eur")),
+            }
+        )
+    return result
+
+
+def _order_payload(invoice_id: str, data: Any) -> dict[str, Any]:
+    item = data.get("content") if isinstance(data, dict) and isinstance(data.get("content"), dict) else data
+    if not isinstance(item, dict):
+        return {"invoice_id": invoice_id, "raw": data}
+    buyer = item.get("buyer_info") if isinstance(item.get("buyer_info"), dict) else {}
+    feedback = item.get("feedback") if isinstance(item.get("feedback"), dict) else {}
+    return {
+        "invoice_id": invoice_id,
+        "name": item.get("name"),
+        "item_id": item.get("item_id"),
+        "amount": item.get("amount"),
+        "currency": item.get("currency_type"),
+        "profit": item.get("profit"),
+        "invoice_state": item.get("invoice_state"),
+        "purchase_date": item.get("purchase_date"),
+        "date_pay": item.get("date_pay"),
+        "external_order_id": item.get("external_order_id"),
+        "buyer": buyer,
+        "feedback": feedback,
+        "options": item.get("options") if isinstance(item.get("options"), list) else [],
+    }
+
+
+def _review_payload(data: Any) -> list[dict[str, Any]]:
+    return [item for item in extract_list(data, ("reviews", "items")) if isinstance(item, dict)]
+
+
+def _chat_payload(data: Any) -> list[dict[str, Any]]:
+    return [item for item in extract_list(data, ("chats", "items")) if isinstance(item, dict)]
+
+
+def _message_payload(data: Any) -> list[dict[str, Any]]:
+    return [item for item in extract_list(data, ("messages", "items")) if isinstance(item, dict)]
+
+
+@app.get("/app")
+def miniapp_page():
+    return render_template("miniapp.html", app_url=APP_URL)
+
+
+@app.get("/app/api/me")
+@miniapp_api
+def miniapp_me(user: dict[str, Any]):
+    return miniapp_success(
+        {
+            "id": user.get("id"),
+            "first_name": user.get("first_name"),
+            "username": user.get("username"),
+            "seller_id": GGSEL_SELLER_ID,
+        }
+    )
+
+
+@app.get("/app/api/dashboard")
+@miniapp_api
+def miniapp_dashboard(user: dict[str, Any]):
+    errors: dict[str, str] = {}
+    balance_data: dict[str, Any] = {}
+    sales_data: list[dict[str, Any]] = []
+    offers_data: list[dict[str, Any]] = []
+
+    try:
+        balance_data = _balance_payload(ggsel.balance())
+    except Exception as exc:
+        errors["balance"] = str(exc)
+    try:
+        sales_data = _sales_payload(ggsel.last_sales())[:10]
+    except Exception as exc:
+        errors["sales"] = str(exc)
+    try:
+        first_page = ggsel.offers_v2(page=1, limit=100)
+        offers_data = [normalize_offer_item(x) for x in extract_list(first_page, ("items", "offers", "rows")) if isinstance(x, dict)]
+    except Exception as exc:
+        errors["offers"] = str(exc)
+
+    stats = {
+        "offers": len(offers_data),
+        "active": sum(1 for x in offers_data if x.get("status") == "active"),
+        "paused": sum(1 for x in offers_data if x.get("status") == "paused"),
+        "out_of_stock": sum(1 for x in offers_data if as_int(x.get("quantity")) <= 0),
+    }
+    return miniapp_success(
+        {"balance": balance_data, "sales": sales_data, "stats": stats}, errors=errors
+    )
+
+
+@app.get("/app/api/offers")
+@miniapp_api
+def miniapp_offers(user: dict[str, Any]):
+    query = str(request.args.get("q") or "").strip().casefold()
+    status = str(request.args.get("status") or "all").strip().lower()
+    force = request.args.get("refresh") == "1"
+    page = max(1, as_int(request.args.get("page"), 1))
+    per_page = max(10, min(as_int(request.args.get("per_page"), 30), 100))
+
+    offers = collect_all_offers(force=force)
+    if query:
+        offers = [
+            item
+            for item in offers
+            if query in str(item.get("title") or "").casefold()
+            or query in str(item.get("id") or "").casefold()
+            or query in str(item.get("category") or "").casefold()
+        ]
+    if status == "out_of_stock":
+        offers = [item for item in offers if as_int(item.get("quantity")) <= 0]
+    elif status != "all":
+        offers = [item for item in offers if str(item.get("status")) == status]
+
+    total = len(offers)
+    start = (page - 1) * per_page
+    items = offers[start : start + per_page]
+    return miniapp_success(
+        items,
+        pagination={
+            "page": page,
+            "per_page": per_page,
+            "total": total,
+            "pages": max(1, (total + per_page - 1) // per_page),
+        },
+    )
+
+
+@app.get("/app/api/offers/<int:offer_id_value>")
+@miniapp_api
+def miniapp_offer(user: dict[str, Any], offer_id_value: int):
+    data = ggsel.offer_v2(offer_id_value)
+    item = data.get("content") if isinstance(data, dict) and isinstance(data.get("content"), dict) else data
+    if isinstance(item, dict) and isinstance(item.get("product"), dict):
+        item = item["product"]
+    return miniapp_success({"normalized": normalize_offer_item(item), "raw": item})
+
+
+@app.get("/app/api/offers/<int:offer_id_value>/products")
+@miniapp_api
+def miniapp_products(user: dict[str, Any], offer_id_value: int):
+    page = max(1, as_int(request.args.get("page"), 1))
+    limit = max(10, min(as_int(request.args.get("limit"), 50), 100))
+    data = ggsel.products_v2(offer_id_value, page, limit)
+    items = [normalize_product_item(x) for x in extract_list(data, ("items", "products")) if isinstance(x, dict)]
+    return miniapp_success(items, raw_meta=data if isinstance(data, dict) else {})
+
+
+@app.post("/app/api/offers/<int:offer_id_value>/products")
+@miniapp_api
+def miniapp_add_products(user: dict[str, Any], offer_id_value: int):
+    body = request.get_json(silent=True) or {}
+    require_confirmation(body)
+    raw_values = body.get("values")
+    if not isinstance(raw_values, list):
+        raise ValueError("values должен быть массивом строк")
+    values = list(dict.fromkeys(str(value).strip() for value in raw_values if str(value).strip()))
+    if not values:
+        raise ValueError("Список содержимого пуст")
+    if len(values) > 2000:
+        raise ValueError("За один раз можно загрузить не более 2000 строк")
+
+    results: list[Any] = []
+    for index in range(0, len(values), 100):
+        results.append(ggsel.add_products_v2(offer_id_value, values[index : index + 100]))
+    invalidate_offer_cache()
+    audit_miniapp(user.get("id"), "stock_add", offer_id_value, {"count": len(values)})
+    return miniapp_success({"added": len(values), "batches": len(results), "results": results})
+
+
+@app.delete("/app/api/offers/<int:offer_id_value>/products")
+@miniapp_api
+def miniapp_archive_products(user: dict[str, Any], offer_id_value: int):
+    body = request.get_json(silent=True) or {}
+    require_confirmation(body)
+    delete_all = body.get("delete_all") is True
+    product_ids = body.get("product_ids") if isinstance(body.get("product_ids"), list) else []
+    product_ids = [int(x) for x in product_ids]
+    if not delete_all and not product_ids:
+        raise ValueError("Выберите позиции или укажите delete_all")
+    result = ggsel.archive_products_v2(offer_id_value, product_ids, delete_all)
+    invalidate_offer_cache()
+    audit_miniapp(
+        user.get("id"), "stock_archive", offer_id_value, {"delete_all": delete_all, "product_ids": product_ids}
+    )
+    return miniapp_success(result)
+
+
+@app.patch("/app/api/offers/<int:offer_id_value>")
+@miniapp_api
+def miniapp_patch_offer(user: dict[str, Any], offer_id_value: int):
+    body = request.get_json(silent=True) or {}
+    require_confirmation(body)
+    patch = body.get("patch")
+    if not isinstance(patch, dict) or not patch:
+        raise ValueError("Не переданы изменения")
+    allowed = {
+        "title_ru", "title_en", "description_ru", "description_en", "instructions_ru",
+        "instructions_en", "price", "is_autoselling", "category_id", "min_quantity",
+        "max_quantity", "quantity", "is_unlimited_quantity", "delivery", "post_payment_url",
+        "notification_settings", "pre_payment_settings",
+    }
+    unknown = set(patch) - allowed
+    if unknown:
+        raise ValueError("Недопустимые поля: " + ", ".join(sorted(unknown)))
+    result = ggsel.patch_offer_v2(offer_id_value, patch)
+    invalidate_offer_cache()
+    audit_miniapp(user.get("id"), "offer_patch", offer_id_value, patch)
+    return miniapp_success(result)
+
+
+@app.post("/app/api/offers")
+@miniapp_api
+def miniapp_create_offer(user: dict[str, Any]):
+    body = request.get_json(silent=True) or {}
+    require_confirmation(body)
+    data = body.get("data")
+    if not isinstance(data, dict):
+        raise ValueError("Не переданы данные оффера")
+    for field in ("title_ru", "price", "category_id"):
+        if data.get(field) in (None, ""):
+            raise ValueError(f"Обязательное поле: {field}")
+    result = ggsel.create_offer_v2(data)
+    invalidate_offer_cache()
+    audit_miniapp(user.get("id"), "offer_create", "", data)
+    return miniapp_success(result)
+
+
+@app.post("/app/api/offers/<int:offer_id_value>/action")
+@miniapp_api
+def miniapp_offer_action(user: dict[str, Any], offer_id_value: int):
+    body = request.get_json(silent=True) or {}
+    require_confirmation(body)
+    action = str(body.get("action") or "")
+    if action not in {"activate", "pause", "delete"}:
+        raise ValueError("Недопустимое действие")
+    result = ggsel.batch_offers_v2(action, [offer_id_value])
+    invalidate_offer_cache()
+    audit_miniapp(user.get("id"), f"offer_{action}", offer_id_value, result)
+    return miniapp_success(result)
+
+
+@app.post("/app/api/offers/batch-action")
+@miniapp_api
+def miniapp_batch_action(user: dict[str, Any]):
+    body = request.get_json(silent=True) or {}
+    require_confirmation(body)
+    action = str(body.get("action") or "")
+    offer_ids = [int(x) for x in body.get("offer_ids", [])]
+    if action not in {"activate", "pause", "delete"}:
+        raise ValueError("Недопустимое действие")
+    if not offer_ids or len(offer_ids) > 100:
+        raise ValueError("Выберите от 1 до 100 офферов")
+    result = ggsel.batch_offers_v2(action, offer_ids)
+    invalidate_offer_cache()
+    audit_miniapp(user.get("id"), f"offers_{action}", ",".join(map(str, offer_ids)), result)
+    return miniapp_success(result)
+
+
+@app.get("/app/api/categories")
+@miniapp_api
+def miniapp_categories(user: dict[str, Any]):
+    query = str(request.args.get("q") or "").strip()
+    data = ggsel.search_categories_v2(query) if query else ggsel.categories_v2()
+    items = []
+    for category in extract_list(data, ("category", "categories", "items")):
+        if isinstance(category, dict):
+            items.append({"id": category.get("id"), "title": category_title(category), "count": category.get("cnt")})
+    return miniapp_success(items)
+
+
+@app.get("/app/api/balance")
+@miniapp_api
+def miniapp_balance(user: dict[str, Any]):
+    return miniapp_success(_balance_payload(ggsel.balance()))
+
+
+@app.get("/app/api/receipts")
+@miniapp_api
+def miniapp_receipts(user: dict[str, Any]):
+    page = max(1, as_int(request.args.get("page"), 1))
+    count = max(1, min(as_int(request.args.get("count"), 30), 100))
+    data = ggsel.receipts(page, count)
+    content = unwrap_v1(data)
+    return miniapp_success(
+        extract_list(content, ("items",)), raw_meta=content if isinstance(content, dict) else {}
+    )
+
+
+@app.get("/app/api/revenue")
+@miniapp_api
+def miniapp_revenue(user: dict[str, Any]):
+    start_text = str(request.args.get("start") or date.today().isoformat())
+    end_text = str(request.args.get("end") or start_text)
+    start = datetime.strptime(start_text, "%Y-%m-%d").date()
+    end = datetime.strptime(end_text, "%Y-%m-%d").date()
+    if end < start:
+        start, end = end, start
+    received, gross, count, complete = calculate_receipts_period(start, end)
+    return miniapp_success(
+        {"start": start.isoformat(), "end": end.isoformat(), "received": received, "gross": gross, "count": count, "complete": complete}
+    )
+
+
+@app.get("/app/api/sales")
+@miniapp_api
+def miniapp_sales(user: dict[str, Any]):
+    return miniapp_success(_sales_payload(ggsel.last_sales()))
+
+
+@app.get("/app/api/orders/<invoice_id>")
+@miniapp_api
+def miniapp_order(user: dict[str, Any], invoice_id: str):
+    return miniapp_success(_order_payload(invoice_id, ggsel.order_info(invoice_id)))
+
+
+@app.get("/app/api/reviews")
+@miniapp_api
+def miniapp_reviews(user: dict[str, Any]):
+    page = max(1, as_int(request.args.get("page"), 1))
+    return miniapp_success(_review_payload(ggsel.reviews(page)))
+
+
+@app.get("/app/api/chats")
+@miniapp_api
+def miniapp_chats(user: dict[str, Any]):
+    page = max(1, as_int(request.args.get("page"), 1))
+    return miniapp_success(_chat_payload(ggsel.chats(page)))
+
+
+@app.get("/app/api/chats/<debate_id>")
+@miniapp_api
+def miniapp_chat_messages(user: dict[str, Any], debate_id: str):
+    return miniapp_success(_message_payload(ggsel.chat_messages(debate_id)))
+
+
+@app.post("/app/api/chats/<debate_id>/messages")
+@miniapp_api
+def miniapp_send_chat_message(user: dict[str, Any], debate_id: str):
+    body = request.get_json(silent=True) or {}
+    require_confirmation(body)
+    message = str(body.get("message") or "").strip()
+    if not message:
+        raise ValueError("Сообщение пустое")
+    if len(message) > 4000:
+        raise ValueError("Сообщение слишком длинное")
+    result = ggsel.send_chat_message(debate_id, message)
+    audit_miniapp(user.get("id"), "chat_reply", debate_id, {"length": len(message)})
+    return miniapp_success(result)
+
+
+@app.get("/app/api/audit")
+@miniapp_api
+def miniapp_audit_log(user: dict[str, Any]):
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT action, target, payload_json, created_at FROM miniapp_audit ORDER BY id DESC LIMIT 50"
+        ).fetchall()
+    return miniapp_success([dict(row) for row in rows])
+
+
+# ============================================================
 # Flask routes
 # ============================================================
 
 
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "ggsel-telegram-bot-v3"})
+    return jsonify({"ok": True, "service": "ggsel-telegram-bot-miniapp-v4"})
 
 
 @app.get("/setup-telegram-webhook")
@@ -1652,8 +2258,33 @@ def setup_telegram_webhook():
     }
     if TELEGRAM_WEBHOOK_SECRET:
         payload["secret_token"] = TELEGRAM_WEBHOOK_SECRET
-    result = telegram_call("setWebhook", payload)
-    return jsonify(result)
+    webhook_result = telegram_call("setWebhook", payload)
+    menu_result = telegram_call(
+        "setChatMenuButton",
+        {
+            "chat_id": OWNER_ID,
+            "menu_button": {
+                "type": "web_app",
+                "text": "Управление",
+                "web_app": {"url": f"{APP_URL}/app"},
+            },
+        },
+    )
+    commands_result = telegram_call(
+        "setMyCommands",
+        {
+            "commands": [
+                {"command": "start", "description": "Открыть меню"},
+                {"command": "balance", "description": "Баланс GGSEL"},
+                {"command": "lastsales", "description": "Последние продажи"},
+                {"command": "offers", "description": "Список офферов"},
+                {"command": "chats", "description": "Чаты покупателей"},
+                {"command": "help", "description": "Справка"},
+            ],
+            "scope": {"type": "chat", "chat_id": OWNER_ID},
+        },
+    )
+    return jsonify({"ok": True, "webhook": webhook_result, "menu": menu_result, "commands": commands_result})
 
 
 @app.post("/telegram")

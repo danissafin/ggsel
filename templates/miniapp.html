@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>GGSEL Seller</title>
+  <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='miniapp.css') }}">
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">SELLER CONTROL</div>
+        <h1>GGSEL</h1>
+      </div>
+      <button id="globalRefresh" class="icon-button" aria-label="Обновить">↻</button>
+    </header>
+
+    <div id="authNotice" class="notice hidden"></div>
+
+    <nav class="tabs" aria-label="Разделы">
+      <button class="tab active" data-section="dashboard">Обзор</button>
+      <button class="tab" data-section="offers">Товары</button>
+      <button class="tab" data-section="orders">Заказы</button>
+      <button class="tab" data-section="finance">Финансы</button>
+      <button class="tab" data-section="chats">Чаты</button>
+      <button class="tab" data-section="reviews">Отзывы</button>
+      <button class="tab" data-section="categories">Категории</button>
+      <button class="tab" data-section="audit">История</button>
+    </nav>
+
+    <main>
+      <section id="section-dashboard" class="section active">
+        <div class="section-heading">
+          <div><span class="kicker">Сегодня</span><h2>Панель продавца</h2></div>
+          <span id="ownerName" class="muted"></span>
+        </div>
+        <div id="dashboardCards" class="metric-grid skeleton-grid"></div>
+        <div class="panel">
+          <div class="panel-heading"><h3>Последние продажи</h3><button class="link-button" data-goto="orders">Все заказы</button></div>
+          <div id="dashboardSales" class="list"><div class="empty">Загрузка…</div></div>
+        </div>
+      </section>
+
+      <section id="section-offers" class="section">
+        <div class="section-heading">
+          <div><span class="kicker">Каталог</span><h2>Товары</h2></div>
+          <button id="createOfferBtn" class="primary-button compact">＋ Создать</button>
+        </div>
+        <div class="toolbar">
+          <label class="search-field"><span>⌕</span><input id="offerSearch" type="search" placeholder="Название, ID или категория"></label>
+          <button id="offerRefresh" class="icon-button">↻</button>
+        </div>
+        <div id="offerFilters" class="chips">
+          <button class="chip active" data-status="all">Все</button>
+          <button class="chip" data-status="active">Активные</button>
+          <button class="chip" data-status="paused">Приостановлены</button>
+          <button class="chip" data-status="out_of_stock">Без остатка</button>
+          <button class="chip" data-status="archived">Архив</button>
+        </div>
+        <div class="selection-row">
+          <span id="offerCount" class="muted">—</span>
+          <button id="toggleSelection" class="link-button">Выбрать несколько</button>
+        </div>
+        <div id="offersList" class="card-list"><div class="empty">Загрузка…</div></div>
+        <div id="offersPager" class="pager hidden">
+          <button id="offersPrev" class="secondary-button">←</button>
+          <span id="offersPage">1 / 1</span>
+          <button id="offersNext" class="secondary-button">→</button>
+        </div>
+        <div id="batchBar" class="batch-bar hidden">
+          <span id="batchCount">0 выбрано</span>
+          <div><button data-batch="activate" class="success-button">Включить</button><button data-batch="pause" class="secondary-button">Пауза</button><button data-batch="delete" class="danger-button">Архив</button></div>
+        </div>
+      </section>
+
+      <section id="section-orders" class="section">
+        <div class="section-heading"><div><span class="kicker">Продажи</span><h2>Заказы</h2></div></div>
+        <form id="orderSearchForm" class="toolbar">
+          <label class="search-field"><span>#</span><input id="invoiceInput" placeholder="Номер заказа"></label>
+          <button class="primary-button compact" type="submit">Найти</button>
+        </form>
+        <div id="orderResult"></div>
+        <div class="panel">
+          <div class="panel-heading"><h3>Последние продажи</h3><button id="salesRefresh" class="link-button">Обновить</button></div>
+          <div id="salesList" class="list"><div class="empty">Загрузка…</div></div>
+        </div>
+      </section>
+
+      <section id="section-finance" class="section">
+        <div class="section-heading"><div><span class="kicker">Деньги</span><h2>Финансы</h2></div></div>
+        <div id="balanceCards" class="metric-grid"></div>
+        <div class="panel">
+          <div class="panel-heading"><h3>Доход за период</h3></div>
+          <form id="revenueForm" class="date-grid">
+            <label>С<input id="revenueStart" type="date"></label>
+            <label>По<input id="revenueEnd" type="date"></label>
+            <button class="primary-button" type="submit">Рассчитать</button>
+          </form>
+          <div id="revenueResult"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-heading"><h3>Последние чеки</h3><button id="receiptsRefresh" class="link-button">Обновить</button></div>
+          <div id="receiptsList" class="list"><div class="empty">Загрузка…</div></div>
+        </div>
+      </section>
+
+      <section id="section-chats" class="section">
+        <div class="section-heading"><div><span class="kicker">Поддержка</span><h2>Чаты</h2></div><button id="chatsRefresh" class="icon-button">↻</button></div>
+        <div id="chatsList" class="card-list"><div class="empty">Загрузка…</div></div>
+      </section>
+
+      <section id="section-reviews" class="section">
+        <div class="section-heading"><div><span class="kicker">Репутация</span><h2>Отзывы</h2></div><button id="reviewsRefresh" class="icon-button">↻</button></div>
+        <div id="reviewsList" class="card-list"><div class="empty">Загрузка…</div></div>
+      </section>
+
+      <section id="section-categories" class="section">
+        <div class="section-heading"><div><span class="kicker">Справочник</span><h2>Категории</h2></div></div>
+        <form id="categorySearchForm" class="toolbar">
+          <label class="search-field"><span>⌕</span><input id="categorySearch" placeholder="Поиск категории"></label>
+          <button class="primary-button compact" type="submit">Найти</button>
+        </form>
+        <div id="categoriesList" class="list"><div class="empty">Введите запрос или откройте список</div></div>
+      </section>
+
+      <section id="section-audit" class="section">
+        <div class="section-heading"><div><span class="kicker">Безопасность</span><h2>История действий</h2></div><button id="auditRefresh" class="icon-button">↻</button></div>
+        <div id="auditList" class="list"><div class="empty">Загрузка…</div></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="modalBackdrop" class="modal-backdrop hidden"></div>
+
+  <dialog id="offerDialog" class="modal large-modal">
+    <div class="modal-header"><div><span class="kicker">Оффер</span><h2 id="offerDialogTitle">Товар</h2></div><button class="close-button" data-close>×</button></div>
+    <div id="offerDialogBody"></div>
+  </dialog>
+
+  <dialog id="stockDialog" class="modal">
+    <div class="modal-header"><div><span class="kicker">Автовыдача</span><h2>Добавить содержимое</h2></div><button class="close-button" data-close>×</button></div>
+    <p id="stockOfferLabel" class="muted"></p>
+    <textarea id="stockValues" rows="10" placeholder="Каждый ключ или строка — с новой строки"></textarea>
+    <div class="file-row"><label class="secondary-button file-button">Загрузить TXT<input id="stockFile" type="file" accept=".txt,text/plain"></label><span id="stockCount" class="muted">0 строк</span></div>
+    <div id="stockWarnings" class="notice hidden"></div>
+    <button id="stockSubmit" class="primary-button full">Добавить содержимое</button>
+  </dialog>
+
+  <dialog id="editOfferDialog" class="modal">
+    <div class="modal-header"><div><span class="kicker">Карточка</span><h2>Изменить товар</h2></div><button class="close-button" data-close>×</button></div>
+    <form id="editOfferForm" class="form-stack">
+      <input id="editOfferId" type="hidden">
+      <label>Название<input id="editTitle" type="text"></label>
+      <label>Цена, ₽<input id="editPrice" type="number" min="0" step="0.01" required></label>
+      <label>ID категории<input id="editCategory" type="number" min="1"></label>
+      <label class="switch-row"><span>Автоматическая выдача</span><input id="editAutoselling" type="checkbox"></label>
+      <label>Описание<textarea id="editDescription" rows="5"></textarea></label>
+      <button class="primary-button" type="submit">Сохранить</button>
+    </form>
+  </dialog>
+
+  <dialog id="createOfferDialog" class="modal">
+    <div class="modal-header"><div><span class="kicker">Новый оффер</span><h2>Создать товар</h2></div><button class="close-button" data-close>×</button></div>
+    <form id="createOfferForm" class="form-stack">
+      <label>Название<input id="createTitle" required></label>
+      <div class="two-cols"><label>Цена, ₽<input id="createPrice" type="number" min="0" step="0.01" required></label><label>ID категории<input id="createCategory" type="number" min="1" required></label></div>
+      <label>Описание<textarea id="createDescription" rows="5"></textarea></label>
+      <label>Инструкция покупателю<textarea id="createInstructions" rows="4"></textarea></label>
+      <label class="switch-row"><span>Автоматическая выдача</span><input id="createAutoselling" type="checkbox" checked></label>
+      <button class="primary-button" type="submit">Создать товар</button>
+    </form>
+  </dialog>
+
+  <dialog id="chatDialog" class="modal large-modal">
+    <div class="modal-header"><div><span class="kicker">Диалог</span><h2 id="chatDialogTitle">Чат</h2></div><button class="close-button" data-close>×</button></div>
+    <div id="chatMessages" class="messages"></div>
+    <form id="chatReplyForm" class="reply-form"><textarea id="chatReplyText" rows="3" placeholder="Ответ покупателю"></textarea><button class="primary-button" type="submit">Отправить</button></form>
+  </dialog>
+
+  <div id="toast" class="toast hidden"></div>
+  <script src="{{ url_for('static', filename='miniapp.js') }}" defer></script>
+</body>
+</html>
