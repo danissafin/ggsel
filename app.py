@@ -6,6 +6,7 @@ import html
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -672,9 +673,18 @@ class GGSELClient:
     # ---------- V1: chats ----------
 
     def chats(self, page: int = 1) -> Any:
-        return self.v1_request(
-            "GET", "/api_sellers/api/debates/v2/chats", params={"page": page}
-        )
+        # The official endpoint documents no query parameters and returns the
+        # unread conversation list. Some installations accept page, others do
+        # not, so use the documented request first and keep a compatibility
+        # fallback.
+        try:
+            return self.v1_request("GET", "/api_sellers/api/debates/v2/chats")
+        except APIError as exc:
+            if exc.status not in (400, 422):
+                raise
+            return self.v1_request(
+                "GET", "/api_sellers/api/debates/v2/chats", params={"page": page}
+            )
 
     def chat_messages(self, debate_id: str) -> Any:
         return self.v1_request(
@@ -898,7 +908,9 @@ def _offer_quantity(item: dict[str, Any]) -> int:
 
 def _offer_status(item: dict[str, Any]) -> str:
     value: Any = "unknown"
-    for key in ("status", "state", "offer_status", "active"):
+    # V2 usually returns status/state, while the legacy V1 product list uses
+    # visible: 1 for active and 0 for paused/hidden.
+    for key in ("status", "state", "offer_status", "visible", "active"):
         if key in item and item.get(key) is not None:
             value = item.get(key)
             break
@@ -959,59 +971,124 @@ def _has_next_page(data: Any, items: list[Any], page: int, limit: int) -> bool:
     return len(items) >= limit
 
 
-def _collect_offers_v1_fallback() -> list[dict[str, Any]]:
-    """Load seller products through V1 when GGSEL's V2 list endpoint is broken.
+def _v1_products_pagination(data: Any) -> tuple[int, int, int]:
+    """Return (current_page, total_pages, total_items) from the V1 response."""
+    candidates: list[dict[str, Any]] = []
+    if isinstance(data, dict):
+        candidates.append(data)
+        for key in ("content", "data", "result", "pagination", "meta"):
+            nested = data.get(key)
+            if isinstance(nested, dict):
+                candidates.append(nested)
 
-    The V2 offer ID and the legacy product ID represent the same seller item for
-    the operations used by this app. We normalize both schemas into one GUI model.
+    current_page = 0
+    total_pages = 0
+    total_items = 0
+    for obj in candidates:
+        current_page = current_page or as_int(obj.get("page") or obj.get("current_page"))
+        total_pages = total_pages or as_int(obj.get("pages") or obj.get("total_pages"))
+        total_items = total_items or as_int(
+            obj.get("cnt_goods") or obj.get("total") or obj.get("total_count")
+        )
+    return current_page, total_pages, total_items
+
+
+def _collect_offers_v1_fallback() -> list[dict[str, Any]]:
+    """Load the complete seller catalogue through the stable V1 products list.
+
+    GGSEL may ignore a requested ``count`` and return its own fixed page size
+    (currently often 20). Therefore pagination must use the response's ``pages``
+    and ``cnt_goods`` fields, not ``len(rows) < requested_count``.
     """
     collected: list[dict[str, Any]] = []
     seen: set[str] = set()
-    count = 100
+    count = 20
+    expected_total = 0
+
     for page in range(1, MINIAPP_OFFERS_MAX_PAGES + 1):
         data = ggsel.products_v1(page=page, count=count)
         items = extract_list(data, ("products", "items", "rows"))
+        current_page, total_pages, total_items = _v1_products_pagination(data)
+        expected_total = max(expected_total, total_items)
+
         new_count = 0
         for item in items:
             if not isinstance(item, dict):
                 continue
             normalized = normalize_offer_item(item)
-            normalized["api_source"] = "v1-fallback"
+            normalized["api_source"] = "v1-list"
             identifier = str(normalized.get("id") or "")
             if not identifier or identifier in seen:
                 continue
             seen.add(identifier)
             collected.append(normalized)
             new_count += 1
-        if not items or new_count == 0 or len(items) < count:
+
+        logger.info(
+            "GGSEL V1 products page loaded: requested_page=%s response_page=%s "
+            "rows=%s new=%s total_pages=%s total_items=%s collected=%s",
+            page,
+            current_page or page,
+            len(items),
+            new_count,
+            total_pages,
+            total_items,
+            len(collected),
+        )
+
+        if not items or new_count == 0:
             break
-    logger.info("Loaded %s offers through GGSEL V1 fallback", len(collected))
+        if total_pages and (current_page or page) >= total_pages:
+            break
+        if expected_total and len(collected) >= expected_total:
+            break
+        # Only use row count as a last-resort signal when the API omitted all
+        # pagination metadata. Never compare it with the requested count when
+        # metadata is present because GGSEL may enforce a smaller page size.
+        if not total_pages and not expected_total and len(items) < count:
+            break
+
+    if expected_total and len(collected) < expected_total:
+        logger.warning(
+            "GGSEL catalogue pagination stopped early: expected=%s collected=%s "
+            "max_pages=%s",
+            expected_total,
+            len(collected),
+            MINIAPP_OFFERS_MAX_PAGES,
+        )
+    logger.info("Loaded %s seller products through GGSEL V1", len(collected))
     return collected
 
 
 def collect_all_offers(force: bool = False) -> list[dict[str, Any]]:
+    """Return the complete catalogue for the GUI.
+
+    The legacy V1 list exposes reliable ``pages``/``cnt_goods`` metadata, while
+    the V2 list endpoint has returned HTTP 500 or repeated its first page for
+    some seller accounts. We therefore use V1 for catalogue browsing and keep
+    V2 for offer details and write operations.
+    """
     now = time.time()
     with _offer_cache_lock:
         if not force and _offer_cache["items"] and now < float(_offer_cache["expires_at"]):
             return list(_offer_cache["items"])
 
-    limit = MINIAPP_OFFERS_API_PAGE_SIZE
-    collected: list[dict[str, Any]] = []
-    seen: set[str] = set()
     try:
+        collected = _collect_offers_v1_fallback()
+    except APIError:
+        logger.exception("GGSEL V1 products list failed; trying V2 list as fallback")
+        limit = MINIAPP_OFFERS_API_PAGE_SIZE
+        collected = []
+        seen: set[str] = set()
         for page in range(1, MINIAPP_OFFERS_MAX_PAGES + 1):
-            try:
-                data = ggsel.offers_v2(page=page, limit=limit)
-            except APIError:
-                if page == 1 or not collected:
-                    raise
-                logger.exception("GGSEL V2 offers page %s failed; returning partial list", page)
-                break
+            data = ggsel.offers_v2(page=page, limit=limit)
             items = extract_list(data, ("items", "offers", "rows"))
             new_count = 0
             for item in items:
+                if not isinstance(item, dict):
+                    continue
                 normalized = normalize_offer_item(item)
-                normalized["api_source"] = "v2"
+                normalized["api_source"] = "v2-fallback"
                 identifier = str(normalized.get("id") or "")
                 if not identifier or identifier in seen:
                     continue
@@ -1020,13 +1097,6 @@ def collect_all_offers(force: bool = False) -> list[dict[str, Any]]:
                 new_count += 1
             if not items or new_count == 0 or not _has_next_page(data, items, page, limit):
                 break
-    except APIError as exc:
-        if exc.status != 500:
-            raise
-        logger.warning(
-            "GGSEL V2 /offers returned HTTP 500; switching GUI list to V1 products API"
-        )
-        collected = _collect_offers_v1_fallback()
 
     with _offer_cache_lock:
         _offer_cache["items"] = list(collected)
@@ -1346,22 +1416,23 @@ def format_sales(data: Any) -> str:
 
 
 def format_order(invoice_id: str, data: Any) -> str:
-    order = data.get("content") if isinstance(data, dict) and isinstance(data.get("content"), dict) else data
-    if not isinstance(order, dict):
+    payload = _order_payload(invoice_id, data)
+    if "raw" in payload:
         return f"<pre>{safe(compact_json(data))}</pre>"
-    buyer = order.get("buyer_info") if isinstance(order.get("buyer_info"), dict) else {}
-    feedback = order.get("feedback") if isinstance(order.get("feedback"), dict) else {}
-    state = as_int(order.get("invoice_state"))
+    buyer = payload.get("buyer") if isinstance(payload.get("buyer"), dict) else {}
+    feedback = payload.get("feedback") if isinstance(payload.get("feedback"), dict) else {}
+    currency = str(payload.get("currency") or "RUB").strip()
+    symbol = "₽" if currency.upper() in {"RUB", "RUR"} else currency
     return (
         f"<b>📦 Заказ {safe(invoice_id)}</b>\n\n"
-        f"Товар: <b>{safe(order.get('name'))}</b>\n"
-        f"ID товара: <code>{safe(order.get('item_id'))}</code>\n"
-        f"Статус: {safe(INVOICE_STATES.get(state, state))}\n"
-        f"Зачислено: <b>{safe(order.get('amount'))} {safe(order.get('currency_type'))}</b>\n"
-        f"Прибыль: {safe(order.get('profit'))}\n"
-        f"Покупка: {safe(order.get('purchase_date'))}\n"
-        f"Оплата: {safe(order.get('date_pay'))}\n"
-        f"Внешний ID: {safe(order.get('external_order_id'))}\n\n"
+        f"Товар: <b>{safe(payload.get('name'))}</b>\n"
+        f"ID товара: <code>{safe(payload.get('item_id'))}</code>\n"
+        f"Статус: {safe(payload.get('invoice_state_label'))}\n"
+        f"Зачислено: <b>{safe(payload.get('amount'))} {safe(symbol)}</b>\n"
+        f"Прибыль: <b>{safe(payload.get('profit'))} {safe(symbol)}</b>\n"
+        f"Покупка: {safe(payload.get('purchase_date'))}\n"
+        f"Оплата: {safe(payload.get('date_pay'))}\n"
+        f"Внешний ID: {safe(payload.get('external_order_id'))}\n\n"
         f"Почта: {safe(buyer.get('email'))}\n"
         f"Аккаунт: {safe(buyer.get('account'))}\n"
         f"Телефон: {safe(buyer.get('phone'))}\n"
@@ -1987,23 +2058,100 @@ def _sales_payload(data: Any) -> list[dict[str, Any]]:
     return result
 
 
+UUID_LIKE_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
+
+
+def _looks_like_uuid(value: Any) -> bool:
+    return bool(UUID_LIKE_RE.fullmatch(str(value or "").strip()))
+
+
+def _find_text_in_nested(data: Any, keys: tuple[str, ...]) -> str:
+    """Find the first useful non-UUID text value in a nested API response."""
+    queue: list[Any] = [data]
+    seen: set[int] = set()
+    while queue:
+        current = queue.pop(0)
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        if isinstance(current, dict):
+            for key in keys:
+                value = current.get(key)
+                if isinstance(value, str) and value.strip() and not _looks_like_uuid(value):
+                    return value.strip()
+            queue.extend(current.values())
+        elif isinstance(current, list):
+            queue.extend(current)
+    return ""
+
+
+def _local_sale_name(invoice_id: str, item_id: Any = "") -> str:
+    with db_connect() as conn:
+        row = conn.execute(
+            """
+            SELECT product_name
+            FROM sales
+            WHERE invoice_id = ? OR (? != '' AND product_id = ?)
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (str(invoice_id), str(item_id or ""), str(item_id or "")),
+        ).fetchone()
+    value = str(row["product_name"] or "") if row else ""
+    return "" if _looks_like_uuid(value) else value
+
+
+def _resolve_order_name(invoice_id: str, item: dict[str, Any]) -> tuple[str, str]:
+    """Return (human product title, opaque reference if GGSEL put a UUID in name)."""
+    raw_name = str(item.get("name") or "").strip()
+    opaque_reference = raw_name if _looks_like_uuid(raw_name) else ""
+    if raw_name and not opaque_reference:
+        return raw_name, ""
+
+    item_id = item.get("item_id")
+    cached_name = _local_sale_name(invoice_id, item_id)
+    if cached_name:
+        return cached_name, opaque_reference
+
+    if as_int(item_id) > 0:
+        try:
+            product_data = ggsel.product_v1(as_int(item_id))
+            product_name = _find_text_in_nested(
+                product_data,
+                ("title_ru", "name_goods", "product_name", "title", "name"),
+            )
+            if product_name:
+                return product_name, opaque_reference
+        except Exception as exc:
+            logger.warning("Unable to resolve product title for order %s: %s", invoice_id, exc)
+
+    return "Товар", opaque_reference
+
+
 def _order_payload(invoice_id: str, data: Any) -> dict[str, Any]:
     item = data.get("content") if isinstance(data, dict) and isinstance(data.get("content"), dict) else data
     if not isinstance(item, dict):
         return {"invoice_id": invoice_id, "raw": data}
     buyer = item.get("buyer_info") if isinstance(item.get("buyer_info"), dict) else {}
     feedback = item.get("feedback") if isinstance(item.get("feedback"), dict) else {}
+    state = as_int(item.get("invoice_state"))
+    name, opaque_reference = _resolve_order_name(invoice_id, item)
+    external_order_id = item.get("external_order_id") or opaque_reference or item.get("cart_uid")
     return {
         "invoice_id": invoice_id,
-        "name": item.get("name"),
+        "name": name,
         "item_id": item.get("item_id"),
         "amount": item.get("amount"),
-        "currency": item.get("currency_type"),
+        "currency": str(item.get("currency_type") or "RUB").strip(),
         "profit": item.get("profit"),
-        "invoice_state": item.get("invoice_state"),
+        "invoice_state": state,
+        "invoice_state_label": INVOICE_STATES.get(state, f"Неизвестный статус ({state})"),
         "purchase_date": item.get("purchase_date"),
         "date_pay": item.get("date_pay"),
-        "external_order_id": item.get("external_order_id"),
+        "external_order_id": external_order_id,
         "buyer": buyer,
         "feedback": feedback,
         "options": item.get("options") if isinstance(item.get("options"), list) else [],
@@ -2011,15 +2159,185 @@ def _order_payload(invoice_id: str, data: Any) -> dict[str, Any]:
 
 
 def _review_payload(data: Any) -> list[dict[str, Any]]:
-    return [item for item in extract_list(data, ("reviews", "items")) if isinstance(item, dict)]
+    result: list[dict[str, Any]] = []
+    for item in extract_list(data, ("reviews", "items")):
+        if not isinstance(item, dict):
+            continue
+        review_type = str(item.get("type") or "").strip().lower()
+        good_value = as_int(item.get("good"), -1)
+        positive = review_type in {"good", "positive", "положительный"} or (
+            not review_type and good_value > 0
+        )
+        negative = review_type in {"bad", "negative", "отрицательный"} or (
+            not review_type and good_value == 0
+        )
+        rating_label = "Положительный" if positive else "Отрицательный" if negative else (review_type or "Отзыв")
+        result.append(
+            {
+                **item,
+                "text": item.get("info") or item.get("text") or item.get("review") or item.get("feedback") or "",
+                "product_name": item.get("name") or item.get("name_goods") or "Товар",
+                "rating_label": rating_label,
+                "is_positive": positive,
+                "seller_comment": item.get("comment") or "",
+            }
+        )
+    return result
+
+
+def _local_chat_payload() -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                m.debate_id,
+                m.invoice_id,
+                m.message_text,
+                m.image_url,
+                COALESCE(NULLIF(m.message_date, ''), m.created_at) AS last_message_at,
+                o.item_id,
+                o.product_name,
+                o.buyer_email,
+                o.buyer_account
+            FROM messages AS m
+            LEFT JOIN orders AS o ON o.invoice_id = m.invoice_id
+            WHERE m.debate_id IS NOT NULL
+              AND m.debate_id != ''
+              AND m.id IN (
+                  SELECT MAX(id)
+                  FROM messages
+                  WHERE debate_id IS NOT NULL AND debate_id != ''
+                  GROUP BY debate_id
+              )
+            ORDER BY COALESCE(NULLIF(m.message_date, ''), m.created_at) DESC, m.id DESC
+            LIMIT 300
+            """
+        ).fetchall()
+
+    offer_titles: dict[str, str] = {}
+    try:
+        offer_titles = {
+            str(item.get("id")): str(item.get("title") or "")
+            for item in collect_all_offers()
+            if item.get("id") is not None
+        }
+    except Exception as exc:
+        logger.warning("Unable to enrich local chats with offers: %s", exc)
+
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        product_name = str(row["product_name"] or "")
+        if not product_name or _looks_like_uuid(product_name):
+            product_name = offer_titles.get(str(row["item_id"] or ""), "")
+        preview = str(row["message_text"] or "").strip()
+        if not preview and row["image_url"]:
+            preview = "[Изображение]"
+        result.append(
+            {
+                "id_i": str(row["debate_id"]),
+                "invoice_id": str(row["invoice_id"] or ""),
+                "email": str(row["buyer_email"] or row["buyer_account"] or ""),
+                "product": str(row["item_id"] or ""),
+                "product_name": product_name,
+                "last_message": str(row["last_message_at"] or ""),
+                "preview": preview,
+                "source": "local",
+            }
+        )
+    return result
 
 
 def _chat_payload(data: Any) -> list[dict[str, Any]]:
-    return [item for item in extract_list(data, ("chats", "items")) if isinstance(item, dict)]
+    merged: dict[str, dict[str, Any]] = {}
+
+    for item in extract_list(data, ("chats", "items")):
+        if not isinstance(item, dict):
+            continue
+        debate_id = str(item.get("id_i") or item.get("debate_id") or item.get("id") or "")
+        if not debate_id:
+            continue
+        merged[debate_id] = {
+            **item,
+            "id_i": debate_id,
+            "last_message": item.get("last_message") or item.get("date") or "",
+            "preview": "",
+            "source": "api",
+        }
+
+    for local in _local_chat_payload():
+        debate_id = str(local.get("id_i") or "")
+        current = merged.get(debate_id, {})
+        combined = {**current}
+        for key, value in local.items():
+            if value not in (None, "", 0, "0") or key not in combined:
+                combined[key] = value
+        # Preserve unread counters from the API while using the newer local timestamp/preview.
+        combined["cnt_new"] = current.get("cnt_new", combined.get("cnt_new"))
+        combined["cnt_msg"] = current.get("cnt_msg", combined.get("cnt_msg"))
+        merged[debate_id] = combined
+
+    def sort_key(item: dict[str, Any]) -> float:
+        parsed = parse_iso_datetime(item.get("last_message"))
+        return parsed.timestamp() if parsed else 0.0
+
+    return sorted(merged.values(), key=sort_key, reverse=True)
 
 
-def _message_payload(data: Any) -> list[dict[str, Any]]:
-    return [item for item in extract_list(data, ("messages", "items")) if isinstance(item, dict)]
+def _local_messages(debate_id: str) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT message_id, sender, message_text, image_url, message_date, created_at
+            FROM messages
+            WHERE debate_id = ?
+            ORDER BY COALESCE(NULLIF(message_date, ''), created_at), id
+            """,
+            (str(debate_id),),
+        ).fetchall()
+    return [
+        {
+            "id": row["message_id"] or "",
+            "seller": str(row["sender"] or "").lower() == "seller",
+            "buyer": str(row["sender"] or "").lower() == "buyer",
+            "message": row["message_text"] or "",
+            "url": row["image_url"] or "",
+            "is_img": bool(row["image_url"]),
+            "date_written": row["message_date"] or row["created_at"],
+            "source": "local",
+        }
+        for row in rows
+    ]
+
+
+def _message_payload(data: Any, debate_id: str) -> list[dict[str, Any]]:
+    combined: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+
+    api_items = [item for item in extract_list(data, ("messages", "items")) if isinstance(item, dict)]
+    for source_item in [*api_items, *_local_messages(debate_id)]:
+        message = str(source_item.get("message") or source_item.get("text") or "")
+        when = str(source_item.get("date_written") or source_item.get("date") or source_item.get("created_at") or "")
+        seller = bool(source_item.get("seller") is True or source_item.get("is_seller") is True)
+        sender = "seller" if seller else "buyer"
+        url = str(source_item.get("url") or source_item.get("image_url") or "")
+        key = (str(source_item.get("id") or source_item.get("message_id") or ""), when, sender, message or url)
+        if key in seen:
+            continue
+        seen.add(key)
+        combined.append(
+            {
+                **source_item,
+                "message": message,
+                "date_written": when,
+                "seller": seller,
+                "buyer": not seller,
+                "url": url,
+                "is_img": bool(source_item.get("is_img") or url),
+            }
+        )
+
+    combined.sort(key=lambda item: (parse_iso_datetime(item.get("date_written")) or datetime.min.replace(tzinfo=timezone.utc)))
+    return combined
 
 
 @app.get("/app")
@@ -2109,14 +2427,169 @@ def miniapp_offers(user: dict[str, Any]):
     )
 
 
+def _extract_offer_detail(data: Any, offer_id_value: int) -> dict[str, Any]:
+    """Find the most useful offer dictionary inside a V1/V2 response.
+
+    GGSEL currently returns different wrappers for different seller accounts.
+    Some responses use ``content``, others ``data``/``product``/``offer``.
+    We walk the response and prefer a dictionary whose ID matches the requested
+    offer and which contains actual card fields rather than a thin wrapper.
+    """
+    candidates: list[tuple[int, dict[str, Any]]] = []
+
+    def walk(value: Any, depth: int = 0) -> None:
+        if depth > 6:
+            return
+        if isinstance(value, dict):
+            candidate_id = offer_id(value)
+            score = 0
+            if candidate_id is not None:
+                score += 8
+                if str(candidate_id) == str(offer_id_value):
+                    score += 100
+            for key in (
+                "title_ru", "name_goods", "name", "price", "price_rur",
+                "quantity", "num_in_stock", "in_stock", "visible", "status",
+                "description_ru", "description", "info", "category", "category_id",
+            ):
+                if value.get(key) not in (None, "", [], {}):
+                    score += 3
+            if score:
+                candidates.append((score, value))
+            for nested in value.values():
+                if isinstance(nested, (dict, list)):
+                    walk(nested, depth + 1)
+        elif isinstance(value, list):
+            for nested in value[:100]:
+                walk(nested, depth + 1)
+
+    walk(data)
+    if not candidates:
+        return {}
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    return dict(candidates[0][1])
+
+
+def _deep_merge_offer_raw(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    """Merge useful values without replacing good data by empty placeholders."""
+    result = dict(base)
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_offer_raw(dict(result[key]), value)
+        elif value not in (None, "", [], {}):
+            result[key] = value
+    return result
+
+
+def _raw_contains(raw: dict[str, Any], keys: tuple[str, ...]) -> bool:
+    return any(key in raw and raw.get(key) is not None for key in keys)
+
+
+def _merge_offer_normalized(
+    catalogue_item: dict[str, Any],
+    detail_items: list[dict[str, Any]],
+    offer_id_value: int,
+) -> dict[str, Any]:
+    """Keep reliable V1 catalogue values and enrich them with detail fields."""
+    merged = dict(catalogue_item or {})
+    merged.setdefault("id", offer_id_value)
+
+    for raw in detail_items:
+        if not raw:
+            continue
+        normalized = normalize_offer_item(raw)
+        if normalized.get("id"):
+            merged["id"] = normalized["id"]
+        if _raw_contains(raw, ("title_ru", "name_goods", "name", "title")) and normalized.get("title") not in (None, "", "—"):
+            merged["title"] = normalized["title"]
+        if _raw_contains(raw, ("status", "state", "offer_status", "visible", "active")) and normalized.get("status") != "unknown":
+            merged["status"] = normalized["status"]
+        if _raw_contains(raw, ("price", "price_rur")):
+            merged["price"] = normalized.get("price")
+        if _raw_contains(raw, ("currency", "currency_type")) and normalized.get("currency"):
+            merged["currency"] = normalized["currency"]
+        if _raw_contains(raw, ("quantity", "num_in_stock", "in_stock", "products_count", "stock")):
+            merged["quantity"] = normalized.get("quantity")
+        if _raw_contains(raw, ("category", "category_title", "category_id")):
+            if normalized.get("category"):
+                merged["category"] = normalized["category"]
+            if normalized.get("category_id") is not None:
+                merged["category_id"] = normalized["category_id"]
+        if "is_autoselling" in raw:
+            merged["is_autoselling"] = bool(raw.get("is_autoselling"))
+        if "sold_products_count" in raw:
+            merged["sold_products_count"] = as_int(raw.get("sold_products_count"))
+        for field in ("updated_at", "created_at"):
+            if raw.get(field) not in (None, ""):
+                merged[field] = raw.get(field)
+
+    merged.setdefault("title", "—")
+    merged.setdefault("status", "unknown")
+    merged.setdefault("currency", "RUB")
+    merged.setdefault("quantity", 0)
+    merged.setdefault("price", 0.0)
+    merged.setdefault("is_autoselling", False)
+    merged.setdefault("sold_products_count", 0)
+    return merged
+
+
 @app.get("/app/api/offers/<int:offer_id_value>")
 @miniapp_api
 def miniapp_offer(user: dict[str, Any], offer_id_value: int):
-    data = ggsel.offer_v2(offer_id_value)
-    item = data.get("content") if isinstance(data, dict) and isinstance(data.get("content"), dict) else data
-    if isinstance(item, dict) and isinstance(item.get("product"), dict):
-        item = item["product"]
-    return miniapp_success({"normalized": normalize_offer_item(item), "raw": item})
+    # The catalogue list is currently the most reliable source for title,
+    # price, stock and status. Do not throw those values away when GGSEL's V2
+    # detail endpoint returns only a thin object with an ID.
+    catalogue_item = next(
+        (
+            dict(item)
+            for item in collect_all_offers()
+            if str(item.get("id") or "") == str(offer_id_value)
+        ),
+        {},
+    )
+
+    detail_items: list[dict[str, Any]] = []
+    source_errors: dict[str, str] = {}
+
+    try:
+        v1_data = ggsel.product_v1(offer_id_value)
+        v1_item = _extract_offer_detail(v1_data, offer_id_value)
+        if v1_item:
+            detail_items.append(v1_item)
+    except Exception as exc:
+        source_errors["v1"] = str(exc)
+        logger.warning("GGSEL V1 offer detail failed for %s: %s", offer_id_value, exc)
+
+    try:
+        v2_data = ggsel.offer_v2(offer_id_value)
+        v2_item = _extract_offer_detail(v2_data, offer_id_value)
+        if v2_item:
+            detail_items.append(v2_item)
+    except Exception as exc:
+        source_errors["v2"] = str(exc)
+        logger.warning("GGSEL V2 offer detail failed for %s: %s", offer_id_value, exc)
+
+    raw: dict[str, Any] = {}
+    for detail in detail_items:
+        raw = _deep_merge_offer_raw(raw, detail)
+
+    normalized = _merge_offer_normalized(catalogue_item, detail_items, offer_id_value)
+
+    # Give the edit form dependable aliases even if a GGSEL detail response did
+    # not contain them. Description/instructions still come from the raw detail
+    # response when available.
+    if normalized.get("title") not in (None, "", "—"):
+        raw.setdefault("title_ru", normalized["title"])
+    if normalized.get("price") is not None:
+        raw.setdefault("price", normalized["price"])
+    if normalized.get("category_id") is not None:
+        raw.setdefault("category_id", normalized["category_id"])
+    raw.setdefault("id", normalized.get("id") or offer_id_value)
+
+    return miniapp_success(
+        {"normalized": normalized, "raw": raw},
+        source_errors=source_errors,
+    )
 
 
 @app.get("/app/api/offers/<int:offer_id_value>/products")
@@ -2288,13 +2761,18 @@ def miniapp_revenue(user: dict[str, Any]):
 @app.get("/app/api/sales")
 @miniapp_api
 def miniapp_sales(user: dict[str, Any]):
-    return miniapp_success(_sales_payload(ggsel.last_sales()))
+    raw = ggsel.last_sales()
+    upsert_sales(raw)
+    return miniapp_success(_sales_payload(raw))
 
 
 @app.get("/app/api/orders/<invoice_id>")
 @miniapp_api
 def miniapp_order(user: dict[str, Any], invoice_id: str):
-    return miniapp_success(_order_payload(invoice_id, ggsel.order_info(invoice_id)))
+    raw = ggsel.order_info(invoice_id)
+    if isinstance(raw, dict):
+        upsert_order(invoice_id, raw)
+    return miniapp_success(_order_payload(invoice_id, raw))
 
 
 @app.get("/app/api/reviews")
@@ -2308,13 +2786,23 @@ def miniapp_reviews(user: dict[str, Any]):
 @miniapp_api
 def miniapp_chats(user: dict[str, Any]):
     page = max(1, as_int(request.args.get("page"), 1))
-    return miniapp_success(_chat_payload(ggsel.chats(page)))
+    try:
+        api_data = ggsel.chats(page)
+    except Exception as exc:
+        logger.warning("Unable to load GGSEL unread chats; using local history: %s", exc)
+        api_data = {}
+    return miniapp_success(_chat_payload(api_data))
 
 
 @app.get("/app/api/chats/<debate_id>")
 @miniapp_api
 def miniapp_chat_messages(user: dict[str, Any], debate_id: str):
-    return miniapp_success(_message_payload(ggsel.chat_messages(debate_id)))
+    try:
+        api_data = ggsel.chat_messages(debate_id)
+    except Exception as exc:
+        logger.warning("Unable to load GGSEL chat %s; using local history: %s", debate_id, exc)
+        api_data = {}
+    return miniapp_success(_message_payload(api_data, debate_id))
 
 
 @app.post("/app/api/chats/<debate_id>/messages")
@@ -2328,6 +2816,20 @@ def miniapp_send_chat_message(user: dict[str, Any], debate_id: str):
     if len(message) > 4000:
         raise ValueError("Сообщение слишком длинное")
     result = ggsel.send_chat_message(debate_id, message)
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT invoice_id FROM messages WHERE debate_id = ? ORDER BY id DESC LIMIT 1",
+            (str(debate_id),),
+        ).fetchone()
+    save_message_record(
+        message_id="",
+        debate_id=str(debate_id),
+        invoice_id=str(row["invoice_id"] or "") if row else "",
+        sender="seller",
+        message_text=message,
+        image_url="",
+        message_date=datetime.now(timezone.utc).isoformat(),
+    )
     audit_miniapp(user.get("id"), "chat_reply", debate_id, {"length": len(message)})
     return miniapp_success(result)
 

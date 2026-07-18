@@ -64,7 +64,7 @@ h3 { margin: 0; font-size: 17px; }
 .badge { display: inline-flex; align-items: center; padding: 5px 8px; border-radius: 999px; background: color-mix(in srgb, var(--muted) 14%, transparent); color: var(--muted); font-size: 11px; font-weight: 700; }
 .badge.active { background: rgba(28,155,98,.12); color: var(--success); }
 .badge.paused { background: rgba(213,138,22,.13); color: var(--warning); }
-.badge.archived { background: rgba(217,68,82,.11); color: var(--danger); }
+.badge.archived, .badge.danger { background: rgba(217,68,82,.11); color: var(--danger); }
 .offer-bottom { display: flex; align-items: flex-end; justify-content: space-between; margin-top: 14px; gap: 10px; }
 .offer-price { font-size: 22px; font-weight: 800; letter-spacing: -.04em; }
 .offer-actions { display: flex; gap: 7px; flex-wrap: wrap; justify-content: flex-end; }

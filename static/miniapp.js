@@ -191,10 +191,10 @@
       $('#offerDialogBody').innerHTML = `
         <div class="offer-meta"><span class="badge ${esc(item.status)}">${esc(statusLabel(item.status))}</span><span class="badge">ID ${esc(item.id || id)}</span></div>
         <div class="detail-grid">
-          <div class="detail"><span>Цена</span><b>${money(item.price, item.currency)}</b></div>
-          <div class="detail"><span>Остаток</span><b>${esc(item.quantity)}</b></div>
-          <div class="detail"><span>Продано</span><b>${esc(item.sold_products_count)}</b></div>
-          <div class="detail"><span>Автовыдача</span><b>${item.is_autoselling ? 'Да' : 'Нет'}</b></div>
+          <div class="detail"><span>Цена</span><b>${item.price === null || item.price === undefined ? '—' : money(item.price, item.currency)}</b></div>
+          <div class="detail"><span>Остаток</span><b>${esc(item.quantity ?? '—')}</b></div>
+          <div class="detail"><span>Продано</span><b>${esc(item.sold_products_count ?? '—')}</b></div>
+          <div class="detail"><span>Автовыдача</span><b>${item.is_autoselling === true ? 'Да' : item.is_autoselling === false ? 'Нет' : '—'}</b></div>
         </div>
         <p class="muted">${esc(item.category || '')}</p>
         <p>${esc(getAny(raw, ['description_ru','info','description'], 'Описание не указано'))}</p>
@@ -338,15 +338,15 @@
       const {data} = await api(`/app/api/orders/${encodeURIComponent(invoice)}`);
       const buyer = data.buyer || {};
       $('#orderResult').innerHTML = `<article class="order-card panel">
-        <div class="panel-heading"><h3>${esc(data.name || 'Заказ')}</h3><span class="badge">#${esc(data.invoice_id)}</span></div>
+        <div class="panel-heading"><h3>${esc(data.name || 'Товар')}</h3><span class="badge">#${esc(data.invoice_id)}</span></div>
         <div class="detail-grid">
           <div class="detail"><span>Зачислено</span><b>${money(data.amount, data.currency || 'RUB')}</b></div>
-          <div class="detail"><span>Прибыль</span><b>${esc(data.profit)}</b></div>
-          <div class="detail"><span>Статус</span><b>${esc(data.invoice_state)}</b></div>
+          <div class="detail"><span>Прибыль</span><b>${money(data.profit, data.currency || 'RUB')}</b></div>
+          <div class="detail"><span>Статус</span><b>${esc(data.invoice_state_label || `Неизвестный статус (${data.invoice_state ?? '—'})`)}</b></div>
           <div class="detail"><span>Оплата</span><b>${formatDate(data.date_pay)}</b></div>
         </div>
         <p><b>Покупатель:</b> ${esc(buyer.email || buyer.account || '—')}</p>
-        <p class="muted">Телефон: ${esc(buyer.phone || '—')} · Внешний ID: ${esc(data.external_order_id || '—')}</p>
+        <p class="muted">Телефон: ${esc(buyer.phone || '—')} · ID товара: ${esc(data.item_id || '—')} · Внешний ID: ${esc(data.external_order_id || '—')}</p>
       </article>`;
     } catch (error) { $('#orderResult').innerHTML = `<div class="notice">${esc(error.message)}</div>`; }
   }
@@ -393,9 +393,11 @@
     if (!data?.length) { $('#chatsList').innerHTML = '<div class="empty">Чатов нет</div>'; return; }
     $('#chatsList').innerHTML = data.map(item => {
       const id = getAny(item, ['id_i','debate_id','id','invoice_id']);
-      const title = getAny(item, ['product_name','name','subject','email'], `Диалог ${id}`);
-      const preview = getAny(item, ['last_message','message','text','buyer_email'], 'Открыть переписку');
-      return `<button class="chat-card plain-button" data-chat="${esc(id)}"><div class="panel-heading"><strong>${esc(title)}</strong><span class="badge">#${esc(id)}</span></div><p class="muted">${esc(typeof preview === 'object' ? JSON.stringify(preview) : preview)}</p></button>`;
+      const title = getAny(item, ['product_name','name','subject','email'], item.invoice_id ? `Заказ #${item.invoice_id}` : `Диалог #${id}`);
+      const preview = getAny(item, ['preview','message','text'], 'Открыть переписку');
+      const unread = Number(item.cnt_new || 0);
+      const meta = [item.email, item.invoice_id ? `заказ #${item.invoice_id}` : '', formatDate(item.last_message)].filter(Boolean).join(' · ');
+      return `<button class="chat-card plain-button" data-chat="${esc(id)}"><div class="panel-heading"><strong>${esc(title)}</strong><span class="badge">#${esc(id)}${unread > 0 ? ` · ${unread} новых` : ''}</span></div><p>${esc(typeof preview === 'object' ? JSON.stringify(preview) : preview)}</p><span class="muted">${esc(meta)}</span></button>`;
     }).join('');
   }
 
@@ -408,10 +410,11 @@
       const {data} = await api(`/app/api/chats/${encodeURIComponent(id)}`);
       if (!data?.length) { $('#chatMessages').innerHTML = '<div class="empty">Сообщений нет</div>'; return; }
       $('#chatMessages').innerHTML = data.map(item => {
-        const seller = item.seller === true || item.is_seller === true || String(item.sender || '').toLowerCase() === 'seller';
+        const seller = item.seller === true || Number(item.seller) === 1 || item.is_seller === true || Number(item.is_seller) === 1 || String(item.sender || '').toLowerCase() === 'seller';
         const body = getAny(item, ['message','text'], item.is_img ? '[Изображение]' : '[Файл]');
         const when = getAny(item, ['date_written','date','created_at']);
-        return `<div class="message ${seller ? 'seller' : ''}">${esc(body)}<small>${formatDate(when)}</small></div>`;
+        const attachment = item.url ? `<a href="${esc(item.url)}" target="_blank" rel="noopener">Открыть вложение</a>` : '';
+        return `<div class="message ${seller ? 'seller' : ''}">${esc(body)}${attachment}<small>${formatDate(when)}</small></div>`;
       }).join('');
       $('#chatMessages').scrollTop = $('#chatMessages').scrollHeight;
     } catch (error) { $('#chatMessages').innerHTML = `<div class="notice">${esc(error.message)}</div>`; }
@@ -433,10 +436,12 @@
     const {data} = await api('/app/api/reviews');
     if (!data?.length) { $('#reviewsList').innerHTML = '<div class="empty">Отзывов нет</div>'; return; }
     $('#reviewsList').innerHTML = data.map(item => {
-      const rating = getAny(item, ['rating','feedback_type','type'], '—');
-      const text = getAny(item, ['text','review','feedback','message'], 'Без текста');
+      const rating = getAny(item, ['rating_label','rating','feedback_type','type'], 'Отзыв');
+      const text = getAny(item, ['text','info','review','feedback','message'], 'Без текста');
       const product = getAny(item, ['product_name','name_goods','name'], 'Товар');
-      return `<article class="review-card"><div class="panel-heading"><strong>${esc(product)}</strong><span class="badge active">★ ${esc(rating)}</span></div><p>${esc(text)}</p><span class="muted">${formatDate(getAny(item,['date','created_at','date_written']))}</span></article>`;
+      const badgeClass = item.is_positive === false ? 'danger' : 'active';
+      const comment = getAny(item, ['seller_comment','comment'], '');
+      return `<article class="review-card"><div class="panel-heading"><strong>${esc(product)}</strong><span class="badge ${badgeClass}">★ ${esc(rating)}</span></div><p>${esc(text || 'Без текста')}</p>${comment ? `<p class="muted"><b>Ваш ответ:</b> ${esc(comment)}</p>` : ''}<span class="muted">Заказ #${esc(item.invoice_id || '—')} · ${formatDate(getAny(item,['date','created_at','date_written']))}</span></article>`;
     }).join('');
   }
 
