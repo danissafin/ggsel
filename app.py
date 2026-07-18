@@ -39,6 +39,9 @@ RECEIPTS_MAX_PAGES = int(os.environ.get("RECEIPTS_MAX_PAGES", "15"))
 MINIAPP_AUTH_MAX_AGE = int(os.environ.get("MINIAPP_AUTH_MAX_AGE", "86400"))
 MINIAPP_OFFERS_MAX_PAGES = int(os.environ.get("MINIAPP_OFFERS_MAX_PAGES", "20"))
 MINIAPP_OFFERS_CACHE_SECONDS = int(os.environ.get("MINIAPP_OFFERS_CACHE_SECONDS", "30"))
+# GGSEL V2 may return HTTP 500 for an oversized page instead of a validation error.
+# Keep this conservative; the client also retries compatible pagination formats.
+MINIAPP_OFFERS_API_PAGE_SIZE = max(5, min(int(os.environ.get("MINIAPP_OFFERS_API_PAGE_SIZE", "20")), 50))
 
 TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "").strip()
 GGSEL_WEBHOOK_SECRET = os.environ.get("GGSEL_WEBHOOK_SECRET", "").strip()
@@ -577,14 +580,31 @@ class GGSELClient:
     ) -> Any:
         if not GGSEL_API_KEY:
             raise RuntimeError("GGSEL_API_KEY must be set")
+        url = f"{GGSEL_BASE_URL}{path}"
         response = self.session.request(
             method,
-            f"{GGSEL_BASE_URL}{path}",
+            url,
             headers={"Authorization": GGSEL_API_KEY, "Accept": "application/json"},
             params=params,
             json=json_body,
             timeout=REQUEST_TIMEOUT,
         )
+        if not response.ok:
+            request_id = (
+                response.headers.get("x-request-id")
+                or response.headers.get("x-correlation-id")
+                or response.headers.get("cf-ray")
+                or "—"
+            )
+            logger.warning(
+                "GGSEL V2 upstream error: method=%s url=%s params=%s status=%s request_id=%s body=%s",
+                method,
+                url,
+                params,
+                response.status_code,
+                request_id,
+                response.text[:1000],
+            )
         return self._decode_response(response, "GGSEL V2")
 
     # ---------- V1: account/categories ----------
@@ -696,9 +716,48 @@ class GGSELClient:
             )
 
     def offers_v2(self, page: int = 1, limit: int = 20) -> Any:
-        return self.v2_request(
-            "GET", "/api_sellers/v2/offers", params={"page": page, "limit": limit}
-        )
+        """List offers with defensive pagination compatibility.
+
+        GGSEL's V2 documentation exposes the endpoint but deployments can differ
+        in accepted pagination parameter names. Some versions also respond with
+        HTTP 500 when the requested page size is too large. We therefore use a
+        conservative page size and retry only this safe GET request.
+        """
+        page = max(1, int(page))
+        safe_limit = max(5, min(int(limit), 50))
+
+        variants: list[Optional[dict[str, Any]]] = [
+            {"page": page, "limit": safe_limit},
+            {"page": page, "per_page": safe_limit},
+            {"page": page},
+        ]
+        if page == 1:
+            variants.append(None)
+
+        last_error: Optional[APIError] = None
+        seen_variants: set[str] = set()
+        for params in variants:
+            marker = json.dumps(params, sort_keys=True) if params is not None else "none"
+            if marker in seen_variants:
+                continue
+            seen_variants.add(marker)
+            try:
+                return self.v2_request("GET", "/api_sellers/v2/offers", params=params)
+            except APIError as exc:
+                last_error = exc
+                # Authorization/not-found errors are not pagination problems.
+                if exc.status in (401, 403, 404):
+                    raise
+                if exc.status not in (400, 422, 500):
+                    raise
+                logger.warning(
+                    "GGSEL V2 offers retry: page=%s params=%s status=%s",
+                    page,
+                    params,
+                    exc.status,
+                )
+
+        raise last_error or RuntimeError("GGSEL V2 offers request failed")
 
     def offer_v2(self, offer_id: int) -> Any:
         return self.v2_request("GET", f"/api_sellers/v2/offers/{offer_id}")
@@ -838,7 +897,11 @@ def _offer_quantity(item: dict[str, Any]) -> int:
 
 
 def _offer_status(item: dict[str, Any]) -> str:
-    value = item.get("status") or item.get("state") or item.get("offer_status") or "unknown"
+    value: Any = "unknown"
+    for key in ("status", "state", "offer_status", "active"):
+        if key in item and item.get(key) is not None:
+            value = item.get(key)
+            break
     text = str(value).strip().lower()
     aliases = {
         "1": "active",
@@ -896,29 +959,74 @@ def _has_next_page(data: Any, items: list[Any], page: int, limit: int) -> bool:
     return len(items) >= limit
 
 
-def collect_all_offers(force: bool = False) -> list[dict[str, Any]]:
-    now = time.time()
-    with _offer_cache_lock:
-        if not force and _offer_cache["items"] and now < float(_offer_cache["expires_at"]):
-            return list(_offer_cache["items"])
+def _collect_offers_v1_fallback() -> list[dict[str, Any]]:
+    """Load seller products through V1 when GGSEL's V2 list endpoint is broken.
 
-    limit = 100
+    The V2 offer ID and the legacy product ID represent the same seller item for
+    the operations used by this app. We normalize both schemas into one GUI model.
+    """
     collected: list[dict[str, Any]] = []
     seen: set[str] = set()
+    count = 100
     for page in range(1, MINIAPP_OFFERS_MAX_PAGES + 1):
-        data = ggsel.offers_v2(page=page, limit=limit)
-        items = extract_list(data, ("items", "offers", "rows"))
+        data = ggsel.products_v1(page=page, count=count)
+        items = extract_list(data, ("products", "items", "rows"))
         new_count = 0
         for item in items:
+            if not isinstance(item, dict):
+                continue
             normalized = normalize_offer_item(item)
+            normalized["api_source"] = "v1-fallback"
             identifier = str(normalized.get("id") or "")
             if not identifier or identifier in seen:
                 continue
             seen.add(identifier)
             collected.append(normalized)
             new_count += 1
-        if not items or new_count == 0 or not _has_next_page(data, items, page, limit):
+        if not items or new_count == 0 or len(items) < count:
             break
+    logger.info("Loaded %s offers through GGSEL V1 fallback", len(collected))
+    return collected
+
+
+def collect_all_offers(force: bool = False) -> list[dict[str, Any]]:
+    now = time.time()
+    with _offer_cache_lock:
+        if not force and _offer_cache["items"] and now < float(_offer_cache["expires_at"]):
+            return list(_offer_cache["items"])
+
+    limit = MINIAPP_OFFERS_API_PAGE_SIZE
+    collected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    try:
+        for page in range(1, MINIAPP_OFFERS_MAX_PAGES + 1):
+            try:
+                data = ggsel.offers_v2(page=page, limit=limit)
+            except APIError:
+                if page == 1 or not collected:
+                    raise
+                logger.exception("GGSEL V2 offers page %s failed; returning partial list", page)
+                break
+            items = extract_list(data, ("items", "offers", "rows"))
+            new_count = 0
+            for item in items:
+                normalized = normalize_offer_item(item)
+                normalized["api_source"] = "v2"
+                identifier = str(normalized.get("id") or "")
+                if not identifier or identifier in seen:
+                    continue
+                seen.add(identifier)
+                collected.append(normalized)
+                new_count += 1
+            if not items or new_count == 0 or not _has_next_page(data, items, page, limit):
+                break
+    except APIError as exc:
+        if exc.status != 500:
+            raise
+        logger.warning(
+            "GGSEL V2 /offers returned HTTP 500; switching GUI list to V1 products API"
+        )
+        collected = _collect_offers_v1_fallback()
 
     with _offer_cache_lock:
         _offer_cache["items"] = list(collected)
@@ -1949,8 +2057,7 @@ def miniapp_dashboard(user: dict[str, Any]):
     except Exception as exc:
         errors["sales"] = str(exc)
     try:
-        first_page = ggsel.offers_v2(page=1, limit=100)
-        offers_data = [normalize_offer_item(x) for x in extract_list(first_page, ("items", "offers", "rows")) if isinstance(x, dict)]
+        offers_data = collect_all_offers()
     except Exception as exc:
         errors["offers"] = str(exc)
 
