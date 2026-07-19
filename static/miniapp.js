@@ -22,6 +22,9 @@
     dashboardStart: '',
     dashboardEnd: '',
     dashboardProduct: '',
+    attention: {count: 0, items: [], summary: {}},
+    recent: [],
+    searchTimer: null,
   };
 
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -82,6 +85,17 @@
   }
   function closeDialog(dialog) { if (dialog.open) dialog.close(); }
 
+  function applyPreferences() {
+    const compact = localStorage.getItem('ggselCompactMode') === '1';
+    const hideBalance = localStorage.getItem('ggselHideBalance') === '1';
+    document.body.classList.toggle('compact-mode', compact);
+    document.body.classList.toggle('hide-balance', hideBalance);
+    const compactToggle = $('#compactModeToggle');
+    const hideToggle = $('#hideBalanceToggle');
+    if (compactToggle) compactToggle.checked = compact;
+    if (hideToggle) hideToggle.checked = hideBalance;
+  }
+
   function statusLabel(status) {
     return ({active:'Активен', paused:'Приостановлен', archived:'В архиве', unknown:'Неизвестно'})[status] || status || 'Неизвестно';
   }
@@ -105,12 +119,83 @@
         if (name === 'more') return;
       } catch (error) { toast(error.message, true); }
     }
+    if (name === 'dashboard' && state.loaded.has(name)) Promise.allSettled([loadAttention(false), loadRecent()]);
     window.scrollTo({top:0, behavior:'smooth'});
   }
 
   async function loadIdentity() {
     const {data} = await api('/app/api/me');
     $('#ownerName').textContent = data.first_name ? `${data.first_name} · ID ${data.seller_id || '—'}` : '';
+  }
+
+  function attentionItemMarkup(item) {
+    const icon = item.kind === 'low_stock' ? '!' : item.kind === 'chat' ? '✉' : '↻';
+    return `<button class="attention-item plain-button severity-${esc(item.severity || 'info')}" data-attention-action="${esc(item.action || '')}" data-entity-id="${esc(item.entity_id || '')}">
+      <span class="attention-icon">${icon}</span><div><strong>${esc(item.title)}</strong><span class="muted">${esc(item.subtitle || '')}</span></div><span class="support-arrow">→</span>
+    </button>`;
+  }
+
+  async function loadAttention(open = false) {
+    const {data} = await api('/app/api/attention');
+    state.attention = data || {count:0, items:[], summary:{}};
+    const count = Number(state.attention.count || 0);
+    const badge = $('#attentionBadge');
+    badge.textContent = count > 99 ? '99+' : String(count);
+    badge.classList.toggle('hidden', count <= 0);
+    const markup = state.attention.items?.length ? state.attention.items.map(attentionItemMarkup).join('') : '<div class="empty">Всё спокойно — срочных действий нет</div>';
+    $('#dashboardAttention').innerHTML = markup;
+    $('#attentionList').innerHTML = markup;
+    const summary = state.attention.summary || {};
+    $('#attentionSummary').innerHTML = [
+      ['Остатки', summary.low_stock || 0], ['Новые чаты', summary.new_chats || 0], ['Замены', summary.replacement || 0], ['Операции', summary.operations || 0],
+    ].map(([label,value]) => `<div class="metric-card compact-card"><span class="label">${esc(label)}</span><span class="value">${Number(value).toLocaleString('ru-RU')}</span></div>`).join('');
+    if (open) openDialog($('#attentionDialog'));
+  }
+
+  async function loadRecent() {
+    const {data} = await api('/app/api/recent?limit=8');
+    state.recent = data || [];
+    $('#dashboardRecent').innerHTML = state.recent.length ? state.recent.map(item => {
+      const label = item.type === 'offer' ? 'Товар' : item.type === 'order' ? 'Заказ' : 'Чат';
+      return `<button class="list-item plain-button recent-item" data-recent-type="${esc(item.type)}" data-recent-id="${esc(item.id)}"><div><strong>${esc(item.title || `${label} ${item.id}`)}</strong><span class="muted">${label} · ${formatDate(item.viewed_at)}</span></div><span class="support-arrow">→</span></button>`;
+    }).join('') : '<div class="empty">Откройте товар, заказ или чат — они появятся здесь</div>';
+  }
+
+  function renderSearchGroup(title, items) {
+    if (!items?.length) return '';
+    return `<section class="search-group"><h3>${esc(title)}</h3>${items.map(item => `<button class="search-result plain-button" data-search-type="${esc(item.type)}" data-search-id="${esc(item.id)}" data-search-invoice="${esc(item.invoice_id || '')}"><div><strong>${esc(item.title)}</strong><span class="muted">${esc(item.subtitle || '')}</span></div><span class="support-arrow">→</span></button>`).join('')}</section>`;
+  }
+
+  async function runGlobalSearch(query) {
+    const clean = String(query || '').trim();
+    if (clean.length < 2) { $('#globalSearchResults').innerHTML = '<div class="empty">Введите минимум 2 символа</div>'; return; }
+    $('#globalSearchResults').innerHTML = '<div class="empty">Ищу…</div>';
+    try {
+      const {data} = await api(`/app/api/search?q=${encodeURIComponent(clean)}`);
+      const html = renderSearchGroup('Товары', data.offers) + renderSearchGroup('Заказы', data.orders) + renderSearchGroup('Чаты', data.chats);
+      $('#globalSearchResults').innerHTML = html || '<div class="empty">Ничего не найдено</div>';
+    } catch (error) { $('#globalSearchResults').innerHTML = `<div class="notice">${esc(error.message)}</div>`; }
+  }
+
+  function openGlobalSearch() {
+    openDialog($('#globalSearchDialog'));
+    setTimeout(() => $('#globalSearchInput').focus(), 80);
+  }
+
+  async function toggleFavorite(id, favorite) {
+    try {
+      await api(`/app/api/offers/${id}/favorite`, {method:'PUT', body:JSON.stringify({favorite})});
+      toast(favorite ? 'Добавлено в избранное' : 'Удалено из избранного');
+      if ($('#offerDialog').open) await showOffer(id);
+      if (state.section === 'offers') await loadOffers();
+    } catch (error) { toast(error.message, true); }
+  }
+
+  async function handleNavigationItem(type, id, invoice = '') {
+    if (type === 'offer') { closeDialog($('#globalSearchDialog')); closeDialog($('#attentionDialog')); await switchSection('offers'); await showOffer(id); }
+    if (type === 'order') { closeDialog($('#globalSearchDialog')); await switchSection('orders'); $('#invoiceInput').value = id; await findOrder(id); }
+    if (type === 'chat') { closeDialog($('#globalSearchDialog')); await switchSection('chats'); await openChat(id); }
+    if (invoice && type === 'chat') $('#invoiceInput').value = invoice;
   }
 
   function localDateValue(value) {
@@ -241,6 +326,7 @@
     const noteNode = $('#dashboardApiNote');
     if (notes.length) { noteNode.textContent = notes.join(' '); noteNode.classList.remove('hidden'); } else noteNode.classList.add('hidden');
     if (payload.errors && Object.keys(payload.errors).length) console.warn(payload.errors);
+    await Promise.allSettled([loadAttention(false), loadRecent()]);
   }
 
   async function setDashboardPeriod(period) {
@@ -287,7 +373,7 @@
         <div class="offer-head">
           ${state.selectionMode ? `<input class="offer-select" type="checkbox" ${selected ? 'checked' : ''} aria-label="Выбрать товар">` : ''}
           <div class="offer-main">
-            <div class="offer-title">${esc(item.title)}</div>
+            <div class="offer-title-row"><div class="offer-title">${esc(item.title)}</div><button class="favorite-button ${item.favorite ? 'active' : ''}" data-action="favorite" aria-label="Избранное">★</button></div>
             <div class="offer-meta"><span class="badge ${esc(item.status)}">${esc(statusLabel(item.status))}</span><span class="badge ${stockClass}">Остаток: ${esc(item.quantity)}</span>${item.low_stock ? '<span class="badge warning">Заканчивается</span>' : ''}<span class="badge">ID ${esc(item.id)}</span></div>
           </div>
         </div>
@@ -325,7 +411,7 @@
       const products = stockResult.data || [];
       $('#offerDialogTitle').textContent = item.title || `Товар #${id}`;
       $('#offerDialogBody').innerHTML = `
-        <div class="offer-meta"><span class="badge ${esc(item.status)}">${esc(statusLabel(item.status))}</span><span class="badge">ID ${esc(item.id || id)}</span></div>
+        <div class="offer-detail-head"><div class="offer-meta"><span class="badge ${esc(item.status)}">${esc(statusLabel(item.status))}</span><span class="badge">ID ${esc(item.id || id)}</span></div><button class="favorite-button large ${item.favorite ? 'active' : ''}" data-modal-action="favorite" aria-label="Избранное">★</button></div>
         <div class="detail-grid">
           <div class="detail"><span>Цена</span><b>${item.price === null || item.price === undefined ? '—' : money(item.price, item.currency)}</b></div>
           <div class="detail"><span>Остаток</span><b>${esc(item.quantity ?? '—')}</b></div>
@@ -498,7 +584,8 @@
     try {
       const {data} = await api(`/app/api/orders/${encodeURIComponent(invoice)}`);
       const buyer = data.buyer || {};
-      $('#orderResult').innerHTML = `<article class="order-card panel">
+      const note = data.note || {};
+      $('#orderResult').innerHTML = `<article class="order-card panel" data-order-id="${esc(data.invoice_id)}">
         <div class="panel-heading"><h3>${esc(data.name || 'Товар')}</h3><span class="badge">#${esc(data.invoice_id)}</span></div>
         <div class="detail-grid">
           <div class="detail"><span>Зачислено</span><b>${money(data.amount, data.currency || 'RUB')}</b></div>
@@ -508,8 +595,25 @@
         </div>
         <p><b>Покупатель:</b> ${esc(buyer.email || buyer.account || '—')}</p>
         <p class="muted">Телефон: ${esc(buyer.phone || '—')} · ID товара: ${esc(data.item_id || '—')} · Внешний ID: ${esc(data.external_order_id || '—')}</p>
+        <div class="order-note-box">
+          <div class="panel-heading"><h3>Моя заметка</h3><span class="muted">видна только тебе</span></div>
+          <label>Метка<select id="orderNoteTag"><option value="">Без метки</option><option value="check">Проверить</option><option value="replacement">Замена</option><option value="waiting">Ждём клиента</option><option value="vip">VIP</option><option value="resolved">Решено</option></select></label>
+          <label>Комментарий<textarea id="orderNoteText" rows="3" placeholder="Что важно помнить по этому заказу">${esc(note.note || '')}</textarea></label>
+          <button class="secondary-button full" data-save-order-note>Сохранить заметку</button>
+        </div>
       </article>`;
+      $('#orderNoteTag').value = note.tag || '';
     } catch (error) { $('#orderResult').innerHTML = `<div class="notice">${esc(error.message)}</div>`; }
+  }
+
+  async function saveOrderNote() {
+    const card = $('#orderResult [data-order-id]');
+    if (!card) return;
+    const invoice = card.dataset.orderId;
+    try {
+      await api(`/app/api/orders/${encodeURIComponent(invoice)}/note`, {method:'PUT', body:JSON.stringify({tag:$('#orderNoteTag').value, note:$('#orderNoteText').value})});
+      toast('Заметка сохранена');
+    } catch (error) { toast(error.message, true); }
   }
 
   async function loadFinance() {
@@ -720,12 +824,24 @@
     $$('.tab').forEach(tab => tab.addEventListener('click', () => switchSection(tab.dataset.section)));
     $$('[data-goto]').forEach(button => button.addEventListener('click', () => switchSection(button.dataset.goto)));
     $('#globalRefresh').addEventListener('click', globalRefresh);
+    $('#globalSearchBtn').addEventListener('click', openGlobalSearch);
+    $('#globalSearchMoreBtn').addEventListener('click', openGlobalSearch);
+    $('#attentionBtn').addEventListener('click', () => loadAttention(true).catch(error => toast(error.message, true)));
+    $('#dashboardAttentionRefresh').addEventListener('click', () => loadAttention(false).catch(error => toast(error.message, true)));
+    $('#dashboardRecentClear').addEventListener('click', () => loadRecent().catch(error => toast(error.message, true)));
+    $('#compactModeToggle').addEventListener('change', event => { localStorage.setItem('ggselCompactMode', event.target.checked ? '1' : '0'); applyPreferences(); });
+    $('#hideBalanceToggle').addEventListener('change', event => { localStorage.setItem('ggselHideBalance', event.target.checked ? '1' : '0'); applyPreferences(); });
     $('#dashboardPeriods').addEventListener('click', event => { const button = event.target.closest('[data-dashboard-period]'); if (button) setDashboardPeriod(button.dataset.dashboardPeriod); });
     $('#dashboardProduct').addEventListener('change', async event => { state.dashboardProduct = event.target.value; await loadDashboard(); });
     $('#dashboardDateForm').addEventListener('submit', async event => { event.preventDefault(); state.dashboardStart = $('#dashboardStart').value; state.dashboardEnd = $('#dashboardEnd').value; if (!state.dashboardStart || !state.dashboardEnd) return; await loadDashboard(); });
     $('#dashboardTopProducts').addEventListener('click', event => { const id = event.target.closest('[data-product-id]')?.dataset.productId; if (id) { state.dashboardProduct = id; $('#dashboardProduct').value = id; loadDashboard(); } });
     $('#dashboardLowStock').addEventListener('click', event => { const id = event.target.closest('[data-offer-id]')?.dataset.offerId; if (id) switchSection('offers').then(() => showOffer(id)); });
     $('#dashboardSupport').addEventListener('click', event => { if (event.target.closest('[data-goto="chats"]')) switchSection('chats'); });
+    const attentionClick = event => { const node = event.target.closest('[data-attention-action]'); if (!node) return; const action = node.dataset.attentionAction; const id = node.dataset.entityId; if (action === 'offer') switchSection('offers').then(() => showOffer(id)); else if (action === 'chats') { state.chatLabel = id || 'all'; switchSection('chats').then(() => { $$('#chatFilters .chip').forEach(chip => chip.classList.toggle('active', chip.dataset.chatLabel === state.chatLabel)); renderChats(); }); } else if (action === 'operations') switchSection('operations'); closeDialog($('#attentionDialog')); };
+    $('#dashboardAttention').addEventListener('click', attentionClick);
+    $('#attentionList').addEventListener('click', attentionClick);
+    $('#dashboardRecent').addEventListener('click', event => { const node = event.target.closest('[data-recent-type]'); if (node) handleNavigationItem(node.dataset.recentType, node.dataset.recentId); });
+    $$('.quick-actions-grid [data-quick-action]').forEach(button => button.addEventListener('click', () => { const action = button.dataset.quickAction; if (action === 'search') openGlobalSearch(); if (action === 'low-stock') { state.offerStatus = 'low_stock'; switchSection('offers').then(() => { $$('#offerFilters .chip').forEach(chip => chip.classList.toggle('active', chip.dataset.status === 'low_stock')); loadOffers(); }); } if (action === 'order') switchSection('orders').then(() => $('#invoiceInput').focus()); if (action === 'chats') switchSection('chats'); }));
 
     let searchTimer;
     $('#offerSearch').addEventListener('input', event => {
@@ -747,6 +863,7 @@
       const action = event.target.closest('[data-action]')?.dataset.action;
       if (action === 'details') showOffer(id);
       if (action === 'stock') openStock(id, $('.offer-title', card)?.textContent || '');
+      if (action === 'favorite') toggleFavorite(id, !event.target.closest('[data-action=\"favorite\"]').classList.contains('active'));
     });
     $('#batchBar').addEventListener('click', event => { const action = event.target.closest('[data-batch]')?.dataset.batch; if (action) batchAction(action); });
     $('#createOfferBtn').addEventListener('click', () => openDialog($('#createOfferDialog')));
@@ -757,6 +874,7 @@
       if (action === 'stock') openStock(id, $('#offerDialogTitle').textContent);
       if (action === 'edit') openEditOffer();
       if (action === 'save-settings') saveOfferSettings(id);
+      if (action === 'favorite') { const current = JSON.parse($('#offerDialog').dataset.offer || '{}').item || {}; toggleFavorite(id, !current.favorite); }
       if (['activate','pause','delete'].includes(action)) offerAction(id, action);
       if (action === 'archive-all') archiveAllStock(id);
     });
@@ -770,6 +888,7 @@
     $('#salesRefresh').addEventListener('click', loadSales);
     $('#salesList').addEventListener('click', event => { const invoice = event.target.closest('[data-invoice]')?.dataset.invoice; if (invoice) { $('#invoiceInput').value = invoice; findOrder(invoice); } });
     $('#dashboardSales').addEventListener('click', event => { const invoice = event.target.closest('[data-invoice]')?.dataset.invoice; if (invoice) { switchSection('orders').then(() => { $('#invoiceInput').value = invoice; findOrder(invoice); }); } });
+    $('#orderResult').addEventListener('click', event => { if (event.target.closest('[data-save-order-note]')) saveOrderNote(); });
 
     $('#revenueForm').addEventListener('submit', calculateRevenue);
     $$('.finance-presets [data-period]').forEach(button => button.addEventListener('click', () => applyFinancePeriod(button.dataset.period)));
@@ -785,6 +904,9 @@
     $('#auditRefresh').addEventListener('click', loadAudit);
     $('#operationsRefresh').addEventListener('click', () => loadOperations(true));
     $('#exportOffersBtn').addEventListener('click', exportOffers);
+    $('#globalSearchInput').addEventListener('input', event => { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(() => runGlobalSearch(event.target.value), 280); });
+    $('#globalSearchResults').addEventListener('click', event => { const node = event.target.closest('[data-search-type]'); if (node) handleNavigationItem(node.dataset.searchType, node.dataset.searchId, node.dataset.searchInvoice); });
+    document.addEventListener('keydown', event => { if (event.key === '/' && !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName)) { event.preventDefault(); openGlobalSearch(); } if (event.key === 'Escape') $$('.modal').forEach(closeDialog); });
     $$('[data-close]').forEach(button => button.addEventListener('click', () => closeDialog(button.closest('dialog'))));
   }
 
@@ -795,6 +917,7 @@
       try { tg.setBackgroundColor('bg_color'); } catch {}
       tg.enableClosingConfirmation?.();
     }
+    applyPreferences();
     bindEvents();
     if (!initData) {
       const notice = $('#authNotice'); notice.textContent = 'Откройте эту панель кнопкой «Управление» внутри Telegram-бота.'; notice.classList.remove('hidden');

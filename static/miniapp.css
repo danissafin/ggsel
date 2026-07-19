@@ -229,3 +229,49 @@ button:disabled { opacity: .45; cursor: default; }
   .compact-metrics { grid-template-columns: repeat(2, minmax(0,1fr)); }
   .bar-chart-grid { min-width: max(100%, 390px); height: 190px; }
 }
+
+/* v4.8 productivity: universal search, action center, favorites and private notes */
+.topbar-actions { display: flex; align-items: center; gap: 8px; }
+.notification-button { position: relative; }
+.notification-badge { position: absolute; right: -4px; top: -4px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 999px; display: grid; place-items: center; background: var(--danger); color: #fff; border: 2px solid var(--bg); font-size: 9px; font-weight: 900; }
+.productivity-grid { margin-top: 14px; }
+.attention-item { width: 100%; display: grid; grid-template-columns: 36px 1fr auto; align-items: center; gap: 10px; padding: 12px; border-radius: 14px; margin-bottom: 8px; background: color-mix(in srgb, var(--muted) 6%, transparent); border: 1px solid var(--line); }
+.attention-item div { display: grid; gap: 3px; min-width: 0; }
+.attention-item strong, .attention-item .muted { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attention-icon { width: 34px; height: 34px; border-radius: 12px; display: grid; place-items: center; font-weight: 900; background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); }
+.attention-item.severity-warning .attention-icon { background: rgba(213,138,22,.14); color: var(--warning); }
+.attention-item.severity-danger .attention-icon { background: rgba(217,68,82,.13); color: var(--danger); }
+.quick-actions-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 10px; }
+.quick-actions-grid button { min-height: 100px; padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: color-mix(in srgb, var(--muted) 5%, transparent); color: var(--text); display: grid; align-content: space-between; justify-items: start; text-align: left; }
+.quick-actions-grid button > span { font-size: 23px; color: var(--accent); }
+.quick-actions-grid b { font-size: 15px; }
+.quick-actions-grid small { color: var(--muted); }
+.offer-title-row, .offer-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.favorite-button { flex: 0 0 auto; width: 34px; height: 34px; border-radius: 12px; border: 1px solid var(--line); background: color-mix(in srgb, var(--muted) 6%, transparent); color: var(--muted); font-size: 18px; }
+.favorite-button.active { color: #ffb020; background: rgba(255,176,32,.14); border-color: rgba(255,176,32,.34); }
+.favorite-button.large { width: 42px; height: 42px; font-size: 22px; }
+.search-modal { min-height: min(680px, 88vh); }
+.global-search-field { margin-bottom: 14px; }
+.search-results { display: grid; gap: 16px; }
+.search-group { display: grid; gap: 7px; }
+.search-group h3 { margin: 0 0 3px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; }
+.search-result { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px; border: 1px solid var(--line); border-radius: 14px; background: color-mix(in srgb, var(--muted) 4%, transparent); }
+.search-result > div { min-width: 0; display: grid; gap: 3px; }
+.search-result strong, .search-result .muted { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.order-note-box { margin-top: 18px; padding: 14px; border: 1px solid color-mix(in srgb, var(--accent) 25%, var(--line)); border-radius: 16px; background: color-mix(in srgb, var(--accent) 6%, transparent); display: grid; gap: 10px; }
+.order-note-box label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 750; }
+.order-note-box select, .order-note-box textarea { width: 100%; border: 1px solid var(--line); border-radius: 13px; padding: 11px; color: var(--text); background: var(--surface); }
+.preferences-panel .switch-row > span { display: grid; gap: 3px; }
+.preferences-panel small { color: var(--muted); font-weight: 500; }
+.hide-balance #dashboardInventoryCards .metric-card:nth-child(-n+2) .value,
+.hide-balance #balanceCards .metric-card .value,
+.hide-balance #dashboardKpis .metric-card:first-child .value,
+.hide-balance #dashboardGrossTotal { filter: blur(8px); user-select: none; }
+.compact-mode .offer-card { padding: 12px; }
+.compact-mode .offer-title { font-size: 15px; }
+.compact-mode .offer-bottom { margin-top: 10px; }
+.compact-mode .panel { padding: 14px; }
+.compact-mode .list-item { padding: 10px 0; }
+.compact-mode .metric-card { min-height: 90px; padding: 12px; }
+@media (min-width: 700px) { .quick-actions-grid { grid-template-columns: repeat(4,minmax(0,1fr)); } }
+@media (max-width: 420px) { .topbar-actions { gap: 5px; } .topbar-actions .icon-button { width: 42px; height: 42px; } }

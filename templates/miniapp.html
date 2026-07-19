@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>GGSEL Seller</title>
   <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
-  <link rel="stylesheet" href="{{ url_for('static', filename='miniapp.css', v='47') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='miniapp.css', v='48') }}">
 </head>
 <body>
   <div id="app" class="app-shell">
@@ -15,7 +15,11 @@
         <div class="eyebrow">SELLER CONTROL</div>
         <h1>GGSEL</h1>
       </div>
-      <button id="globalRefresh" class="icon-button" aria-label="Обновить">↻</button>
+      <div class="topbar-actions">
+        <button id="globalSearchBtn" class="icon-button" aria-label="Поиск по кабинету">⌕</button>
+        <button id="attentionBtn" class="icon-button notification-button" aria-label="Что требует внимания">♢<span id="attentionBadge" class="notification-badge hidden">0</span></button>
+        <button id="globalRefresh" class="icon-button" aria-label="Обновить">↻</button>
+      </div>
     </header>
 
     <div id="authNotice" class="notice hidden"></div>
@@ -67,6 +71,27 @@
 
         <div id="dashboardApiNote" class="notice info-notice hidden"></div>
 
+        <div class="dashboard-columns productivity-grid">
+          <div class="panel">
+            <div class="panel-heading"><h3>Требует внимания</h3><button id="dashboardAttentionRefresh" class="link-button">Обновить</button></div>
+            <div id="dashboardAttention" class="list"><div class="empty">Загрузка…</div></div>
+          </div>
+          <div class="panel">
+            <div class="panel-heading"><h3>Недавно открывали</h3><button id="dashboardRecentClear" class="link-button">Обновить</button></div>
+            <div id="dashboardRecent" class="list"><div class="empty">Загрузка…</div></div>
+          </div>
+        </div>
+
+        <div class="panel quick-actions-panel">
+          <div class="panel-heading"><h3>Быстрые действия</h3></div>
+          <div class="quick-actions-grid">
+            <button data-quick-action="search"><span>⌕</span><b>Найти</b><small>Товар, заказ или чат</small></button>
+            <button data-quick-action="low-stock"><span>＋</span><b>Пополнить</b><small>Товары с низким остатком</small></button>
+            <button data-quick-action="order"><span>#</span><b>Заказ</b><small>Открыть по номеру</small></button>
+            <button data-quick-action="chats"><span>✉</span><b>Поддержка</b><small>Новые обращения</small></button>
+          </div>
+        </div>
+
         <div class="panel">
           <div class="panel-heading"><h3>Состояние магазина</h3><button class="link-button" data-goto="offers">Все товары</button></div>
           <div id="dashboardInventoryCards" class="metric-grid compact-metrics"></div>
@@ -105,6 +130,7 @@
           <button class="chip" data-status="paused">Приостановлены</button>
           <button class="chip" data-status="out_of_stock">Без остатка</button>
           <button class="chip" data-status="low_stock">Заканчиваются</button>
+          <button class="chip" data-status="favorite">★ Избранные</button>
           <button class="chip" data-status="archived">Архив</button>
         </div>
         <div class="selection-row">
@@ -205,6 +231,12 @@
           <button class="more-card" data-goto="operations"><span>↻</span><b>Операции</b><small>Фоновые задачи</small></button>
           <button class="more-card" data-goto="audit"><span>☰</span><b>История</b><small>Журнал действий</small></button>
           <button id="exportOffersBtn" class="more-card"><span>⇩</span><b>Экспорт</b><small>Товары в JSON</small></button>
+          <button id="globalSearchMoreBtn" class="more-card"><span>⌕</span><b>Общий поиск</b><small>По всему кабинету</small></button>
+        </div>
+        <div class="panel preferences-panel">
+          <div class="panel-heading"><h3>Интерфейс</h3></div>
+          <label class="switch-row"><span><b>Компактные карточки</b><small>Больше информации на экране</small></span><input id="compactModeToggle" type="checkbox"></label>
+          <label class="switch-row"><span><b>Скрывать баланс</b><small>Полезно при демонстрации экрана</small></span><input id="hideBalanceToggle" type="checkbox"></label>
         </div>
       </section>
 
@@ -270,6 +302,18 @@
     <form id="chatReplyForm" class="reply-form"><textarea id="chatReplyText" rows="3" placeholder="Ответ покупателю"></textarea><button class="primary-button" type="submit">Отправить</button></form>
   </dialog>
 
+  <dialog id="globalSearchDialog" class="modal large-modal search-modal">
+    <div class="modal-header"><div><span class="kicker">Навигация</span><h2>Поиск по кабинету</h2></div><button class="close-button" data-close>×</button></div>
+    <label class="search-field global-search-field"><span>⌕</span><input id="globalSearchInput" type="search" placeholder="Название товара, заказ, email или текст чата"></label>
+    <div id="globalSearchResults" class="search-results"><div class="empty">Введите минимум 2 символа</div></div>
+  </dialog>
+
+  <dialog id="attentionDialog" class="modal large-modal">
+    <div class="modal-header"><div><span class="kicker">Центр действий</span><h2>Требует внимания</h2></div><button class="close-button" data-close>×</button></div>
+    <div id="attentionSummary" class="metric-grid compact-metrics"></div>
+    <div id="attentionList" class="list"><div class="empty">Загрузка…</div></div>
+  </dialog>
+
   <nav class="bottom-nav" aria-label="Основная навигация">
     <button class="tab active" data-section="dashboard"><span>⌂</span><small>Обзор</small></button>
     <button class="tab" data-section="offers"><span>▦</span><small>Товары</small></button>
@@ -279,6 +323,6 @@
   </nav>
 
   <div id="toast" class="toast hidden"></div>
-  <script src="{{ url_for('static', filename='miniapp.js', v='47') }}" defer></script>
+  <script src="{{ url_for('static', filename='miniapp.js', v='48') }}" defer></script>
 </body>
 </html>

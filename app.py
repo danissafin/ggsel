@@ -337,6 +337,27 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS offer_favorites (
+                offer_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS recent_views (
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                title TEXT,
+                metadata_json TEXT,
+                viewed_at TEXT NOT NULL,
+                PRIMARY KEY(entity_type, entity_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS order_notes (
+                invoice_id TEXT PRIMARY KEY,
+                tag TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_messages_debate ON messages(debate_id, id);
             CREATE INDEX IF NOT EXISTS idx_messages_invoice ON messages(invoice_id, id);
             CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
@@ -961,6 +982,99 @@ def audit_miniapp(user_id: Any, action: str, target: Any = "", payload: Any = No
         )
 
 
+def get_favorite_offer_ids() -> set[str]:
+    with db_connect() as conn:
+        rows = conn.execute("SELECT offer_id FROM offer_favorites").fetchall()
+    return {str(row["offer_id"]) for row in rows}
+
+
+def set_offer_favorite(offer_id_value: Any, favorite: bool) -> bool:
+    key = str(offer_id_value)
+    with db_connect() as conn:
+        if favorite:
+            conn.execute(
+                "INSERT OR REPLACE INTO offer_favorites(offer_id, created_at) VALUES (?, ?)",
+                (key, datetime.now(timezone.utc).isoformat()),
+            )
+        else:
+            conn.execute("DELETE FROM offer_favorites WHERE offer_id = ?", (key,))
+    return favorite
+
+
+def remember_recent_view(entity_type: str, entity_id: Any, title: str = "", metadata: Any = None) -> None:
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO recent_views(entity_type, entity_id, title, metadata_json, viewed_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                title=excluded.title,
+                metadata_json=excluded.metadata_json,
+                viewed_at=excluded.viewed_at
+            """,
+            (
+                str(entity_type),
+                str(entity_id),
+                str(title or ""),
+                json.dumps(metadata, ensure_ascii=False, default=str) if metadata is not None else "",
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+
+
+def get_recent_views(limit: int = 8) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT entity_type, entity_id, title, metadata_json, viewed_at
+            FROM recent_views ORDER BY viewed_at DESC LIMIT ?
+            """,
+            (max(1, min(limit, 30)),),
+        ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        metadata: Any = {}
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            metadata = {}
+        result.append({
+            "type": row["entity_type"],
+            "id": row["entity_id"],
+            "title": row["title"],
+            "metadata": metadata,
+            "viewed_at": row["viewed_at"],
+        })
+    return result
+
+
+def get_order_note(invoice_id: Any) -> dict[str, Any]:
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT tag, note, updated_at FROM order_notes WHERE invoice_id = ?",
+            (str(invoice_id),),
+        ).fetchone()
+    return dict(row) if row else {"tag": "", "note": "", "updated_at": ""}
+
+
+def save_order_note(invoice_id: Any, tag: str, note: str) -> dict[str, Any]:
+    allowed_tags = {"", "check", "replacement", "waiting", "vip", "resolved"}
+    clean_tag = str(tag or "").strip().lower()
+    if clean_tag not in allowed_tags:
+        raise ValueError("Неизвестная метка заказа")
+    clean_note = str(note or "").strip()[:4000]
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO order_notes(invoice_id, tag, note, updated_at) VALUES (?, ?, ?, ?)
+            ON CONFLICT(invoice_id) DO UPDATE SET
+                tag=excluded.tag, note=excluded.note, updated_at=excluded.updated_at
+            """,
+            (str(invoice_id), clean_tag, clean_note, datetime.now(timezone.utc).isoformat()),
+        )
+    return get_order_note(invoice_id)
+
+
 def get_offer_settings_map() -> dict[str, dict[str, Any]]:
     with db_connect() as conn:
         rows = conn.execute(
@@ -1029,17 +1143,20 @@ def save_offer_settings(offer_id_value: Any, settings: dict[str, Any]) -> dict[s
 
 def enrich_offer_settings(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     settings_map = get_offer_settings_map()
+    favorites = get_favorite_offer_ids()
     enriched: list[dict[str, Any]] = []
     for item in items:
         copy = dict(item)
-        settings = settings_map.get(str(copy.get("id") or ""), {
+        offer_key = str(copy.get("id") or "")
+        settings = settings_map.get(offer_key, {
             "min_stock": LOW_STOCK_DEFAULT,
             "auto_activate": False,
             "auto_pause": False,
             "alert_sent": False,
         })
         copy["settings"] = settings
-        copy["low_stock"] = as_int(copy.get("quantity")) <= as_int(settings.get("min_stock"), LOW_STOCK_DEFAULT)
+        copy["favorite"] = offer_key in favorites
+        copy["low_stock"] = str(copy.get("status") or "") != "archived" and as_int(copy.get("quantity")) <= as_int(settings.get("min_stock"), LOW_STOCK_DEFAULT)
         enriched.append(copy)
     return enriched
 
@@ -2946,6 +3063,149 @@ def _message_payload(data: Any, debate_id: str) -> list[dict[str, Any]]:
     return combined
 
 
+def global_search_payload(query: str) -> dict[str, list[dict[str, Any]]]:
+    clean = str(query or "").strip()
+    if len(clean) < 2:
+        return {"offers": [], "orders": [], "chats": []}
+    folded = clean.casefold()
+
+    offers: list[dict[str, Any]] = []
+    try:
+        for item in enrich_offer_settings(collect_all_offers()):
+            haystack = " ".join(str(item.get(key) or "") for key in ("id", "title", "category")).casefold()
+            if folded in haystack:
+                offers.append({
+                    "type": "offer",
+                    "id": str(item.get("id") or ""),
+                    "title": str(item.get("title") or "Товар"),
+                    "subtitle": f"ID {item.get('id') or '—'} · остаток {as_int(item.get('quantity'))}",
+                    "status": item.get("status"),
+                    "favorite": bool(item.get("favorite")),
+                })
+            if len(offers) >= 10:
+                break
+    except Exception as exc:
+        logger.warning("Global offer search failed: %s", exc)
+
+    like = f"%{clean}%"
+    with db_connect() as conn:
+        order_rows = conn.execute(
+            """
+            SELECT invoice_id, item_id, product_name, buyer_email, amount, currency, purchase_date
+            FROM orders
+            WHERE invoice_id LIKE ? OR item_id LIKE ? OR product_name LIKE ? OR buyer_email LIKE ?
+            ORDER BY updated_at DESC LIMIT 10
+            """,
+            (like, like, like, like),
+        ).fetchall()
+    orders = [
+        {
+            "type": "order",
+            "id": str(row["invoice_id"]),
+            "title": str(row["product_name"] or f"Заказ #{row['invoice_id']}"),
+            "subtitle": f"#{row['invoice_id']} · {row['buyer_email'] or 'без email'}",
+            "amount": as_float(row["amount"]),
+            "currency": str(row["currency"] or "RUB"),
+            "date": row["purchase_date"],
+        }
+        for row in order_rows
+    ]
+
+    chats: list[dict[str, Any]] = []
+    try:
+        for item in _chat_payload({}):
+            haystack = " ".join(str(item.get(key) or "") for key in ("id_i", "invoice_id", "email", "product_name", "preview")).casefold()
+            if folded in haystack:
+                chats.append({
+                    "type": "chat",
+                    "id": str(item.get("id_i") or ""),
+                    "title": str(item.get("email") or item.get("product_name") or "Диалог"),
+                    "subtitle": str(item.get("preview") or item.get("product_name") or "Открыть переписку"),
+                    "invoice_id": str(item.get("invoice_id") or ""),
+                    "label": str(item.get("label") or "new"),
+                    "date": item.get("last_message"),
+                })
+            if len(chats) >= 10:
+                break
+    except Exception as exc:
+        logger.warning("Global chat search failed: %s", exc)
+
+    return {"offers": offers, "orders": orders, "chats": chats}
+
+
+def attention_center_payload() -> dict[str, Any]:
+    offers: list[dict[str, Any]] = []
+    try:
+        offers = enrich_offer_settings(collect_all_offers())
+    except Exception as exc:
+        logger.warning("Attention center offers failed: %s", exc)
+    low_stock = sorted(
+        [item for item in offers if item.get("low_stock")],
+        key=lambda item: (as_int(item.get("quantity")), str(item.get("title") or "").casefold()),
+    )[:8]
+
+    with db_connect() as conn:
+        chat_rows = conn.execute(
+            "SELECT label, COUNT(*) AS total FROM chat_labels WHERE label IN ('new','waiting','replacement') GROUP BY label"
+        ).fetchall()
+        unlabeled_new = conn.execute(
+            """
+            SELECT COUNT(DISTINCT m.debate_id) AS total
+            FROM messages AS m
+            LEFT JOIN chat_labels AS c ON c.debate_id = m.debate_id
+            WHERE m.debate_id != '' AND c.debate_id IS NULL
+            """
+        ).fetchone()
+        operation_rows = conn.execute(
+            """
+            SELECT operation, target, status, updated_at, result_json
+            FROM async_operations WHERE status IN ('failed','queued','running')
+            ORDER BY updated_at DESC LIMIT 8
+            """
+        ).fetchall()
+    chat_counts = {str(row["label"]): as_int(row["total"]) for row in chat_rows}
+    chat_counts["new"] = chat_counts.get("new", 0) + as_int(unlabeled_new["total"] if unlabeled_new else 0)
+    operations = [dict(row) for row in operation_rows]
+
+    items: list[dict[str, Any]] = []
+    for item in low_stock:
+        items.append({
+            "kind": "low_stock",
+            "severity": "danger" if as_int(item.get("quantity")) <= 0 else "warning",
+            "title": str(item.get("title") or "Товар"),
+            "subtitle": f"Остаток {as_int(item.get('quantity'))}, минимум {as_int(item.get('min_stock'), LOW_STOCK_DEFAULT)}",
+            "entity_id": str(item.get("id") or ""),
+            "action": "offer",
+        })
+    for label, title in (("replacement", "Нужна замена"), ("new", "Новые обращения"), ("waiting", "Ждём клиента")):
+        count = chat_counts.get(label, 0)
+        if count:
+            items.append({
+                "kind": "chat", "severity": "warning", "title": title,
+                "subtitle": f"{count} диалогов", "entity_id": label, "action": "chats",
+            })
+    for operation in operations:
+        status = str(operation.get("status") or "queued")
+        items.append({
+            "kind": "operation",
+            "severity": "danger" if status == "failed" else "info",
+            "title": str(operation.get("operation") or "Операция GGSEL"),
+            "subtitle": f"{operation.get('target') or '—'} · {status}",
+            "entity_id": str(operation.get("target") or ""),
+            "action": "operations",
+        })
+    return {
+        "count": len(items),
+        "items": items[:20],
+        "summary": {
+            "low_stock": len(low_stock),
+            "new_chats": chat_counts.get("new", 0),
+            "replacement": chat_counts.get("replacement", 0),
+            "operations": len(operations),
+        },
+    }
+
+
 @app.get("/app")
 def miniapp_page():
     return render_template("miniapp.html", app_url=APP_URL)
@@ -2962,6 +3222,25 @@ def miniapp_me(user: dict[str, Any]):
             "seller_id": GGSEL_SELLER_ID,
         }
     )
+
+
+@app.get("/app/api/search")
+@miniapp_api
+def miniapp_global_search(user: dict[str, Any]):
+    query = str(request.args.get("q") or "").strip()
+    return miniapp_success(global_search_payload(query))
+
+
+@app.get("/app/api/attention")
+@miniapp_api
+def miniapp_attention(user: dict[str, Any]):
+    return miniapp_success(attention_center_payload())
+
+
+@app.get("/app/api/recent")
+@miniapp_api
+def miniapp_recent(user: dict[str, Any]):
+    return miniapp_success(get_recent_views(as_int(request.args.get("limit"), 8)))
 
 
 @app.get("/app/api/dashboard")
@@ -3105,6 +3384,8 @@ def miniapp_offers(user: dict[str, Any]):
         offers = [item for item in offers if as_int(item.get("quantity")) <= 0]
     elif status == "low_stock":
         offers = [item for item in offers if item.get("low_stock")]
+    elif status == "favorite":
+        offers = [item for item in offers if item.get("favorite")]
     elif status != "all":
         offers = [item for item in offers if str(item.get("status")) == status]
 
@@ -3120,6 +3401,15 @@ def miniapp_offers(user: dict[str, Any]):
             "pages": max(1, (total + per_page - 1) // per_page),
         },
     )
+
+
+@app.put("/app/api/offers/<int:offer_id_value>/favorite")
+@miniapp_api
+def miniapp_offer_favorite(user: dict[str, Any], offer_id_value: int):
+    body = request.get_json(silent=True) or {}
+    favorite = set_offer_favorite(offer_id_value, bool(body.get("favorite", True)))
+    audit_miniapp(user.get("id"), "offer_favorite", offer_id_value, {"favorite": favorite})
+    return miniapp_success({"offer_id": offer_id_value, "favorite": favorite})
 
 
 def _extract_offer_detail(data: Any, offer_id_value: int) -> dict[str, Any]:
@@ -3283,7 +3573,12 @@ def miniapp_offer(user: dict[str, Any], offer_id_value: int):
 
     settings = get_offer_settings(offer_id_value)
     normalized["settings"] = settings
-    normalized["low_stock"] = as_int(normalized.get("quantity")) <= as_int(settings.get("min_stock"), LOW_STOCK_DEFAULT)
+    normalized["favorite"] = str(offer_id_value) in get_favorite_offer_ids()
+    normalized["low_stock"] = str(normalized.get("status") or "") != "archived" and as_int(normalized.get("quantity")) <= as_int(settings.get("min_stock"), LOW_STOCK_DEFAULT)
+    remember_recent_view(
+        "offer", offer_id_value, str(normalized.get("title") or f"Товар {offer_id_value}"),
+        {"quantity": as_int(normalized.get("quantity")), "status": normalized.get("status"), "price": normalized.get("price")},
+    )
     return miniapp_success(
         {"normalized": normalized, "raw": raw, "settings": settings},
         source_errors=source_errors,
@@ -3536,7 +3831,19 @@ def miniapp_order(user: dict[str, Any], invoice_id: str):
     raw = ggsel.order_info(invoice_id)
     if isinstance(raw, dict):
         upsert_order(invoice_id, raw)
-    return miniapp_success(_order_payload(invoice_id, raw))
+    payload = _order_payload(invoice_id, raw)
+    payload["note"] = get_order_note(invoice_id)
+    remember_recent_view("order", invoice_id, str(payload.get("name") or f"Заказ #{invoice_id}"), {"amount": payload.get("amount"), "currency": payload.get("currency")})
+    return miniapp_success(payload)
+
+
+@app.put("/app/api/orders/<invoice_id>/note")
+@miniapp_api
+def miniapp_order_note(user: dict[str, Any], invoice_id: str):
+    body = request.get_json(silent=True) or {}
+    saved = save_order_note(invoice_id, str(body.get("tag") or ""), str(body.get("note") or ""))
+    audit_miniapp(user.get("id"), "order_note", invoice_id, saved)
+    return miniapp_success(saved)
 
 
 @app.get("/app/api/reviews")
@@ -3606,6 +3913,11 @@ def miniapp_chat_messages(user: dict[str, Any], debate_id: str):
     except Exception as exc:
         logger.warning("Unable to load GGSEL chat %s; using local history: %s", debate_id, exc)
         api_data = {}
+    chat = next((item for item in _chat_payload({}) if str(item.get("id_i") or "") == str(debate_id)), {})
+    remember_recent_view(
+        "chat", debate_id, str(chat.get("email") or chat.get("product_name") or f"Диалог {debate_id}"),
+        {"invoice_id": chat.get("invoice_id"), "product_name": chat.get("product_name")},
+    )
     return miniapp_success(_message_payload(api_data, debate_id))
 
 
@@ -3674,7 +3986,7 @@ def miniapp_audit_log(user: dict[str, Any]):
 
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "ggsel-telegram-bot-miniapp-v4"})
+    return jsonify({"ok": True, "service": "ggsel-telegram-bot-miniapp-v4.8"})
 
 
 @app.get("/setup-telegram-webhook")
