@@ -10,7 +10,9 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import sqlite3
+import zipfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -21,7 +23,7 @@ from typing import Any, Iterable, Optional
 from urllib.parse import parse_qsl
 
 import requests
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 
 
 # ============================================================
@@ -54,6 +56,11 @@ GGSEL_WEBHOOK_SECRET = os.environ.get("GGSEL_WEBHOOK_SECRET", "").strip()
 GGSEL_WEBHOOK_COMPAT_MODE = os.environ.get("GGSEL_WEBHOOK_COMPAT_MODE", "true").strip().lower() in {"1", "true", "yes", "on"}
 LOW_STOCK_DEFAULT = max(0, int(os.environ.get("LOW_STOCK_DEFAULT", "3")))
 SETUP_SECRET = os.environ.get("SETUP_SECRET", "").strip()
+CRON_SECRET = os.environ.get("CRON_SECRET", SETUP_SECRET).strip()
+CONTENT_SEARCH_SECRET = os.environ.get("CONTENT_SEARCH_SECRET", BOT_TOKEN).strip()
+BACKUP_DIR = os.environ.get("BACKUP_DIR", "/data/backups").strip()
+SLA_WARNING_MINUTES = max(1, int(os.environ.get("SLA_WARNING_MINUTES", "30")))
+SLA_CRITICAL_MINUTES = max(SLA_WARNING_MINUTES, int(os.environ.get("SLA_CRITICAL_MINUTES", "60")))
 
 if not BOT_TOKEN or not OWNER_ID:
     raise RuntimeError("BOT_TOKEN and OWNER_ID (or CHAT_ID) must be set")
@@ -357,6 +364,74 @@ def init_db() -> None:
                 note TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS inventory_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                offer_id TEXT,
+                product_name TEXT,
+                content_hash TEXT NOT NULL,
+                content_masked TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'in_stock',
+                invoice_id TEXT,
+                source TEXT NOT NULL DEFAULT 'upload',
+                added_at TEXT NOT NULL,
+                sold_at TEXT,
+                replaced_at TEXT,
+                metadata_json TEXT,
+                UNIQUE(content_hash, offer_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS automation_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                trigger_type TEXT NOT NULL,
+                condition_json TEXT NOT NULL DEFAULT '{}',
+                action_json TEXT NOT NULL DEFAULT '{}',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS reply_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL DEFAULT 'Общие',
+                name TEXT NOT NULL,
+                body TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS api_errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service TEXT NOT NULL,
+                endpoint TEXT,
+                status INTEGER,
+                message TEXT NOT NULL,
+                context_json TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS report_settings (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                morning_enabled INTEGER NOT NULL DEFAULT 0,
+                evening_enabled INTEGER NOT NULL DEFAULT 0,
+                include_finance INTEGER NOT NULL DEFAULT 1,
+                include_stock INTEGER NOT NULL DEFAULT 1,
+                include_chats INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_inventory_hash ON inventory_ledger(content_hash);
+            CREATE INDEX IF NOT EXISTS idx_inventory_invoice ON inventory_ledger(invoice_id);
+            CREATE INDEX IF NOT EXISTS idx_inventory_offer ON inventory_ledger(offer_id, status);
+            CREATE INDEX IF NOT EXISTS idx_api_errors_created ON api_errors(created_at);
 
             CREATE INDEX IF NOT EXISTS idx_messages_debate ON messages(debate_id, id);
             CREATE INDEX IF NOT EXISTS idx_messages_invoice ON messages(invoice_id, id);
@@ -954,12 +1029,15 @@ def miniapp_api(func):
             user = validate_telegram_init_data(init_data)
             return func(user, *args, **kwargs)
         except APIError as exc:
+            record_api_error(exc.service, request.path, exc.status, str(exc))
             return jsonify({"ok": False, "error": str(exc), "service": exc.service}), exc.status
         except (ValueError, RuntimeError, requests.RequestException) as exc:
             logger.warning("Mini App request failed: %s", exc)
+            record_api_error("Mini App", request.path, 400, str(exc))
             return jsonify({"ok": False, "error": str(exc)}), 400
         except Exception as exc:
             logger.exception("Unexpected Mini App error")
+            record_api_error("Mini App", request.path, 500, str(exc))
             return jsonify({"ok": False, "error": str(exc)}), 500
 
     return wrapped
@@ -3612,6 +3690,7 @@ def miniapp_add_products(user: dict[str, Any], offer_id_value: int):
     results: list[Any] = []
     for index in range(0, len(values), 100):
         results.append(ggsel.add_products_v2(offer_id_value, values[index : index + 100]))
+    record_inventory_upload(offer_id_value, values)
     operation = record_operation("stock_add", offer_id_value, {"batches": results, "count": len(values)}, "completed")
     settings = get_offer_settings(offer_id_value)
     activation_result: Any = None
@@ -3831,6 +3910,7 @@ def miniapp_order(user: dict[str, Any], invoice_id: str):
     raw = ggsel.order_info(invoice_id)
     if isinstance(raw, dict):
         upsert_order(invoice_id, raw)
+        index_sold_content_from_order(invoice_id, raw)
     payload = _order_payload(invoice_id, raw)
     payload["note"] = get_order_note(invoice_id)
     remember_recent_view("order", invoice_id, str(payload.get("name") or f"Заказ #{invoice_id}"), {"amount": payload.get("amount"), "currency": payload.get("currency")})
@@ -4113,6 +4193,431 @@ def ggsel_webhook():
     if remember_event(event_key):
         run_background(process_ggsel_event, data)
     return jsonify({"ok": True})
+
+
+# ============================================================
+# Seller workspace v5.0: inventory search, automation and ops
+# ============================================================
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def record_api_error(service: str, endpoint: str, status: int, message: str, context: Any = None) -> None:
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT INTO api_errors(service, endpoint, status, message, context_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (str(service), str(endpoint), int(status or 0), str(message)[:2000], json.dumps(context, ensure_ascii=False, default=str) if context is not None else None, _utc_now()),
+            )
+    except Exception:
+        logger.exception("Unable to store API error")
+
+
+def normalize_secret_content(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip()).upper()
+
+
+def content_fingerprint(value: Any) -> str:
+    normalized = normalize_secret_content(value)
+    return hmac.new(CONTENT_SEARCH_SECRET.encode("utf-8"), normalized.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def mask_secret_content(value: Any) -> str:
+    text = str(value or "").strip()
+    if len(text) <= 8:
+        return text[:2] + "…" + text[-2:] if len(text) > 4 else "••••"
+    return text[:5] + "…" + text[-5:]
+
+
+def record_inventory_upload(offer_id: Any, values: Iterable[str], product_name: str = "") -> int:
+    now = _utc_now()
+    inserted = 0
+    with db_connect() as conn:
+        for value in values:
+            normalized = normalize_secret_content(value)
+            if not normalized:
+                continue
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO inventory_ledger
+                (offer_id, product_name, content_hash, content_masked, status, source, added_at, metadata_json)
+                VALUES (?, ?, ?, ?, 'in_stock', 'upload', ?, ?)""",
+                (str(offer_id or ""), product_name, content_fingerprint(normalized), mask_secret_content(value), now, json.dumps({"length": len(normalized)}, ensure_ascii=False)),
+            )
+            inserted += max(0, cur.rowcount)
+    return inserted
+
+
+def _extract_delivered_values(obj: Any, parent_key: str = "") -> list[str]:
+    found: list[str] = []
+    exact_keys = {"content", "delivered_content", "delivered", "code", "key", "serial", "unique_code", "product_value", "value"}
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            key_l = str(key).lower()
+            if key_l in exact_keys or any(token in key_l for token in ("delivered_content", "product_content", "license_key")):
+                if isinstance(value, str) and 4 <= len(value.strip()) <= 10000:
+                    found.extend(line.strip() for line in value.splitlines() if line.strip())
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, str) and item.strip(): found.append(item.strip())
+                        elif isinstance(item, dict): found.extend(_extract_delivered_values(item, key_l))
+            elif isinstance(value, (dict, list)):
+                found.extend(_extract_delivered_values(value, key_l))
+    elif isinstance(obj, list):
+        for item in obj:
+            found.extend(_extract_delivered_values(item, parent_key))
+    return list(dict.fromkeys(found))
+
+
+def index_sold_content_from_order(invoice_id: str, raw: dict[str, Any]) -> int:
+    values = _extract_delivered_values(raw)
+    if not values:
+        return 0
+    item_id = str(get_any(raw, ("item_id", "product_id", "id_goods"), ""))
+    product_name = str(get_any(raw, ("product_name", "name", "title"), ""))
+    sold_at = str(get_any(raw, ("date_pay", "purchase_date", "date"), _utc_now()))
+    count = 0
+    with db_connect() as conn:
+        for value in values:
+            fp = content_fingerprint(value)
+            row = conn.execute("SELECT id FROM inventory_ledger WHERE content_hash=? ORDER BY id DESC LIMIT 1", (fp,)).fetchone()
+            if row:
+                conn.execute("UPDATE inventory_ledger SET status='sold', invoice_id=?, sold_at=?, product_name=COALESCE(NULLIF(product_name,''), ?) WHERE id=?", (invoice_id, sold_at, product_name, row["id"]))
+            else:
+                conn.execute("""INSERT INTO inventory_ledger(offer_id, product_name, content_hash, content_masked, status, invoice_id, source, added_at, sold_at, metadata_json)
+                VALUES (?, ?, ?, ?, 'sold', ?, 'order_api', ?, ?, ?)""", (item_id, product_name, fp, mask_secret_content(value), invoice_id, sold_at, sold_at, json.dumps({"indexed_from_order": True}, ensure_ascii=False)))
+            count += 1
+    return count
+
+
+def inventory_search(value: str) -> list[dict[str, Any]]:
+    normalized = normalize_secret_content(value)
+    if len(normalized) < 4:
+        raise ValueError("Введите не менее 4 символов содержимого")
+    fp = content_fingerprint(normalized)
+    with db_connect() as conn:
+        rows = conn.execute("SELECT * FROM inventory_ledger WHERE content_hash=? ORDER BY id DESC", (fp,)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def inventory_history(limit: int = 100, offer_id: str = "", status: str = "") -> list[dict[str, Any]]:
+    clauses, params = [], []
+    if offer_id:
+        clauses.append("offer_id=?"); params.append(offer_id)
+    if status:
+        clauses.append("status=?"); params.append(status)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    with db_connect() as conn:
+        rows = conn.execute(f"SELECT * FROM inventory_ledger{where} ORDER BY id DESC LIMIT ?", (*params, max(1,min(limit,500)))).fetchall()
+    return [dict(row) for row in rows]
+
+
+def validate_import_values(values: list[str], offer_id: str = "") -> dict[str, Any]:
+    cleaned = [str(v).strip() for v in values if str(v).strip()]
+    unique = list(dict.fromkeys(cleaned))
+    duplicates = len(cleaned) - len(unique)
+    malformed = []
+    known = []
+    valid = []
+    with db_connect() as conn:
+        for value in unique:
+            normalized = normalize_secret_content(value)
+            if len(normalized) < 5 or len(normalized) > 5000:
+                malformed.append(mask_secret_content(value)); continue
+            row = conn.execute("SELECT status, invoice_id, offer_id FROM inventory_ledger WHERE content_hash=? ORDER BY id DESC LIMIT 1", (content_fingerprint(value),)).fetchone()
+            if row:
+                known.append({"value": mask_secret_content(value), "status": row["status"], "invoice_id": row["invoice_id"], "offer_id": row["offer_id"]})
+            else:
+                valid.append(value)
+    return {"total": len(cleaned), "unique": len(unique), "duplicates": duplicates, "malformed": malformed, "known": known, "valid": valid, "valid_count": len(valid)}
+
+
+def list_templates() -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        rows = conn.execute("SELECT * FROM reply_templates ORDER BY category, name").fetchall()
+    return [dict(row) for row in rows]
+
+
+def render_template_text(body: str, context: dict[str, Any]) -> str:
+    allowed = {k: str(v or "") for k,v in context.items()}
+    return re.sub(r"\{([a-zA-Z0-9_]+)\}", lambda m: allowed.get(m.group(1), m.group(0)), body)
+
+
+def sla_payload() -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    with db_connect() as conn:
+        rows = conn.execute("""SELECT debate_id, MAX(CASE WHEN sender='buyer' THEN message_date END) buyer_at,
+            MAX(CASE WHEN sender='seller' THEN message_date END) seller_at,
+            MAX(invoice_id) invoice_id, MAX(message_text) last_text
+            FROM messages WHERE debate_id!='' GROUP BY debate_id ORDER BY MAX(id) DESC LIMIT 300""").fetchall()
+    items=[]; waiting=[]
+    for row in rows:
+        b=parse_datetime_any(row["buyer_at"]); s=parse_datetime_any(row["seller_at"])
+        unanswered = bool(b and (not s or b>s))
+        minutes = max(0, int((now-b).total_seconds()/60)) if unanswered and b else 0
+        severity = "critical" if minutes>=SLA_CRITICAL_MINUTES else "warning" if minutes>=SLA_WARNING_MINUTES else "ok"
+        item={"debate_id":row["debate_id"],"invoice_id":row["invoice_id"],"minutes":minutes,"unanswered":unanswered,"severity":severity,"last_text":row["last_text"]}
+        items.append(item)
+        if unanswered: waiting.append(item)
+    return {"unanswered":len(waiting),"warning":sum(x["severity"]=="warning" for x in waiting),"critical":sum(x["severity"]=="critical" for x in waiting),"items":waiting[:100]}
+
+
+def product_analytics_payload(days: int = 30) -> list[dict[str, Any]]:
+    cutoff=(datetime.now(timezone.utc)-timedelta(days=max(1,days))).isoformat()
+    with db_connect() as conn:
+        rows=conn.execute("""SELECT COALESCE(NULLIF(product_id,''),'unknown') product_id, COALESCE(NULLIF(product_name,''),'Без названия') product_name,
+            COUNT(*) sales_count, SUM(COALESCE(price_rub,0)) revenue_rub, SUM(COALESCE(price_usd,0)) revenue_usd,
+            MIN(sale_date) first_sale, MAX(sale_date) last_sale
+            FROM sales WHERE COALESCE(sale_date,updated_at)>=? GROUP BY product_id,product_name ORDER BY sales_count DESC LIMIT 100""",(cutoff,)).fetchall()
+    result=[]
+    for r in rows:
+        d=dict(r); d["daily_rate"]=round((d["sales_count"] or 0)/max(1,days),2); result.append(d)
+    return result
+
+
+def recommendations_payload() -> list[dict[str, Any]]:
+    offers=get_all_offers_cached(); analytics={str(x["product_id"]):x for x in product_analytics_payload(30)}
+    recs=[]
+    for offer in offers:
+        oid=str(offer.get("id") or offer.get("offer_id") or "")
+        stock=as_int(offer.get("stock") or offer.get("count") or offer.get("quantity"),0)
+        settings=get_offer_settings(oid); rate=float(analytics.get(oid,{}).get("daily_rate") or 0)
+        days_left=(stock/rate) if rate>0 else None
+        if stock<=as_int(settings.get("min_stock"),LOW_STOCK_DEFAULT): recs.append({"type":"stock","severity":"critical" if stock==0 else "warning","offer_id":oid,"title":offer.get("title") or offer.get("name"),"text":f"Остаток {stock}; порог {settings.get('min_stock')}"})
+        if days_left is not None and days_left<3: recs.append({"type":"forecast","severity":"warning","offer_id":oid,"title":offer.get("title") or offer.get("name"),"text":f"Запаса примерно на {days_left:.1f} дня"})
+        if rate==0 and str(offer.get("status"))=="active": recs.append({"type":"no_sales","severity":"info","offer_id":oid,"title":offer.get("title") or offer.get("name"),"text":"Нет продаж за 30 дней — проверьте цену и карточку"})
+    sla=sla_payload()
+    if sla["critical"]: recs.insert(0,{"type":"sla","severity":"critical","title":"Поддержка","text":f"{sla['critical']} диалогов без ответа более {SLA_CRITICAL_MINUTES} мин"})
+    return recs[:100]
+
+
+def create_database_backup() -> dict[str, Any]:
+    os.makedirs(BACKUP_DIR,exist_ok=True)
+    stamp=datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    target=os.path.join(BACKUP_DIR,f"ggsel_bot_{stamp}.sqlite3")
+    with sqlite3.connect(DB_PATH) as src, sqlite3.connect(target) as dst:
+        src.backup(dst)
+    return {"name":os.path.basename(target),"path":target,"size":os.path.getsize(target),"created_at":_utc_now()}
+
+
+def list_backups() -> list[dict[str,Any]]:
+    os.makedirs(BACKUP_DIR,exist_ok=True)
+    out=[]
+    for name in sorted(os.listdir(BACKUP_DIR),reverse=True):
+        path=os.path.join(BACKUP_DIR,name)
+        if os.path.isfile(path) and name.endswith('.sqlite3'):
+            out.append({"name":name,"size":os.path.getsize(path),"created_at":datetime.fromtimestamp(os.path.getmtime(path),timezone.utc).isoformat()})
+    return out[:50]
+
+
+def daily_report_payload() -> dict[str,Any]:
+    today=date.today(); analytics=calculate_receipts_analytics(today,today)
+    sla=sla_payload(); recs=recommendations_payload()
+    return {"date":today.isoformat(),"analytics":analytics,"sla":sla,"recommendations":recs[:10],"generated_at":_utc_now()}
+
+
+def send_daily_report() -> dict[str,Any]:
+    data=daily_report_payload(); a=data.get("analytics") or {}
+    text=(f"📊 <b>Отчёт за {safe(data['date'])}</b>\n\n"
+          f"Продаж: <b>{as_int(a.get('orders') or a.get('count'))}</b>\n"
+          f"Сумма: <b>{safe(a.get('sales_total') or a.get('total') or 0)}</b>\n"
+          f"Без ответа: <b>{data['sla']['unanswered']}</b>\n"
+          f"Критичных: <b>{data['sla']['critical']}</b>\n"
+          f"Рекомендаций: <b>{len(data['recommendations'])}</b>")
+    send_text(text); return data
+
+
+def run_automation_event(trigger_type: str, context: dict[str,Any]) -> list[dict[str,Any]]:
+    with db_connect() as conn:
+        rows=conn.execute("SELECT * FROM automation_rules WHERE enabled=1 AND trigger_type=? ORDER BY id",(trigger_type,)).fetchall()
+    executed=[]
+    for row in rows:
+        try:
+            cond=json.loads(row["condition_json"] or '{}'); action=json.loads(row["action_json"] or '{}')
+            needle=str(cond.get("contains") or '').lower()
+            if needle and needle not in str(context.get("text") or '').lower(): continue
+            if cond.get("max_stock") is not None and as_int(context.get("stock"),999999)>as_int(cond.get("max_stock")): continue
+            kind=action.get("type")
+            if kind=='notify': send_text(str(action.get("text") or row["name"]))
+            elif kind=='label_chat' and context.get('debate_id'): save_chat_label(str(context['debate_id']),str(action.get('label') or 'new'),str(action.get('note') or ''))
+            executed.append({"id":row["id"],"name":row["name"],"action":kind})
+        except Exception as exc:
+            record_api_error('Automation',trigger_type,500,str(exc),dict(row))
+    return executed
+
+
+@app.get('/app/api/inventory/search')
+@miniapp_api
+def miniapp_inventory_search(user: dict[str,Any]):
+    query=str(request.args.get('q') or '')
+    return miniapp_success(inventory_search(query))
+
+
+@app.get('/app/api/inventory/history')
+@miniapp_api
+def miniapp_inventory_history(user: dict[str,Any]):
+    return miniapp_success(inventory_history(as_int(request.args.get('limit'),100),str(request.args.get('offer_id') or ''),str(request.args.get('status') or '')))
+
+
+@app.post('/app/api/inventory/validate')
+@miniapp_api
+def miniapp_inventory_validate(user: dict[str,Any]):
+    body=request.get_json(silent=True) or {}; values=body.get('values') if isinstance(body.get('values'),list) else []
+    return miniapp_success(validate_import_values(values,str(body.get('offer_id') or '')))
+
+
+@app.post('/app/api/inventory/reindex')
+@miniapp_api
+def miniapp_inventory_reindex(user: dict[str,Any]):
+    body=request.get_json(silent=True) or {}; require_confirmation(body)
+    invoices=body.get('invoice_ids') if isinstance(body.get('invoice_ids'),list) else []
+    if not invoices:
+        raw=ggsel.last_sales(); invoices=[str(get_any(x,('invoice_id','invoice','id'),'')) for x in extract_list(raw,('items','sales','content')) if isinstance(x,dict)][:max(1,min(as_int(body.get('limit'),20),50))]
+    indexed=0; errors=[]
+    for invoice in invoices:
+        if not invoice: continue
+        try:
+            raw=ggsel.order_info(invoice)
+            if isinstance(raw,dict): indexed+=index_sold_content_from_order(invoice,raw)
+        except Exception as exc: errors.append({'invoice_id':invoice,'error':str(exc)})
+    audit_miniapp(user.get('id'),'inventory_reindex',','.join(invoices),{'indexed':indexed,'errors':errors})
+    return miniapp_success({'indexed':indexed,'orders':len(invoices),'errors':errors})
+
+
+@app.get('/app/api/templates')
+@miniapp_api
+def miniapp_templates(user: dict[str,Any]): return miniapp_success(list_templates())
+
+
+@app.post('/app/api/templates')
+@miniapp_api
+def miniapp_template_create(user: dict[str,Any]):
+    b=request.get_json(silent=True) or {}; now=_utc_now()
+    with db_connect() as conn:
+        cur=conn.execute("INSERT INTO reply_templates(category,name,body,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?)",(str(b.get('category') or 'Общие'),str(b.get('name') or 'Шаблон'),str(b.get('body') or ''),1,now,now))
+    return miniapp_success({'id':cur.lastrowid})
+
+
+@app.delete('/app/api/templates/<int:template_id>')
+@miniapp_api
+def miniapp_template_delete(user: dict[str,Any],template_id:int):
+    with db_connect() as conn: conn.execute('DELETE FROM reply_templates WHERE id=?',(template_id,))
+    return miniapp_success({'deleted':template_id})
+
+
+@app.get('/app/api/automations')
+@miniapp_api
+def miniapp_automations(user:dict[str,Any]):
+    with db_connect() as conn: rows=conn.execute('SELECT * FROM automation_rules ORDER BY id DESC').fetchall()
+    return miniapp_success([dict(r) for r in rows])
+
+
+@app.post('/app/api/automations')
+@miniapp_api
+def miniapp_automation_create(user:dict[str,Any]):
+    b=request.get_json(silent=True) or {}; now=_utc_now()
+    with db_connect() as conn:
+        cur=conn.execute("INSERT INTO automation_rules(name,trigger_type,condition_json,action_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(str(b.get('name') or 'Правило'),str(b.get('trigger_type') or 'message'),json.dumps(b.get('condition') or {},ensure_ascii=False),json.dumps(b.get('action') or {},ensure_ascii=False),1,now,now))
+    return miniapp_success({'id':cur.lastrowid})
+
+
+@app.patch('/app/api/automations/<int:rule_id>')
+@miniapp_api
+def miniapp_automation_patch(user:dict[str,Any],rule_id:int):
+    b=request.get_json(silent=True) or {}
+    with db_connect() as conn: conn.execute('UPDATE automation_rules SET enabled=?, updated_at=? WHERE id=?',(1 if b.get('enabled') else 0,_utc_now(),rule_id))
+    return miniapp_success({'id':rule_id,'enabled':bool(b.get('enabled'))})
+
+
+@app.delete('/app/api/automations/<int:rule_id>')
+@miniapp_api
+def miniapp_automation_delete(user:dict[str,Any],rule_id:int):
+    with db_connect() as conn: conn.execute('DELETE FROM automation_rules WHERE id=?',(rule_id,))
+    return miniapp_success({'deleted':rule_id})
+
+
+@app.get('/app/api/sla')
+@miniapp_api
+def miniapp_sla(user:dict[str,Any]): return miniapp_success(sla_payload())
+
+
+@app.get('/app/api/product-analytics')
+@miniapp_api
+def miniapp_product_analytics(user:dict[str,Any]): return miniapp_success(product_analytics_payload(as_int(request.args.get('days'),30)))
+
+
+@app.get('/app/api/recommendations')
+@miniapp_api
+def miniapp_recommendations(user:dict[str,Any]): return miniapp_success(recommendations_payload())
+
+
+@app.get('/app/api/errors')
+@miniapp_api
+def miniapp_errors(user:dict[str,Any]):
+    with db_connect() as conn: rows=conn.execute('SELECT * FROM api_errors ORDER BY id DESC LIMIT 200').fetchall()
+    return miniapp_success([dict(r) for r in rows])
+
+
+@app.post('/app/api/backups')
+@miniapp_api
+def miniapp_backup_create(user:dict[str,Any]): return miniapp_success(create_database_backup())
+
+
+@app.get('/app/api/backups')
+@miniapp_api
+def miniapp_backups(user:dict[str,Any]): return miniapp_success(list_backups())
+
+
+@app.get('/app/api/backups/<name>')
+def miniapp_backup_download(name:str):
+    authorization=request.headers.get('Authorization',''); init_data=authorization[4:] if authorization.startswith('tma ') else request.args.get('initData','')
+    validate_telegram_init_data(init_data)
+    safe_name=os.path.basename(name); path=os.path.join(BACKUP_DIR,safe_name)
+    if not os.path.isfile(path): return jsonify({'ok':False,'error':'Копия не найдена'}),404
+    return send_file(path,as_attachment=True,download_name=safe_name)
+
+
+@app.get('/app/api/today')
+@miniapp_api
+def miniapp_today(user:dict[str,Any]): return miniapp_success(daily_report_payload())
+
+
+@app.get('/app/api/report-settings')
+@miniapp_api
+def miniapp_report_settings_get(user:dict[str,Any]):
+    with db_connect() as conn: row=conn.execute('SELECT * FROM report_settings WHERE id=1').fetchone()
+    return miniapp_success(dict(row) if row else {'morning_enabled':0,'evening_enabled':0,'include_finance':1,'include_stock':1,'include_chats':1})
+
+
+@app.put('/app/api/report-settings')
+@miniapp_api
+def miniapp_report_settings_put(user:dict[str,Any]):
+    b=request.get_json(silent=True) or {}; now=_utc_now()
+    vals=(1,1 if b.get('morning_enabled') else 0,1 if b.get('evening_enabled') else 0,1 if b.get('include_finance',True) else 0,1 if b.get('include_stock',True) else 0,1 if b.get('include_chats',True) else 0,now)
+    with db_connect() as conn: conn.execute('INSERT OR REPLACE INTO report_settings(id,morning_enabled,evening_enabled,include_finance,include_stock,include_chats,updated_at) VALUES(?,?,?,?,?,?,?)',vals)
+    return miniapp_success({'saved':True})
+
+
+@app.post('/app/api/bulk-price')
+@miniapp_api
+def miniapp_bulk_price(user:dict[str,Any]):
+    b=request.get_json(silent=True) or {}; require_confirmation(b)
+    ids=[int(x) for x in b.get('offer_ids',[])]; mode=str(b.get('mode') or 'set'); value=float(b.get('value') or 0)
+    offers={int(x.get('id') or x.get('offer_id')):x for x in get_all_offers_cached() if x.get('id') or x.get('offer_id')}
+    results=[]
+    for oid in ids[:100]:
+        current=float(offers.get(oid,{}).get('price') or 0)
+        new=value if mode=='set' else current*(1+value/100) if mode=='percent' else current+value
+        new=max(0,round(new,2)); results.append({'offer_id':oid,'old':current,'new':new,'result':ggsel.patch_offer_v2(oid,{'price':new})})
+    invalidate_offer_cache(); audit_miniapp(user.get('id'),'bulk_price',','.join(map(str,ids)),{'mode':mode,'value':value})
+    return miniapp_success(results)
+
+
+@app.get('/cron/daily-report')
+def cron_daily_report():
+    provided=request.args.get('secret') or request.headers.get('X-Cron-Secret','')
+    if not CRON_SECRET or not secrets.compare_digest(str(provided),CRON_SECRET): return jsonify({'ok':False}),403
+    return jsonify({'ok':True,'data':send_daily_report()})
 
 
 init_db()

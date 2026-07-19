@@ -116,6 +116,9 @@
         if (name === 'categories') await loadCategories();
         if (name === 'audit') await loadAudit();
         if (name === 'operations') await loadOperations();
+        if (name === 'inventory') await loadInventoryTools();
+        if (name === 'workspace') await loadWorkspace();
+        if (name === 'health') await loadHealth();
         if (name === 'more') return;
       } catch (error) { toast(error.message, true); }
     }
@@ -820,7 +823,66 @@
     toast('Данные обновлены');
   }
 
+
+  async function loadInventoryTools() {
+    const {data} = await api('/app/api/inventory/history?limit=100');
+    $('#inventoryHistory').innerHTML = data.length ? data.map(x => `<div class="list-item"><div><strong>${esc(x.product_name || `Товар ${x.offer_id || '—'}`)}</strong><span class="muted">${esc(x.content_masked)} · ${esc(x.status)}${x.invoice_id ? ` · заказ #${esc(x.invoice_id)}` : ''}</span></div><span>${formatDate(x.sold_at || x.added_at)}</span></div>`).join('') : '<div class="empty">История пока пуста. Новые загрузки начнут индексироваться автоматически.</div>';
+  }
+
+  async function searchSoldContent() {
+    const q = $('#soldContentQuery').value.trim();
+    if (!q) return toast('Вставьте содержимое', true);
+    const {data} = await api(`/app/api/inventory/search?q=${encodeURIComponent(q)}`);
+    $('#soldContentResults').innerHTML = data.length ? data.map(x => `<button class="list-item plain-button" data-open-order="${esc(x.invoice_id || '')}"><div><strong>${esc(x.product_name || 'Товар')}</strong><span class="muted">${esc(x.content_masked)} · ${esc(x.status)} · заказ #${esc(x.invoice_id || '—')}</span></div><span class="support-arrow">→</span></button>`).join('') : '<div class="empty">Совпадений нет. Для старых продаж сначала выполните индексацию.</div>';
+  }
+
+  async function reindexSales() {
+    if (!(await confirmAction('Индексировать содержимое последних 20 заказов?'))) return;
+    const {data} = await api('/app/api/inventory/reindex',{method:'POST',body:JSON.stringify({confirmed:true,limit:20})});
+    toast(`Проиндексировано позиций: ${data.indexed}`); await loadInventoryTools();
+  }
+
+  async function validateStockInput() {
+    if (!state.currentOffer) return;
+    const values=$('#stockValues').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
+    if (!values.length) return;
+    try {
+      const {data}=await api('/app/api/inventory/validate',{method:'POST',body:JSON.stringify({offer_id:state.currentOffer.id,values})});
+      $('#stockWarnings').classList.remove('hidden');
+      $('#stockWarnings').innerHTML=`Готово: <b>${data.valid_count}</b> · дубли в файле: <b>${data.duplicates}</b> · уже известны: <b>${data.known.length}</b> · подозрительных: <b>${data.malformed.length}</b>`;
+    } catch(e) { console.warn(e); }
+  }
+
+  async function loadWorkspace() {
+    const [today,sla,recs,templates,rules,analytics]=await Promise.all([api('/app/api/today'),api('/app/api/sla'),api('/app/api/recommendations'),api('/app/api/templates'),api('/app/api/automations'),api('/app/api/product-analytics?days=30')]);
+    const a=today.data.analytics||{};
+    $('#todayWorkspace').innerHTML=[['Продаж сегодня',a.orders||a.count||0],['Без ответа',sla.data.unanswered],['Критичных',sla.data.critical],['Рекомендаций',recs.data.length]].map(([l,v])=>`<div class="metric-card"><span class="label">${l}</span><span class="value">${Number(v||0).toLocaleString('ru-RU')}</span></div>`).join('');
+    renderSla(sla.data); renderRecommendations(recs.data); renderTemplates(templates.data); renderRules(rules.data); renderProductAnalytics(analytics.data);
+  }
+  function renderSla(data){ $('#slaSummary').innerHTML=[['Без ответа',data.unanswered],['30+ минут',data.warning],['60+ минут',data.critical]].map(([l,v])=>`<div class="metric-card compact-card"><span class="label">${l}</span><span class="value">${v}</span></div>`).join(''); $('#slaList').innerHTML=data.items.length?data.items.slice(0,20).map(x=>`<button class="list-item plain-button severity-${x.severity}" data-open-chat="${esc(x.debate_id)}"><div><strong>Диалог #${esc(x.debate_id)}</strong><span class="muted">${x.minutes} мин без ответа · заказ #${esc(x.invoice_id||'—')}</span></div><span>→</span></button>`).join(''):'<div class="empty">Нет диалогов без ответа</div>'; }
+  function renderRecommendations(data){ $('#recommendationsList').innerHTML=data.length?data.map(x=>`<button class="list-item plain-button severity-${esc(x.severity)}" ${x.offer_id?`data-open-offer="${esc(x.offer_id)}"`:''}><div><strong>${esc(x.title||'Рекомендация')}</strong><span class="muted">${esc(x.text)}</span></div><span>→</span></button>`).join(''):'<div class="empty">Рекомендаций нет</div>'; }
+  function renderTemplates(data){ $('#templatesList').innerHTML=data.length?data.map(x=>`<div class="list-item"><div><strong>${esc(x.name)}</strong><span class="muted">${esc(x.category)} · ${esc(x.body).slice(0,100)}</span></div><button class="danger-link" data-delete-template="${x.id}">Удалить</button></div>`).join(''):'<div class="empty">Шаблонов пока нет</div>'; }
+  function renderRules(data){ $('#rulesList').innerHTML=data.length?data.map(x=>`<div class="list-item"><div><strong>${esc(x.name)}</strong><span class="muted">${esc(x.trigger_type)} · ${x.enabled?'включено':'выключено'}</span></div><div class="inline-actions"><button class="secondary-button small" data-toggle-rule="${x.id}" data-enabled="${x.enabled?0:1}">${x.enabled?'Выкл.':'Вкл.'}</button><button class="danger-link" data-delete-rule="${x.id}">Удалить</button></div></div>`).join(''):'<div class="empty">Правил пока нет</div>'; }
+  function renderProductAnalytics(data){ $('#productAnalyticsList').innerHTML=data.length?data.slice(0,30).map(x=>`<div class="list-item"><div><strong>${esc(x.product_name)}</strong><span class="muted">${x.sales_count} продаж · ${x.daily_rate}/день</span></div><span>${money(x.revenue_rub||x.revenue_usd,x.revenue_rub?'RUB':'USD')}</span></div>`).join(''):'<div class="empty">Нет данных</div>'; }
+
+  async function loadHealth(){ const [backups,errors,settings]=await Promise.all([api('/app/api/backups'),api('/app/api/errors'),api('/app/api/report-settings')]); renderBackups(backups.data); renderErrors(errors.data); $('#morningReportToggle').checked=!!settings.data.morning_enabled; $('#eveningReportToggle').checked=!!settings.data.evening_enabled; }
+  function renderBackups(data){ $('#backupsList').innerHTML=data.length?data.map(x=>`<div class="list-item"><div><strong>${esc(x.name)}</strong><span class="muted">${(x.size/1024/1024).toFixed(2)} МБ · ${formatDate(x.created_at)}</span></div></div>`).join(''):'<div class="empty">Копий пока нет</div>'; }
+  function renderErrors(data){ $('#errorsList').innerHTML=data.length?data.slice(0,50).map(x=>`<div class="list-item"><div><strong>${esc(x.service)} · HTTP ${esc(x.status)}</strong><span class="muted">${esc(x.endpoint)} · ${esc(x.message)}</span></div><span>${formatDate(x.created_at)}</span></div>`).join(''):'<div class="empty">Ошибок не зафиксировано</div>'; }
   function bindEvents() {
+    $('#soldContentSearchBtn')?.addEventListener('click', searchSoldContent);
+    $('#reindexSalesBtn')?.addEventListener('click', reindexSales);
+    $('#inventoryRefresh')?.addEventListener('click', loadInventoryTools);
+    $('#stockValues')?.addEventListener('input', (()=>{let t; return ()=>{clearTimeout(t); t=setTimeout(validateStockInput,400);};})());
+    $('#slaRefresh')?.addEventListener('click', async()=>renderSla((await api('/app/api/sla')).data));
+    $('#recommendationsRefresh')?.addEventListener('click', async()=>renderRecommendations((await api('/app/api/recommendations')).data));
+    $('#templateAddBtn')?.addEventListener('click', ()=>openDialog($('#templateDialog')));
+    $('#ruleAddBtn')?.addEventListener('click', ()=>openDialog($('#ruleDialog')));
+    $('#templateForm')?.addEventListener('submit', async e=>{e.preventDefault(); await api('/app/api/templates',{method:'POST',body:JSON.stringify({category:$('#templateCategory').value,name:$('#templateName').value,body:$('#templateBody').value})}); closeDialog($('#templateDialog')); renderTemplates((await api('/app/api/templates')).data); toast('Шаблон сохранён');});
+    $('#ruleForm')?.addEventListener('submit', async e=>{e.preventDefault(); const actionType=$('#ruleAction').value; const val=$('#ruleActionValue').value; await api('/app/api/automations',{method:'POST',body:JSON.stringify({name:$('#ruleName').value,trigger_type:$('#ruleTrigger').value,condition:{contains:$('#ruleContains').value},action:actionType==='notify'?{type:'notify',text:val}:{type:'label_chat',label:val}})}); closeDialog($('#ruleDialog')); renderRules((await api('/app/api/automations')).data); toast('Правило сохранено');});
+    $('#backupCreateBtn')?.addEventListener('click', async()=>{const {data}=await api('/app/api/backups',{method:'POST',body:'{}'}); toast(`Копия создана: ${data.name}`); renderBackups((await api('/app/api/backups')).data);});
+    $('#errorsRefresh')?.addEventListener('click', async()=>renderErrors((await api('/app/api/errors')).data));
+    $('#reportSettingsSave')?.addEventListener('click', async()=>{await api('/app/api/report-settings',{method:'PUT',body:JSON.stringify({morning_enabled:$('#morningReportToggle').checked,evening_enabled:$('#eveningReportToggle').checked})}); toast('Настройки отчёта сохранены');});
+
     $$('.tab').forEach(tab => tab.addEventListener('click', () => switchSection(tab.dataset.section)));
     $$('[data-goto]').forEach(button => button.addEventListener('click', () => switchSection(button.dataset.goto)));
     $('#globalRefresh').addEventListener('click', globalRefresh);
@@ -918,7 +980,16 @@
       tg.enableClosingConfirmation?.();
     }
     applyPreferences();
-    bindEvents();
+  
+  document.addEventListener('click', async e=>{
+    const order=e.target.closest('[data-open-order]'); if(order?.dataset.openOrder){ switchSection('orders'); setTimeout(()=>openOrder(order.dataset.openOrder),150); }
+    const chat=e.target.closest('[data-open-chat]'); if(chat?.dataset.openChat){ switchSection('chats'); setTimeout(()=>openChat(chat.dataset.openChat),150); }
+    const offer=e.target.closest('[data-open-offer]'); if(offer?.dataset.openOffer){ switchSection('offers'); setTimeout(()=>openOffer(offer.dataset.openOffer),150); }
+    const delTpl=e.target.closest('[data-delete-template]'); if(delTpl){ await api(`/app/api/templates/${delTpl.dataset.deleteTemplate}`,{method:'DELETE'}); renderTemplates((await api('/app/api/templates')).data); }
+    const delRule=e.target.closest('[data-delete-rule]'); if(delRule){ await api(`/app/api/automations/${delRule.dataset.deleteRule}`,{method:'DELETE'}); renderRules((await api('/app/api/automations')).data); }
+    const toggle=e.target.closest('[data-toggle-rule]'); if(toggle){ await api(`/app/api/automations/${toggle.dataset.toggleRule}`,{method:'PATCH',body:JSON.stringify({enabled:toggle.dataset.enabled==='1'})}); renderRules((await api('/app/api/automations')).data); }
+  });
+  bindEvents();
     if (!initData) {
       const notice = $('#authNotice'); notice.textContent = 'Откройте эту панель кнопкой «Управление» внутри Telegram-бота.'; notice.classList.remove('hidden');
       return;

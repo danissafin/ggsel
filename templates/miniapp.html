@@ -232,6 +232,9 @@
           <button class="more-card" data-goto="audit"><span>☰</span><b>История</b><small>Журнал действий</small></button>
           <button id="exportOffersBtn" class="more-card"><span>⇩</span><b>Экспорт</b><small>Товары в JSON</small></button>
           <button id="globalSearchMoreBtn" class="more-card"><span>⌕</span><b>Общий поиск</b><small>По всему кабинету</small></button>
+          <button class="more-card" data-goto="workspace"><span>⚙</span><b>Автоматизация</b><small>Правила, SLA и шаблоны</small></button>
+          <button class="more-card" data-goto="inventory"><span>⌁</span><b>История ключей</b><small>Поиск проданного содержимого</small></button>
+          <button class="more-card" data-goto="health"><span>✚</span><b>Система</b><small>Ошибки и резервные копии</small></button>
         </div>
         <div class="panel preferences-panel">
           <div class="panel-heading"><h3>Интерфейс</h3></div>
@@ -240,6 +243,30 @@
         </div>
       </section>
 
+
+      <section id="section-inventory" class="section">
+        <div class="section-heading"><div><span class="kicker">Склад</span><h2>Поиск содержимого</h2></div></div>
+        <div class="panel form-stack"><label>Ключ или выданная строка<input id="soldContentQuery" placeholder="Вставьте содержимое целиком"></label><div class="button-row"><button id="soldContentSearchBtn" class="primary-button">Найти продажу</button><button id="reindexSalesBtn" class="secondary-button">Индексировать последние заказы</button></div><p class="muted">Поиск выполняется по защищённому отпечатку. Сам ключ в базе хранится только в маскированном виде.</p></div>
+        <div id="soldContentResults" class="list"><div class="empty">Введите содержимое для поиска</div></div>
+        <div class="section-heading minor"><div><h3>История содержимого</h3></div><button id="inventoryRefresh" class="icon-button">↻</button></div><div id="inventoryHistory" class="list"></div>
+      </section>
+
+      <section id="section-workspace" class="section">
+        <div class="section-heading"><div><span class="kicker">Автопилот</span><h2>Автоматизация</h2></div></div>
+        <div id="todayWorkspace" class="metric-grid"></div>
+        <div class="panel"><div class="panel-heading"><h3>Время ответа</h3><button id="slaRefresh" class="secondary-button">Обновить</button></div><div id="slaSummary" class="metric-grid compact-metrics"></div><div id="slaList" class="list"></div></div>
+        <div class="panel"><div class="panel-heading"><h3>Рекомендации</h3><button id="recommendationsRefresh" class="secondary-button">Обновить</button></div><div id="recommendationsList" class="list"></div></div>
+        <div class="panel"><div class="panel-heading"><h3>Шаблоны ответов</h3><button id="templateAddBtn" class="primary-button small">+ Добавить</button></div><div id="templatesList" class="list"></div></div>
+        <div class="panel"><div class="panel-heading"><h3>Правила</h3><button id="ruleAddBtn" class="primary-button small">+ Правило</button></div><div id="rulesList" class="list"></div></div>
+        <div class="panel"><div class="panel-heading"><h3>Аналитика товаров</h3></div><div id="productAnalyticsList" class="list"></div></div>
+      </section>
+
+      <section id="section-health" class="section">
+        <div class="section-heading"><div><span class="kicker">Надёжность</span><h2>Система</h2></div></div>
+        <div class="panel"><div class="panel-heading"><h3>Резервные копии</h3><button id="backupCreateBtn" class="primary-button">Создать копию</button></div><div id="backupsList" class="list"></div></div>
+        <div class="panel"><div class="panel-heading"><h3>Ошибки API</h3><button id="errorsRefresh" class="secondary-button">Обновить</button></div><div id="errorsList" class="list"></div></div>
+        <div class="panel"><div class="panel-heading"><h3>Ежедневный отчёт</h3></div><label class="switch-row"><span>Утренний отчёт</span><input id="morningReportToggle" type="checkbox"></label><label class="switch-row"><span>Вечерний отчёт</span><input id="eveningReportToggle" type="checkbox"></label><button id="reportSettingsSave" class="primary-button full">Сохранить</button><p class="muted">Для доставки по расписанию добавьте Railway Cron на /cron/daily-report?secret=CRON_SECRET.</p></div>
+      </section>
       <section id="section-audit" class="section">
         <div class="section-heading"><div><span class="kicker">Безопасность</span><h2>История действий</h2></div><button id="auditRefresh" class="icon-button">↻</button></div>
         <div id="auditList" class="list"><div class="empty">Загрузка…</div></div>
@@ -314,6 +341,9 @@
     <div id="attentionList" class="list"><div class="empty">Загрузка…</div></div>
   </dialog>
 
+  <dialog id="templateDialog" class="modal"><div class="modal-header"><div><span class="kicker">Поддержка</span><h2>Новый шаблон</h2></div><button class="close-button" data-close>×</button></div><form id="templateForm" class="form-stack"><label>Категория<input id="templateCategory" value="Общие"></label><label>Название<input id="templateName" required></label><label>Текст<textarea id="templateBody" rows="8" placeholder="Здравствуйте! Заказ №{order_id}"></textarea></label><button class="primary-button">Сохранить</button></form></dialog>
+  <dialog id="ruleDialog" class="modal"><div class="modal-header"><div><span class="kicker">Автопилот</span><h2>Новое правило</h2></div><button class="close-button" data-close>×</button></div><form id="ruleForm" class="form-stack"><label>Название<input id="ruleName" required></label><label>Триггер<select id="ruleTrigger"><option value="message">Новое сообщение</option><option value="stock">Изменение остатка</option></select></label><label>Текст содержит<input id="ruleContains" placeholder="не работает"></label><label>Действие<select id="ruleAction"><option value="notify">Уведомить меня</option><option value="label_chat">Поставить метку чату</option></select></label><label>Текст/метка<input id="ruleActionValue" placeholder="replacement"></label><button class="primary-button">Сохранить</button></form></dialog>
+
   <nav class="bottom-nav" aria-label="Основная навигация">
     <button class="tab active" data-section="dashboard"><span>⌂</span><small>Обзор</small></button>
     <button class="tab" data-section="offers"><span>▦</span><small>Товары</small></button>
@@ -323,6 +353,6 @@
   </nav>
 
   <div id="toast" class="toast hidden"></div>
-  <script src="{{ url_for('static', filename='miniapp.js', v='48') }}" defer></script>
+  <script src="{{ url_for('static', filename='miniapp.js', v='50') }}" defer></script>
 </body>
 </html>

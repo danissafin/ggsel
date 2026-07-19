@@ -275,3 +275,7 @@ button:disabled { opacity: .45; cursor: default; }
 .compact-mode .metric-card { min-height: 90px; padding: 12px; }
 @media (min-width: 700px) { .quick-actions-grid { grid-template-columns: repeat(4,minmax(0,1fr)); } }
 @media (max-width: 420px) { .topbar-actions { gap: 5px; } .topbar-actions .icon-button { width: 42px; height: 42px; } }
+
+
+/* v5.0 seller workspace */
+.section-heading.minor{margin-top:22px}.button-row,.inline-actions{display:flex;gap:10px;flex-wrap:wrap}.primary-button.small,.secondary-button.small{padding:8px 12px;font-size:13px}.severity-critical{border-left:4px solid var(--danger)!important}.severity-warning{border-left:4px solid #f5a623!important}.severity-ok{border-left:4px solid var(--success)!important}.danger-link{border:0;background:transparent;color:var(--danger);font-weight:700}.form-stack select{width:100%;padding:14px;border-radius:14px;border:1px solid var(--border);background:var(--card);color:var(--text)}
