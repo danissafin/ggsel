@@ -25,7 +25,12 @@
     attention: {count: 0, items: [], summary: {}},
     recent: [],
     searchTimer: null,
-  };
+    currentOrder: null,
+    replacementPreview: null,
+    cases: [],
+    caseStatus: 'all',
+    knowledge: [],
+    };
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -119,6 +124,10 @@
         if (name === 'inventory') await loadInventoryTools();
         if (name === 'workspace') await loadWorkspace();
         if (name === 'health') await loadHealth();
+        if (name === 'cases') await loadCases();
+        if (name === 'supply') await loadSupply();
+        if (name === 'knowledge') await loadKnowledge();
+        if (name === 'quality') await loadQuality();
         if (name === 'more') return;
       } catch (error) { toast(error.message, true); }
     }
@@ -164,26 +173,88 @@
     }).join('') : '<div class="empty">Откройте товар, заказ или чат — они появятся здесь</div>';
   }
 
-  function renderSearchGroup(title, items) {
+  const SEARCH_GROUPS = [
+    ['offers', 'Товары', '▦'],
+    ['orders', 'Заказы', '#'],
+    ['chats', 'Клиенты и переписки', '✉'],
+    ['inventory', 'Ключи и содержимое', '⌁'],
+    ['suppliers', 'Поставщики', '◫'],
+    ['batches', 'Партии', '▤'],
+    ['cases', 'Проблемные обращения', '⚑'],
+    ['knowledge', 'База знаний', '◎'],
+    ['notes', 'Заметки', '✎'],
+    ['errors', 'Ошибки API', '!'],
+  ];
+
+  function renderSearchGroup(title, items, icon = '⌕') {
     if (!items?.length) return '';
-    return `<section class="search-group"><h3>${esc(title)}</h3>${items.map(item => `<button class="search-result plain-button" data-search-type="${esc(item.type)}" data-search-id="${esc(item.id)}" data-search-invoice="${esc(item.invoice_id || '')}"><div><strong>${esc(item.title)}</strong><span class="muted">${esc(item.subtitle || '')}</span></div><span class="support-arrow">→</span></button>`).join('')}</section>`;
+    return `<section class="search-group"><div class="search-group-heading"><h3><span>${esc(icon)}</span>${esc(title)}</h3><span class="search-count">${items.length}</span></div>${items.map(item => `<button class="search-result plain-button" data-search-type="${esc(item.type)}" data-search-id="${esc(item.id)}" data-search-invoice="${esc(item.invoice_id || '')}" data-search-offer="${esc(item.offer_id || '')}" data-search-conversation="${esc(item.conversation_id || '')}" data-search-query="${esc(item.title || '')}"><div class="search-result-main"><div class="search-result-title"><strong>${esc(item.title)}</strong>${item.badge ? `<span class="badge search-badge">${esc(item.badge)}</span>` : ''}</div><span class="muted">${esc(item.subtitle || '')}</span></div><span class="support-arrow">→</span></button>`).join('')}</section>`;
+  }
+
+  function readRecentSearches() {
+    try { const value=JSON.parse(localStorage.getItem('ggselRecentSearches') || '[]'); return Array.isArray(value) ? value : []; }
+    catch { return []; }
+  }
+
+  function rememberSearch(query) {
+    const clean = String(query || '').trim();
+    if (clean.length < 2) return;
+    const old = readRecentSearches();
+    localStorage.setItem('ggselRecentSearches', JSON.stringify([clean, ...old.filter(item => item !== clean)].slice(0, 6)));
+  }
+
+  function renderRecentSearches() {
+    const recent = readRecentSearches();
+    const node = $('#globalSearchRecent');
+    if (!node) return;
+    node.innerHTML = recent.length ? `<span class="search-example-label">Недавние:</span>${recent.map(value => `<button type="button" class="search-example" data-search-example="${esc(value)}">${esc(value)}</button>`).join('')}` : '';
+  }
+
+  function renderSearchMeta(meta = {}) {
+    const node = $('#globalSearchMeta');
+    if (!node) return;
+    const filters = (meta.filters || []).map(item => `<span class="search-filter-chip"><b>${esc(item.label)}:</b> ${esc(item.value)}</span>`).join('');
+    const terms = (meta.terms || []).map(term => `<span class="search-filter-chip">${esc(term)}</span>`).join('');
+    const unknown = (meta.unknown || []).length ? `<div class="notice warning-notice compact-notice">Неизвестные команды восприняты как обычный текст: ${esc(meta.unknown.join(', '))}</div>` : '';
+    const warnings = (meta.warnings || []).map(value => `<div class="notice warning-notice compact-notice">${esc(value)}</div>`).join('');
+    node.innerHTML = `<div class="search-summary"><b>${Number(meta.total || 0).toLocaleString('ru-RU')}</b><span class="muted">результатов показано${meta.total >= (meta.limit || 12) ? ' · в каждой группе отобраны самые релевантные' : ''}</span></div>${filters || terms ? `<div class="search-active-filters">${terms}${filters}</div>` : ''}${unknown}${warnings}`;
   }
 
   async function runGlobalSearch(query) {
     const clean = String(query || '').trim();
-    if (clean.length < 2) { $('#globalSearchResults').innerHTML = '<div class="empty">Введите минимум 2 символа</div>'; return; }
-    $('#globalSearchResults').innerHTML = '<div class="empty">Ищу…</div>';
+    if (clean.length < 2) {
+      $('#globalSearchMeta').innerHTML = '';
+      $('#globalSearchResults').innerHTML = '<div class="empty">Введите минимум 2 символа или выберите пример команды</div>';
+      return;
+    }
+    $('#globalSearchMeta').innerHTML = '<div class="search-summary"><span class="muted">Разбираю запрос…</span></div>';
+    $('#globalSearchResults').innerHTML = '<div class="empty">Ищу по кабинету…</div>';
     try {
-      const {data} = await api(`/app/api/search?q=${encodeURIComponent(clean)}`);
-      const html = renderSearchGroup('Товары', data.offers) + renderSearchGroup('Заказы', data.orders) + renderSearchGroup('Чаты', data.chats);
-      $('#globalSearchResults').innerHTML = html || '<div class="empty">Ничего не найдено</div>';
-    } catch (error) { $('#globalSearchResults').innerHTML = `<div class="notice">${esc(error.message)}</div>`; }
+      const {data} = await api(`/app/api/search?q=${encodeURIComponent(clean)}&limit=14`);
+      renderSearchMeta(data.meta || {});
+      const html = SEARCH_GROUPS.map(([key,title,icon]) => renderSearchGroup(title, data[key], icon)).join('');
+      $('#globalSearchResults').innerHTML = html || '<div class="empty">Ничего не найдено. Попробуйте убрать часть фильтров.</div>';
+      rememberSearch(clean);
+      renderRecentSearches();
+    } catch (error) {
+      $('#globalSearchMeta').innerHTML = '';
+      $('#globalSearchResults').innerHTML = `<div class="notice">${esc(error.message)}</div>`;
+    }
+  }
+
+  function applySearchExample(value) {
+    const input = $('#globalSearchInput');
+    input.value = value;
+    input.focus();
+    runGlobalSearch(value);
   }
 
   function openGlobalSearch() {
+    renderRecentSearches();
     openDialog($('#globalSearchDialog'));
     setTimeout(() => $('#globalSearchInput').focus(), 80);
   }
+
 
   async function toggleFavorite(id, favorite) {
     try {
@@ -194,12 +265,34 @@
     } catch (error) { toast(error.message, true); }
   }
 
-  async function handleNavigationItem(type, id, invoice = '') {
-    if (type === 'offer') { closeDialog($('#globalSearchDialog')); closeDialog($('#attentionDialog')); await switchSection('offers'); await showOffer(id); }
-    if (type === 'order') { closeDialog($('#globalSearchDialog')); await switchSection('orders'); $('#invoiceInput').value = id; await findOrder(id); }
-    if (type === 'chat') { closeDialog($('#globalSearchDialog')); await switchSection('chats'); await openChat(id); }
-    if (invoice && type === 'chat') $('#invoiceInput').value = invoice;
+  async function handleNavigationItem(type, id, invoice = '', query = '', offer = '', conversation = '') {
+    closeDialog($('#globalSearchDialog'));
+    closeDialog($('#attentionDialog'));
+    if (type === 'offer') { await switchSection('offers'); await showOffer(id); return; }
+    if (type === 'order' || type === 'order_note') { await switchSection('orders'); $('#invoiceInput').value = id || invoice; await findOrder(id || invoice); return; }
+    if (type === 'chat' || type === 'customer_note') { await switchSection('chats'); await openChat(conversation || id); return; }
+    if (type === 'inventory') {
+      if (invoice) { await switchSection('orders'); $('#invoiceInput').value = invoice; await findOrder(invoice); }
+      else if (offer) { await switchSection('offers'); await showOffer(offer); }
+      else { await switchSection('inventory'); }
+      return;
+    }
+    if (type === 'supplier' || type === 'batch') { await switchSection('supply'); setTimeout(() => document.querySelector('#section-supply')?.scrollIntoView({behavior:'smooth'}), 80); return; }
+    if (type === 'case') {
+      await switchSection('cases');
+      $('#caseSearch').value = invoice || query || id;
+      await loadCases();
+      return;
+    }
+    if (type === 'knowledge') {
+      await switchSection('knowledge');
+      $('#knowledgeSearch').value = query || id;
+      await loadKnowledge(query || id);
+      return;
+    }
+    if (type === 'error') { await switchSection('health'); return; }
   }
+
 
   function localDateValue(value) {
     const date = value instanceof Date ? value : new Date(value);
@@ -450,6 +543,14 @@
     $('#stockValues').value = '';
     $('#stockCount').textContent = '0 строк';
     $('#stockWarnings').classList.add('hidden');
+    $('#stockSupplier').value = '';
+    $('#stockUnitCost').value = '';
+    $('#stockCostCurrency').value = 'RUB';
+    $('#stockFxRate').value = '1';
+    $('#stockPurchasedAt').value = new Date().toISOString().slice(0,10);
+    $('#stockWarrantyDays').value = '7';
+    $('#stockBatchNotes').value = '';
+    populateSupplierDatalist().catch(()=>{});
     let settings = {};
     try { settings = JSON.parse($('#offerDialog').dataset.offer || '{}').settings || {}; } catch {}
     $('#stockAutoActivate').checked = !!settings.auto_activate;
@@ -469,7 +570,16 @@
     if (!ok) return;
     const button = $('#stockSubmit'); button.disabled = true; button.textContent = 'Добавляю…';
     try {
-      const result = await api(`/app/api/offers/${state.currentOffer}/products`, {method:'POST', body:JSON.stringify({values, auto_activate:$('#stockAutoActivate').checked, confirm:true})});
+      const batch = {
+        supplier_name: $('#stockSupplier').value.trim(),
+        unit_cost: Number($('#stockUnitCost').value || 0),
+        currency: $('#stockCostCurrency').value,
+        fx_to_rub: Number($('#stockFxRate').value || 0),
+        purchased_at: $('#stockPurchasedAt').value,
+        warranty_days: Number($('#stockWarrantyDays').value || 0),
+        notes: $('#stockBatchNotes').value.trim(),
+      };
+      const result = await api(`/app/api/offers/${state.currentOffer}/products`, {method:'POST', body:JSON.stringify({values, batch, auto_activate:$('#stockAutoActivate').checked, confirm:true})});
       toast(result.data.auto_activation ? `Добавлено: ${result.data.added}. Активация запущена` : `Добавлено: ${result.data.added}`);
       closeDialog($('#stockDialog'));
       closeDialog($('#offerDialog'));
@@ -586,18 +696,34 @@
     $('#orderResult').innerHTML = '<div class="panel"><div class="empty">Загрузка…</div></div>';
     try {
       const {data} = await api(`/app/api/orders/${encodeURIComponent(invoice)}`);
+      state.currentOrder = data;
       const buyer = data.buyer || {};
       const note = data.note || {};
-      $('#orderResult').innerHTML = `<article class="order-card panel" data-order-id="${esc(data.invoice_id)}">
+      const profit = data.profitability || {};
+      const problem = data.problem_case || {};
+      const replacements = data.replacements || [];
+      const netBlock = profit.net_profit_rub !== null && profit.net_profit_rub !== undefined
+        ? `<div class="detail accent-detail"><span>Чистая прибыль</span><b>${money(profit.net_profit_rub,'RUB')}</b><small>маржа ${profit.margin_percent ?? '—'}%</small></div>`
+        : `<div class="detail"><span>Чистая прибыль</span><b>—</b><small>${profit.cost_known ? 'задайте курс начислений' : 'себестоимость не привязана'}</small></div>`;
+      $('#orderResult').innerHTML = `<article class="order-card panel" data-order-id="${esc(data.invoice_id)}" data-offer-id="${esc(data.item_id || '')}">
         <div class="panel-heading"><h3>${esc(data.name || 'Товар')}</h3><span class="badge">#${esc(data.invoice_id)}</span></div>
         <div class="detail-grid">
           <div class="detail"><span>Зачислено</span><b>${money(data.amount, data.currency || 'RUB')}</b></div>
-          <div class="detail"><span>Прибыль</span><b>${money(data.profit, data.currency || 'RUB')}</b></div>
+          <div class="detail"><span>До себестоимости</span><b>${money(data.profit, data.currency || 'RUB')}</b></div>
+          <div class="detail"><span>Себестоимость</span><b>${profit.cost_known ? money(profit.cost_rub,'RUB') : '—'}</b></div>
+          ${netBlock}
           <div class="detail"><span>Статус</span><b>${esc(data.invoice_state_label || `Неизвестный статус (${data.invoice_state ?? '—'})`)}</b></div>
           <div class="detail"><span>Оплата</span><b>${formatDate(data.date_pay)}</b></div>
         </div>
         <p><b>Покупатель:</b> ${esc(buyer.email || buyer.account || '—')}</p>
         <p class="muted">Телефон: ${esc(buyer.phone || '—')} · ID товара: ${esc(data.item_id || '—')} · Внешний ID: ${esc(data.external_order_id || '—')}</p>
+        ${problem.id ? `<div class="case-strip priority-${esc(problem.priority)}"><b>⚑ ${esc(caseStatusName(problem.status))}</b><span>${esc(problem.error_code || problem.reason || '')}</span><button class="link-button" data-edit-case="${problem.id}">Открыть</button></div>` : ''}
+        ${replacements.length ? `<p class="muted">Замен выполнено: ${replacements.filter(x=>x.status==='sent').length}</p>` : ''}
+        <div class="order-actions-grid">
+          <button class="secondary-button" data-order-diagnostic>⌁ Диагностика</button>
+          <button class="secondary-button" data-order-case>⚑ Проблема</button>
+          <button class="danger-button" data-order-replacement>↺ Заменить содержимое</button>
+        </div>
         <div class="order-note-box">
           <div class="panel-heading"><h3>Моя заметка</h3><span class="muted">видна только тебе</span></div>
           <label>Метка<select id="orderNoteTag"><option value="">Без метки</option><option value="check">Проверить</option><option value="replacement">Замена</option><option value="waiting">Ждём клиента</option><option value="vip">VIP</option><option value="resolved">Решено</option></select></label>
@@ -906,7 +1032,165 @@
   async function loadHealth(){ const [backups,errors,settings]=await Promise.all([api('/app/api/backups'),api('/app/api/errors'),api('/app/api/report-settings')]); renderBackups(backups.data); renderErrors(errors.data); $('#morningReportToggle').checked=!!settings.data.morning_enabled; $('#eveningReportToggle').checked=!!settings.data.evening_enabled; }
   function renderBackups(data){ $('#backupsList').innerHTML=data.length?data.map(x=>`<div class="list-item"><div><strong>${esc(x.name)}</strong><span class="muted">${(x.size/1024/1024).toFixed(2)} МБ · ${formatDate(x.created_at)}</span></div></div>`).join(''):'<div class="empty">Копий пока нет</div>'; }
   function renderErrors(data){ $('#errorsList').innerHTML=data.length?data.slice(0,50).map(x=>`<div class="list-item"><div><strong>${esc(x.service)} · HTTP ${esc(x.status)}</strong><span class="muted">${esc(x.endpoint)} · ${esc(x.message)}</span></div><span>${formatDate(x.created_at)}</span></div>`).join(''):'<div class="empty">Ошибок не зафиксировано</div>'; }
+
+  function caseStatusName(status) {
+    return ({new:'Новый',diagnosis:'Диагностика',waiting:'Ждём клиента',replacement:'Нужна замена',resolved:'Решено',closed:'Закрыто'})[status] || status || 'Новый';
+  }
+  function casePriorityName(priority) {
+    return ({low:'Низкий',normal:'Обычный',high:'Высокий',critical:'Критичный'})[priority] || priority || 'Обычный';
+  }
+
+  async function populateSupplierDatalist() {
+    const {data} = await api('/app/api/suppliers');
+    $('#supplierNames').innerHTML = (data || []).map(x => `<option value="${esc(x.name)}"></option>`).join('');
+  }
+
+  function openCaseEditor(item = {}) {
+    $('#caseId').value = item.id || '';
+    $('#caseInvoice').value = item.invoice_id || state.currentOrder?.invoice_id || state.currentChatInfo?.invoice_id || '';
+    $('#caseProduct').value = item.product_name || state.currentOrder?.name || state.currentChatInfo?.product_name || '';
+    $('#caseStatus').value = item.status || 'new';
+    $('#casePriority').value = item.priority || 'normal';
+    $('#caseCategory').value = item.category || 'activation';
+    $('#caseError').value = item.error_code || '';
+    $('#caseReason').value = item.reason || '';
+    $('#caseNote').value = item.note || '';
+    openDialog($('#caseDialog'));
+  }
+
+  async function loadCases() {
+    const params = new URLSearchParams();
+    if (state.caseStatus !== 'all') params.set('status', state.caseStatus);
+    const query = $('#caseSearch')?.value.trim(); if (query) params.set('q', query);
+    const {data} = await api(`/app/api/problem-cases?${params}`);
+    state.cases = data || [];
+    const counts = {new:0,diagnosis:0,waiting:0,replacement:0,critical:0};
+    state.cases.forEach(x=>{ if(counts[x.status]!==undefined) counts[x.status]++; if(x.priority==='critical') counts.critical++; });
+    $('#caseMetrics').innerHTML = [['Новых',counts.new],['Диагностика',counts.diagnosis],['Ждём',counts.waiting],['Замена',counts.replacement],['Критичных',counts.critical]].map(([l,v])=>`<div class="metric-card compact-card"><span class="label">${l}</span><span class="value">${v}</span></div>`).join('');
+    $('#casesList').innerHTML = state.cases.length ? state.cases.map(item=>`<article class="case-card priority-${esc(item.priority)}" data-case-id="${item.id}"><div class="panel-heading"><div><strong>${esc(item.product_name || 'Проблемный заказ')}</strong><span class="muted">Заказ #${esc(item.invoice_id || '—')} · ${formatDate(item.updated_at)}</span></div><span class="badge">${esc(caseStatusName(item.status))}</span></div><p>${esc(item.reason || item.note || 'Причина не указана')}</p><div class="case-footer"><span class="badge severity-${esc(item.priority)}">${esc(casePriorityName(item.priority))}</span><span class="muted">${esc(item.error_code || item.category || '')}</span><button class="link-button" data-edit-case="${item.id}">Открыть</button></div></article>`).join('') : '<div class="empty">Проблемных заказов по этому фильтру нет</div>';
+  }
+
+  async function saveCase(event) {
+    event.preventDefault();
+    const id = $('#caseId').value;
+    const payload = {invoice_id:$('#caseInvoice').value.trim(),product_name:$('#caseProduct').value.trim(),status:$('#caseStatus').value,priority:$('#casePriority').value,category:$('#caseCategory').value,error_code:$('#caseError').value.trim(),reason:$('#caseReason').value.trim(),note:$('#caseNote').value.trim(),conversation_id:state.currentChat || '',offer_id:state.currentOrder?.item_id || ''};
+    await api(id ? `/app/api/problem-cases/${id}` : '/app/api/problem-cases',{method:id?'PATCH':'POST',body:JSON.stringify(payload)});
+    closeDialog($('#caseDialog')); toast('Обращение сохранено'); await loadCases();
+    if (state.currentOrder?.invoice_id === payload.invoice_id) await findOrder(payload.invoice_id);
+  }
+
+  async function openReplacement(invoice, offerId = '') {
+    if (!invoice) return toast('Сначала откройте заказ', true);
+    $('#replacementPreview').innerHTML = '<div class="empty">Проверяю склад…</div>';
+    $('#replacementReason').value = '';
+    openDialog($('#replacementDialog'));
+    try {
+      const params = offerId ? `?offer_id=${encodeURIComponent(offerId)}` : '';
+      const {data} = await api(`/app/api/orders/${encodeURIComponent(invoice)}/replacement/preview${params}`);
+      state.replacementPreview = data;
+      $('#replacementPreview').innerHTML = `<div class="notice warning-notice"><b>Заказ #${esc(data.invoice_id)}</b><br>${esc(data.product_name || `Товар ${data.offer_id}`)}<br>Новая позиция: <code>${esc(data.content_masked)}</code><br>Доступно на складе: ${esc(data.stock_available)}<br><small>Перед отправкой позиция будет исключена из склада GGSEL.</small></div>`;
+    } catch (error) { state.replacementPreview=null; $('#replacementPreview').innerHTML=`<div class="notice">${esc(error.message)}</div>`; }
+  }
+
+  async function confirmReplacement() {
+    const p = state.replacementPreview;
+    if (!p) return toast('Нет доступного содержимого для замены', true);
+    if (!await confirmAction(`Исключить ${p.content_masked} из склада и отправить покупателю по заказу #${p.invoice_id}?`)) return;
+    const btn=$('#replacementConfirm'); btn.disabled=true; btn.textContent='Выполняю замену…';
+    try {
+      const {data}=await api(`/app/api/orders/${encodeURIComponent(p.invoice_id)}/replacement`,{method:'POST',body:JSON.stringify({offer_id:p.offer_id,product_id:p.product_id,reason:$('#replacementReason').value.trim(),confirm:true})});
+      toast(`Замена отправлена: ${data.content_masked}`); closeDialog($('#replacementDialog')); state.replacementPreview=null;
+      if(state.currentOrder?.invoice_id===p.invoice_id) await findOrder(p.invoice_id); await loadAttention(false);
+    } catch(error){ toast(error.message,true); }
+    finally{btn.disabled=false;btn.textContent='Подтвердить и отправить покупателю';}
+  }
+
+  function openDiagnostic(invoice='', conversation='') {
+    $('#diagnosticInvoice').value=invoice || state.currentOrder?.invoice_id || state.currentChatInfo?.invoice_id || '';
+    $('#diagnosticConversation').value=conversation || state.currentChat || '';
+    const product=(state.currentOrder?.name || state.currentChatInfo?.product_name || '').toLowerCase();
+    $('#diagnosticFamily').value=product.includes('office')?'office':product.includes('windows')?'windows':product.includes('mac')?'mac':'other';
+    $('#diagnosticInstalled').value=''; $('#diagnosticPurchased').value=state.currentOrder?.name || state.currentChatInfo?.product_name || '';
+    $('#diagnosticError').value=''; $('#diagnosticDescription').value=''; $('#diagnosticResult').innerHTML=''; openDialog($('#diagnosticDialog'));
+  }
+
+  async function runDiagnostic(event){
+    event.preventDefault();
+    const payload={invoice_id:$('#diagnosticInvoice').value,conversation_id:$('#diagnosticConversation').value,product_family:$('#diagnosticFamily').value,installed_edition:$('#diagnosticInstalled').value,purchased_edition:$('#diagnosticPurchased').value,error_code:$('#diagnosticError').value,description:$('#diagnosticDescription').value};
+    const {data}=await api('/app/api/diagnostics',{method:'POST',body:JSON.stringify(payload)});
+    $('#diagnosticResult').innerHTML=`<div class="diagnostic-answer"><h3>${esc(data.title)}</h3><ol>${(data.steps||[]).map(x=>`<li>${esc(x)}</li>`).join('')}</ol><div class="button-row"><button class="secondary-button" type="button" data-use-diagnostic>Вставить в ответ</button>${data.action==='replacement'?'<button class="danger-button" type="button" data-diagnostic-replacement>Перейти к замене</button>':''}</div><textarea id="diagnosticResponseText" rows="8">${esc(data.response_text||'')}</textarea></div>`;
+    $('#diagnosticResult').dataset.result=JSON.stringify(data);
+  }
+
+  async function loadKnowledge(query=''){
+    const q=query || $('#knowledgeSearch')?.value.trim() || '';
+    const {data}=await api(`/app/api/knowledge${q?`?q=${encodeURIComponent(q)}`:''}`); state.knowledge=data||[];
+    $('#knowledgeList').innerHTML=state.knowledge.length?state.knowledge.map(x=>`<article class="knowledge-card" data-article-id="${x.id}"><div class="panel-heading"><div><span class="kicker">${esc(x.category)}</span><strong>${esc(x.title)}</strong></div><button class="danger-link" data-delete-article="${x.id}">Удалить</button></div><p>${esc(x.body)}</p><div class="knowledge-footer"><span class="muted">${esc((x.error_codes||[]).join(', ') || x.product_pattern || 'Общая инструкция')}</span><button class="secondary-button small" data-use-article="${x.id}">Использовать</button></div></article>`).join(''):'<div class="empty">Инструкции не найдены</div>';
+  }
+
+  async function openKnowledgePicker(){
+    const {data}=await api('/app/api/knowledge'); state.knowledge=data||[]; renderKnowledgePicker(state.knowledge); openDialog($('#knowledgePickerDialog')); setTimeout(()=>$('#knowledgePickerSearch').focus(),60);
+  }
+  function renderKnowledgePicker(items){ $('#knowledgePickerList').innerHTML=items.length?items.map(x=>`<button class="list-item plain-button" data-pick-article="${x.id}"><div><strong>${esc(x.title)}</strong><span class="muted">${esc(x.category)} · ${esc((x.error_codes||[]).join(', '))}</span></div><span>→</span></button>`).join(''):'<div class="empty">Нет инструкций</div>'; }
+  function useArticle(id){ const article=state.knowledge.find(x=>String(x.id)===String(id)); if(!article)return; if($('#chatDialog').open){$('#chatReplyText').value=article.body;closeDialog($('#knowledgePickerDialog'));toast('Инструкция вставлена в ответ');}else{navigator.clipboard?.writeText(article.body);toast('Инструкция скопирована');} }
+
+  async function saveKnowledge(event){event.preventDefault();const payload={category:$('#knowledgeCategory').value,title:$('#knowledgeTitle').value,product_pattern:$('#knowledgeProductPattern').value,error_codes:$('#knowledgeErrors').value.split(',').map(x=>x.trim().toLowerCase()).filter(Boolean),body:$('#knowledgeBody').value};await api('/app/api/knowledge',{method:'POST',body:JSON.stringify(payload)});closeDialog($('#knowledgeDialog'));event.target.reset();toast('Инструкция сохранена');await loadKnowledge();}
+
+  async function loadSupply(){
+    const [profit,suppliers,batches,settings]=await Promise.all([api('/app/api/profitability'),api('/app/api/suppliers'),api('/app/api/batches'),api('/app/api/business-settings')]);
+    const p=profit.data||{}; const st=settings.data||{};
+    $('#profitMetrics').innerHTML=[['Прибыль до закупки',money(p.platform_profit_rub||0,'RUB')],['Себестоимость',money(p.cost_rub||0,'RUB')],['Чистая прибыль',money(p.net_profit_rub||0,'RUB')],['Заказов с ценой',`${p.cost_known_orders||0} / ${p.orders||0}`]].map(([l,v])=>`<div class="metric-card"><span class="label">${l}</span><span class="value">${esc(v)}</span></div>`).join('');
+    $('#profitCoverage').textContent=`Покрытие себестоимостью: ${p.coverage_percent||0}%`;
+    $('#settlementCurrency').value=st.settlement_currency||'USD'; $('#settlementRate').value=st.settlement_to_rub||''; $('#targetMargin').value=st.target_margin||30;
+    $('#profitOrders').innerHTML=(p.items||[]).slice(0,30).map(x=>`<button class="list-item plain-button" data-open-order="${esc(x.invoice_id)}"><div><strong>${esc(x.product_name||`Заказ #${x.invoice_id}`)}</strong><span class="muted">#${esc(x.invoice_id)} · ${formatDate(x.date)}${x.cost_known?'':' · нет себестоимости'}</span></div><b>${x.net_profit_rub!==null?money(x.net_profit_rub,'RUB'):'—'}</b></button>`).join('')||'<div class="empty">Откройте заказы, чтобы собрать расчёт</div>';
+    $('#suppliersList').innerHTML=(suppliers.data||[]).map(x=>`<div class="list-item"><div><strong>${esc(x.name)}</strong><span class="muted">${esc(x.contact||'Без контакта')} · ${esc(x.default_currency)}</span></div><button class="danger-link" data-delete-supplier="${x.id}">Удалить</button></div>`).join('')||'<div class="empty">Поставщики пока не добавлены</div>';
+    $('#batchesList').innerHTML=(batches.data||[]).map(x=>`<div class="list-item batch-item"><div><strong>${esc(x.product_name||`Товар ${x.offer_id}`)}</strong><span class="muted">Партия #${x.id} · ${esc(x.supplier_display||'без поставщика')} · ${x.ledger_count||0} шт. · продано ${x.sold||0} · замен ${x.replaced||0}</span></div><b>${money((x.unit_cost_rub||0)*(x.quantity||0),'RUB')}</b></div>`).join('')||'<div class="empty">Партии появятся после пополнения товара с заполненной себестоимостью</div>';
+  }
+
+  async function syncProfitability(){
+    const btn=$('#profitSyncBtn'); const original=btn?.textContent;
+    if(btn){btn.disabled=true;btn.textContent='Обновляю…';}
+    try{
+      const {data}=await api('/app/api/profitability/sync',{method:'POST',body:JSON.stringify({limit:20})});
+      const errors=(data.errors||[]).length;
+      toast(`Обновлено заказов: ${data.synced||0}${errors?` · ошибок: ${errors}`:''}`);
+      await loadSupply();
+    }finally{if(btn){btn.disabled=false;btn.textContent=original||'Обновить 20 заказов';}}
+  }
+
+  async function saveProfitSettings(event){event.preventDefault();await api('/app/api/business-settings',{method:'PUT',body:JSON.stringify({settlement_currency:$('#settlementCurrency').value,settlement_to_rub:Number($('#settlementRate').value||0),target_margin:Number($('#targetMargin').value||30)})});toast('Настройки прибыли сохранены');await loadSupply();}
+  async function saveSupplier(event){event.preventDefault();await api('/app/api/suppliers',{method:'POST',body:JSON.stringify({name:$('#supplierName').value,contact:$('#supplierContact').value,default_currency:$('#supplierCurrency').value,notes:$('#supplierNotes').value})});closeDialog($('#supplierDialog'));event.target.reset();toast('Поставщик сохранён');await loadSupply();}
+
+  async function loadQuality(){
+    const {data}=await api('/app/api/quality');
+    $('#incidentsList').innerHTML=(data.incidents||[]).length?data.incidents.map(x=>`<div class="list-item severity-critical"><div><strong>${esc(x.product_name||`Товар ${x.offer_id}`)}</strong><span class="muted">${x.signal_count} похожих обращений за ${x.window_minutes} мин. · ${esc(x.error_code||x.category)}</span></div><button class="secondary-button small" data-resolve-incident="${x.id}">Решено</button></div>`).join(''):'<div class="empty">Массовых проблем не обнаружено</div>';
+    $('#productQualityList').innerHTML=(data.products||[]).map(x=>`<div class="list-item"><div><strong>${esc(x.product_name)}</strong><span class="muted">${x.sales_count} продаж · проблем ${x.problem_orders} · замен ${x.replacements} · негативных ${x.negative_reviews}</span></div><b>${x.reliability===null?'—':`${x.reliability}%`}</b></div>`).join('')||'<div class="empty">Недостаточно данных</div>';
+    $('#supplierQualityList').innerHTML=(data.suppliers||[]).map(x=>`<div class="list-item"><div><strong>${esc(x.supplier_name)}</strong><span class="muted">${x.total_items||0} загружено · ${x.sold_items||0} продано · ${x.replaced_items||0} замен</span></div><b>${x.quality===null?'—':`${x.quality}%`}</b></div>`).join('')||'<div class="empty">Добавьте поставщиков и партии</div>';
+  }
+
   function bindEvents() {
+    $('#casesRefresh')?.addEventListener('click', loadCases);
+    $('#caseCreateBtn')?.addEventListener('click', ()=>openCaseEditor());
+    $('#caseForm')?.addEventListener('submit', saveCase);
+    $('#caseFilters')?.addEventListener('click', e=>{const b=e.target.closest('[data-case-status]');if(!b)return;state.caseStatus=b.dataset.caseStatus;$$('#caseFilters .chip').forEach(x=>x.classList.toggle('active',x===b));loadCases();});
+    let caseSearchTimer; $('#caseSearch')?.addEventListener('input',()=>{clearTimeout(caseSearchTimer);caseSearchTimer=setTimeout(loadCases,300);});
+    $('#replacementConfirm')?.addEventListener('click', confirmReplacement);
+    $('#diagnosticForm')?.addEventListener('submit', runDiagnostic);
+    $('#knowledgeAddBtn')?.addEventListener('click',()=>openDialog($('#knowledgeDialog')));
+    $('#knowledgeForm')?.addEventListener('submit', saveKnowledge);
+    let knowledgeTimer; $('#knowledgeSearch')?.addEventListener('input',e=>{clearTimeout(knowledgeTimer);knowledgeTimer=setTimeout(()=>loadKnowledge(e.target.value),260);});
+    $('#knowledgePickerSearch')?.addEventListener('input',e=>{const q=e.target.value.toLowerCase();renderKnowledgePicker(state.knowledge.filter(x=>[x.title,x.body,x.category,(x.error_codes||[]).join(' ')].some(v=>String(v||'').toLowerCase().includes(q))));});
+    $('#chatKnowledgeBtn')?.addEventListener('click', openKnowledgePicker);
+    $('#chatDiagnosticBtn')?.addEventListener('click',()=>openDiagnostic(state.currentChatInfo?.invoice_id||'',state.currentChat||''));
+    $('#chatCaseBtn')?.addEventListener('click',()=>openCaseEditor({invoice_id:state.currentChatInfo?.invoice_id||'',conversation_id:state.currentChat||'',product_name:state.currentChatInfo?.product_name||''}));
+    $('#chatReplacementBtn')?.addEventListener('click',()=>openReplacement(state.currentChatInfo?.invoice_id||'',state.currentChatInfo?.item_id||''));
+    $('#supplyRefresh')?.addEventListener('click',loadSupply);
+    $('#profitSyncBtn')?.addEventListener('click',syncProfitability);
+    $('#profitSettingsForm')?.addEventListener('submit',saveProfitSettings);
+    $('#supplierAddBtn')?.addEventListener('click',()=>openDialog($('#supplierDialog')));
+    $('#supplierForm')?.addEventListener('submit',saveSupplier);
+    $('#qualityRefresh')?.addEventListener('click',loadQuality);
+    $('#stockCostCurrency')?.addEventListener('change',e=>{if(['RUB','RUR'].includes(e.target.value))$('#stockFxRate').value='1';});
     $('#soldContentSearchBtn')?.addEventListener('click', searchSoldContent);
     $('#reindexSalesBtn')?.addEventListener('click', reindexSales);
     $('#inventoryRefresh')?.addEventListener('click', loadInventoryTools);
@@ -988,7 +1272,7 @@
     $('#salesRefresh').addEventListener('click', loadSales);
     $('#salesList').addEventListener('click', event => { const invoice = event.target.closest('[data-invoice]')?.dataset.invoice; if (invoice) { $('#invoiceInput').value = invoice; findOrder(invoice); } });
     $('#dashboardSales').addEventListener('click', event => { const invoice = event.target.closest('[data-invoice]')?.dataset.invoice; if (invoice) { switchSection('orders').then(() => { $('#invoiceInput').value = invoice; findOrder(invoice); }); } });
-    $('#orderResult').addEventListener('click', event => { if (event.target.closest('[data-save-order-note]')) saveOrderNote(); });
+    $('#orderResult').addEventListener('click', event => { if (event.target.closest('[data-save-order-note]')) saveOrderNote(); const card=event.target.closest('[data-order-id]')||$('#orderResult [data-order-id]'); if(event.target.closest('[data-order-replacement]')) openReplacement(card?.dataset.orderId,card?.dataset.offerId); if(event.target.closest('[data-order-diagnostic]')) openDiagnostic(card?.dataset.orderId,''); if(event.target.closest('[data-order-case]')) openCaseEditor({invoice_id:card?.dataset.orderId,product_name:state.currentOrder?.name||'',offer_id:card?.dataset.offerId}); const edit=event.target.closest('[data-edit-case]'); if(edit){const item=state.cases.find(x=>String(x.id)===String(edit.dataset.editCase))||state.currentOrder?.problem_case;openCaseEditor(item||{});} });
 
     $('#revenueForm').addEventListener('submit', calculateRevenue);
     $$('.finance-presets [data-period]').forEach(button => button.addEventListener('click', () => applyFinancePeriod(button.dataset.period)));
@@ -1005,7 +1289,7 @@
         toast('Карточка клиента сохранена'); await loadChats();
       } catch (error) { toast(error.message, true); }
     });
-    $('#customerOrders')?.addEventListener('click', event => { const id=event.target.closest('[data-open-order]')?.dataset.openOrder; if(id){ closeDialog($('#chatDialog')); switchSection('orders').then(()=>{ $('#invoiceInput').value=id; $('#orderForm').requestSubmit(); }); } });
+    $('#customerOrders')?.addEventListener('click', event => { const id=event.target.closest('[data-open-order]')?.dataset.openOrder; if(id){ closeDialog($('#chatDialog')); switchSection('orders').then(()=>{ $('#invoiceInput').value=id; findOrder(id); }); } });
     $('#chatsList').addEventListener('click', event => { const id = event.target.closest('[data-chat]')?.dataset.chat; if (id) openChat(id); });
     $('#chatReplyForm').addEventListener('submit', sendChatReply);
     $('#reviewsRefresh').addEventListener('click', loadReviews);
@@ -1014,8 +1298,10 @@
     $('#operationsRefresh').addEventListener('click', () => loadOperations(true));
     $('#exportOffersBtn').addEventListener('click', exportOffers);
     $('#globalSearchInput').addEventListener('input', event => { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(() => runGlobalSearch(event.target.value), 280); });
-    $('#globalSearchResults').addEventListener('click', event => { const node = event.target.closest('[data-search-type]'); if (node) handleNavigationItem(node.dataset.searchType, node.dataset.searchId, node.dataset.searchInvoice); });
-    document.addEventListener('keydown', event => { if (event.key === '/' && !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName)) { event.preventDefault(); openGlobalSearch(); } if (event.key === 'Escape') $$('.modal').forEach(closeDialog); });
+    $('#globalSearchDialog').addEventListener('click', event => { const example=event.target.closest('[data-search-example]'); if(example) applySearchExample(example.dataset.searchExample); });
+    $('#globalSearchClearBtn')?.addEventListener('click', () => { $('#globalSearchInput').value=''; $('#globalSearchMeta').innerHTML=''; $('#globalSearchResults').innerHTML='<div class="empty">Введите минимум 2 символа или выберите пример команды</div>'; $('#globalSearchInput').focus(); });
+    $('#globalSearchResults').addEventListener('click', event => { const node = event.target.closest('[data-search-type]'); if (node) handleNavigationItem(node.dataset.searchType, node.dataset.searchId, node.dataset.searchInvoice, node.dataset.searchQuery, node.dataset.searchOffer, node.dataset.searchConversation); });
+    document.addEventListener('keydown', event => { const typing=['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName); if ((event.key === '/' && !typing) || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k')) { event.preventDefault(); openGlobalSearch(); } if (event.key === 'Escape') $$('.modal').forEach(closeDialog); });
     $$('[data-close]').forEach(button => button.addEventListener('click', () => closeDialog(button.closest('dialog'))));
   }
 
@@ -1029,12 +1315,20 @@
     applyPreferences();
   
   document.addEventListener('click', async e=>{
-    const order=e.target.closest('[data-open-order]'); if(order?.dataset.openOrder){ switchSection('orders'); setTimeout(()=>openOrder(order.dataset.openOrder),150); }
+    const order=e.target.closest('[data-open-order]'); if(order?.dataset.openOrder){ switchSection('orders'); $('#invoiceInput').value=order.dataset.openOrder; setTimeout(()=>findOrder(order.dataset.openOrder),150); }
     const chat=e.target.closest('[data-open-chat]'); if(chat?.dataset.openChat){ switchSection('chats'); setTimeout(()=>openChat(chat.dataset.openChat),150); }
-    const offer=e.target.closest('[data-open-offer]'); if(offer?.dataset.openOffer){ switchSection('offers'); setTimeout(()=>openOffer(offer.dataset.openOffer),150); }
+    const offer=e.target.closest('[data-open-offer]'); if(offer?.dataset.openOffer){ switchSection('offers'); setTimeout(()=>showOffer(offer.dataset.openOffer),150); }
     const delTpl=e.target.closest('[data-delete-template]'); if(delTpl){ await api(`/app/api/templates/${delTpl.dataset.deleteTemplate}`,{method:'DELETE'}); renderTemplates((await api('/app/api/templates')).data); }
     const delRule=e.target.closest('[data-delete-rule]'); if(delRule){ await api(`/app/api/automations/${delRule.dataset.deleteRule}`,{method:'DELETE'}); renderRules((await api('/app/api/automations')).data); }
     const toggle=e.target.closest('[data-toggle-rule]'); if(toggle){ await api(`/app/api/automations/${toggle.dataset.toggleRule}`,{method:'PATCH',body:JSON.stringify({enabled:toggle.dataset.enabled==='1'})}); renderRules((await api('/app/api/automations')).data); }
+    const editCase=e.target.closest('[data-edit-case]'); if(editCase && !e.target.closest('#orderResult')){const item=state.cases.find(x=>String(x.id)===String(editCase.dataset.editCase));if(item)openCaseEditor(item);}
+    const useArticleBtn=e.target.closest('[data-use-article]'); if(useArticleBtn)useArticle(useArticleBtn.dataset.useArticle);
+    const pickArticle=e.target.closest('[data-pick-article]'); if(pickArticle)useArticle(pickArticle.dataset.pickArticle);
+    const deleteArticle=e.target.closest('[data-delete-article]'); if(deleteArticle && await confirmAction('Удалить инструкцию?')){await api(`/app/api/knowledge/${deleteArticle.dataset.deleteArticle}`,{method:'DELETE'});await loadKnowledge();}
+    const deleteSupplier=e.target.closest('[data-delete-supplier]'); if(deleteSupplier && await confirmAction('Удалить поставщика? Партии сохранятся.')){await api(`/app/api/suppliers/${deleteSupplier.dataset.deleteSupplier}`,{method:'DELETE'});await loadSupply();}
+    const resolveIncident=e.target.closest('[data-resolve-incident]'); if(resolveIncident){await api(`/app/api/incidents/${resolveIncident.dataset.resolveIncident}`,{method:'PATCH',body:JSON.stringify({status:'resolved'})});await loadQuality();}
+    if(e.target.closest('[data-use-diagnostic]')){const text=$('#diagnosticResponseText')?.value||'';if($('#chatDialog').open){$('#chatReplyText').value=text;closeDialog($('#diagnosticDialog'));toast('Решение вставлено в ответ');}else{navigator.clipboard?.writeText(text);toast('Решение скопировано');}}
+    if(e.target.closest('[data-diagnostic-replacement]')){closeDialog($('#diagnosticDialog'));openReplacement($('#diagnosticInvoice').value,state.currentOrder?.item_id||state.currentChatInfo?.item_id||'');}
   });
   bindEvents();
     if (!initData) {

@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light dark">
   <title>GGSEL Seller</title>
   <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
-  <link rel="stylesheet" href="{{ url_for('static', filename='miniapp.css', v='48') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='miniapp.css', v='80') }}">
 </head>
 <body>
   <div id="app" class="app-shell">
@@ -16,7 +16,7 @@
         <h1>GGSEL</h1>
       </div>
       <div class="topbar-actions">
-        <button id="globalSearchBtn" class="icon-button" aria-label="Поиск по кабинету">⌕</button>
+        <button id="globalSearchBtn" class="icon-button" aria-label="Расширенный поиск по кабинету">⌕</button>
         <button id="attentionBtn" class="icon-button notification-button" aria-label="Что требует внимания">♢<span id="attentionBadge" class="notification-badge hidden">0</span></button>
         <button id="globalRefresh" class="icon-button" aria-label="Обновить">↻</button>
       </div>
@@ -231,10 +231,14 @@
           <button class="more-card" data-goto="operations"><span>↻</span><b>Операции</b><small>Фоновые задачи</small></button>
           <button class="more-card" data-goto="audit"><span>☰</span><b>История</b><small>Журнал действий</small></button>
           <button id="exportOffersBtn" class="more-card"><span>⇩</span><b>Экспорт</b><small>Товары в JSON</small></button>
-          <button id="globalSearchMoreBtn" class="more-card"><span>⌕</span><b>Общий поиск</b><small>По всему кабинету</small></button>
+          <button id="globalSearchMoreBtn" class="more-card"><span>⌕</span><b>Расширенный поиск</b><small>Фильтры, ключи и вся CRM</small></button>
           <button class="more-card" data-goto="workspace"><span>⚙</span><b>Автоматизация</b><small>Правила, SLA и шаблоны</small></button>
           <button class="more-card" data-goto="inventory"><span>⌁</span><b>История ключей</b><small>Поиск проданного содержимого</small></button>
           <button class="more-card" data-goto="health"><span>✚</span><b>Система</b><small>Ошибки и резервные копии</small></button>
+          <button class="more-card" data-goto="cases"><span>⚑</span><b>Проблемные заказы</b><small>Диагностика и замены</small></button>
+          <button class="more-card" data-goto="supply"><span>◫</span><b>Закупки и прибыль</b><small>Партии и поставщики</small></button>
+          <button class="more-card" data-goto="knowledge"><span>◎</span><b>База знаний</b><small>Инструкции поддержки</small></button>
+          <button class="more-card" data-goto="quality"><span>◇</span><b>Качество</b><small>Товары, поставщики и сбои</small></button>
         </div>
         <div class="panel preferences-panel">
           <div class="panel-heading"><h3>Интерфейс</h3></div>
@@ -267,6 +271,35 @@
         <div class="panel"><div class="panel-heading"><h3>Ошибки API</h3><button id="errorsRefresh" class="secondary-button">Обновить</button></div><div id="errorsList" class="list"></div></div>
         <div class="panel"><div class="panel-heading"><h3>Ежедневный отчёт</h3></div><label class="switch-row"><span>Утренний отчёт</span><input id="morningReportToggle" type="checkbox"></label><label class="switch-row"><span>Вечерний отчёт</span><input id="eveningReportToggle" type="checkbox"></label><button id="reportSettingsSave" class="primary-button full">Сохранить</button><p class="muted">Для доставки по расписанию добавьте Railway Cron на /cron/daily-report?secret=CRON_SECRET.</p></div>
       </section>
+
+      <section id="section-cases" class="section">
+        <div class="section-heading"><div><span class="kicker">Поддержка</span><h2>Проблемные заказы</h2></div><button id="caseCreateBtn" class="primary-button compact">＋ Создать</button></div>
+        <div id="caseMetrics" class="metric-grid compact-metrics"></div>
+        <div class="toolbar"><label class="search-field"><span>⌕</span><input id="caseSearch" type="search" placeholder="Заказ, товар, ошибка или комментарий"></label><button id="casesRefresh" class="icon-button">↻</button></div>
+        <div id="caseFilters" class="chips"><button class="chip active" data-case-status="all">Все</button><button class="chip" data-case-status="new">Новые</button><button class="chip" data-case-status="diagnosis">Диагностика</button><button class="chip" data-case-status="waiting">Ждём клиента</button><button class="chip" data-case-status="replacement">Замена</button><button class="chip" data-case-status="resolved">Решено</button></div>
+        <div id="casesList" class="card-list"><div class="empty">Загрузка…</div></div>
+      </section>
+
+      <section id="section-supply" class="section">
+        <div class="section-heading"><div><span class="kicker">Экономика</span><h2>Закупки и прибыль</h2></div><button id="supplyRefresh" class="icon-button">↻</button></div>
+        <div id="profitMetrics" class="metric-grid"></div>
+        <div class="panel"><div class="panel-heading"><div><h3>Расчёт прибыли</h3><span id="profitCoverage" class="muted"></span></div><button id="profitSyncBtn" class="secondary-button small" type="button">Обновить 20 заказов</button></div><form id="profitSettingsForm" class="form-stack"><div class="three-cols"><label>Валюта начислений<select id="settlementCurrency"><option>USD</option><option>RUB</option><option>EUR</option></select></label><label>Курс к ₽<input id="settlementRate" type="number" min="0" step="0.0001"></label><label>Целевая маржа, %<input id="targetMargin" type="number" min="0" step="0.1"></label></div><button class="secondary-button" type="submit">Сохранить настройки</button></form><div id="profitOrders" class="list"></div></div>
+        <div class="panel"><div class="panel-heading"><h3>Поставщики</h3><button id="supplierAddBtn" class="primary-button small">＋ Поставщик</button></div><div id="suppliersList" class="list"></div></div>
+        <div class="panel"><div class="panel-heading"><h3>Партии содержимого</h3><span class="muted">создаются при пополнении</span></div><div id="batchesList" class="list"></div></div>
+      </section>
+
+      <section id="section-knowledge" class="section">
+        <div class="section-heading"><div><span class="kicker">Поддержка</span><h2>База знаний</h2></div><button id="knowledgeAddBtn" class="primary-button compact">＋ Инструкция</button></div>
+        <label class="search-field"><span>⌕</span><input id="knowledgeSearch" type="search" placeholder="Ошибка, продукт или тема"></label>
+        <div id="knowledgeList" class="card-list"><div class="empty">Загрузка…</div></div>
+      </section>
+
+      <section id="section-quality" class="section">
+        <div class="section-heading"><div><span class="kicker">Контроль</span><h2>Качество</h2></div><button id="qualityRefresh" class="icon-button">↻</button></div>
+        <div class="panel"><div class="panel-heading"><h3>Массовые проблемы</h3><span class="muted">одинаковые сигналы за короткий период</span></div><div id="incidentsList" class="list"></div></div>
+        <div class="panel"><div class="panel-heading"><h3>Надёжность товаров</h3></div><div id="productQualityList" class="list"></div></div>
+        <div class="panel"><div class="panel-heading"><h3>Качество поставщиков</h3></div><div id="supplierQualityList" class="list"></div></div>
+      </section>
       <section id="section-audit" class="section">
         <div class="section-heading"><div><span class="kicker">Безопасность</span><h2>История действий</h2></div><button id="auditRefresh" class="icon-button">↻</button></div>
         <div id="auditList" class="list"><div class="empty">Загрузка…</div></div>
@@ -287,6 +320,15 @@
     <textarea id="stockValues" rows="10" placeholder="Каждый ключ или строка — с новой строки"></textarea>
     <div class="file-row"><label class="secondary-button file-button">Загрузить TXT<input id="stockFile" type="file" accept=".txt,text/plain"></label><span id="stockCount" class="muted">0 строк</span></div>
     <div id="stockWarnings" class="notice hidden"></div>
+    <details class="batch-details">
+      <summary>Закупка и себестоимость <span class="muted">необязательно</span></summary>
+      <div class="form-stack batch-form">
+        <label>Поставщик<input id="stockSupplier" list="supplierNames" placeholder="Например, Поставщик A"><datalist id="supplierNames"></datalist></label>
+        <div class="three-cols"><label>Цена за 1 шт.<input id="stockUnitCost" type="number" min="0" step="0.0001" placeholder="0"></label><label>Валюта<select id="stockCostCurrency"><option>RUB</option><option>CNY</option><option>USD</option><option>EUR</option></select></label><label>Курс к ₽<input id="stockFxRate" type="number" min="0" step="0.0001" value="1"></label></div>
+        <div class="two-cols"><label>Дата закупки<input id="stockPurchasedAt" type="date"></label><label>Гарантия, дней<input id="stockWarrantyDays" type="number" min="0" value="7"></label></div>
+        <label>Комментарий<input id="stockBatchNotes" placeholder="Номер партии, условия гарантии"></label>
+      </div>
+    </details>
     <label class="switch-row"><span>Сразу включить продажу после загрузки</span><input id="stockAutoActivate" type="checkbox"></label>
     <button id="stockSubmit" class="primary-button full">Добавить содержимое</button>
   </dialog>
@@ -328,6 +370,12 @@
     <div class="crm-chat-layout">
       <section class="crm-thread">
         <div id="chatMessages" class="messages"></div>
+        <div class="chat-tools">
+          <button id="chatKnowledgeBtn" class="secondary-button small" type="button">◎ Инструкция</button>
+          <button id="chatDiagnosticBtn" class="secondary-button small" type="button">⌁ Диагностика</button>
+          <button id="chatCaseBtn" class="secondary-button small" type="button">⚑ Проблема</button>
+          <button id="chatReplacementBtn" class="danger-button small" type="button">↺ Замена</button>
+        </div>
         <form id="chatReplyForm" class="reply-form"><textarea id="chatReplyText" rows="3" placeholder="Ответ покупателю"></textarea><button class="primary-button" type="submit">Отправить</button></form>
       </section>
       <aside class="customer-panel">
@@ -345,9 +393,39 @@
   </dialog>
 
   <dialog id="globalSearchDialog" class="modal large-modal search-modal">
-    <div class="modal-header"><div><span class="kicker">Навигация</span><h2>Поиск по кабинету</h2></div><button class="close-button" data-close>×</button></div>
-    <label class="search-field global-search-field"><span>⌕</span><input id="globalSearchInput" type="search" placeholder="Название товара, заказ, email или текст чата"></label>
-    <div id="globalSearchResults" class="search-results"><div class="empty">Введите минимум 2 символа</div></div>
+    <div class="modal-header"><div><span class="kicker">Навигация и фильтры</span><h2>Расширенный поиск</h2></div><button class="close-button" data-close>×</button></div>
+    <div class="global-search-row">
+      <label class="search-field global-search-field"><span>⌕</span><input id="globalSearchInput" type="search" autocomplete="off" placeholder='Например: товар:"Office 2021" остаток:<5'></label>
+      <button id="globalSearchClearBtn" class="icon-button" type="button" aria-label="Очистить поиск">×</button>
+    </div>
+    <div class="search-command-help">
+      <span class="search-example-label">Примеры:</span>
+      <button type="button" class="search-example" data-search-example='статус:проблемный ошибка:0xc004f050'>Проблемы по ошибке</button>
+      <button type="button" class="search-example" data-search-example='товар:"Office 2021" остаток:<5'>Товар и остаток</button>
+      <button type="button" class="search-example" data-search-example='поставщик:Китай после:2026-07-01'>Поставщик и дата</button>
+      <button type="button" class="search-example" data-search-example='тип:заказ прибыль:<100'>Заказы с низкой прибылью</button>
+    </div>
+    <div id="globalSearchRecent" class="search-command-help"></div>
+    <details class="search-syntax">
+      <summary>Команды поиска</summary>
+      <div class="search-syntax-grid">
+        <code>тип:заказ</code><span>ограничить раздел</span>
+        <code>товар:Office</code><span>название или ID товара</span>
+        <code>заказ:12345</code><span>номер заказа</span>
+        <code>клиент:mail@example.com</code><span>email или аккаунт</span>
+        <code>ключ:XXXXX-...</code><span>точный защищённый поиск содержимого</span>
+        <code>поставщик:Китай</code><span>поставщик или партия</span>
+        <code>статус:проблемный</code><span>статус товара, обращения или ключа</span>
+        <code>ошибка:0xc004f050</code><span>код ошибки в чатах и обращениях</span>
+        <code>остаток:&lt;5</code><span>числовые условия: &lt;, &lt;=, &gt;, &gt;=, =</span>
+        <code>прибыль:&lt;100</code><span>прибыль заказа</span>
+        <code>после:2026-07-01</code><span>нижняя граница даты</span>
+        <code>до:2026-07-31</code><span>верхняя граница даты</span>
+      </div>
+      <p class="muted">Значения с пробелами заключайте в кавычки. Несколько слов и фильтров работают одновременно.</p>
+    </details>
+    <div id="globalSearchMeta" class="global-search-meta"></div>
+    <div id="globalSearchResults" class="search-results"><div class="empty">Введите минимум 2 символа или выберите пример команды</div></div>
   </dialog>
 
   <dialog id="attentionDialog" class="modal large-modal">
@@ -359,6 +437,38 @@
   <dialog id="templateDialog" class="modal"><div class="modal-header"><div><span class="kicker">Поддержка</span><h2>Новый шаблон</h2></div><button class="close-button" data-close>×</button></div><form id="templateForm" class="form-stack"><label>Категория<input id="templateCategory" value="Общие"></label><label>Название<input id="templateName" required></label><label>Текст<textarea id="templateBody" rows="8" placeholder="Здравствуйте! Заказ №{order_id}"></textarea></label><button class="primary-button">Сохранить</button></form></dialog>
   <dialog id="ruleDialog" class="modal"><div class="modal-header"><div><span class="kicker">Автопилот</span><h2>Новое правило</h2></div><button class="close-button" data-close>×</button></div><form id="ruleForm" class="form-stack"><label>Название<input id="ruleName" required></label><label>Триггер<select id="ruleTrigger"><option value="message">Новое сообщение</option><option value="stock">Изменение остатка</option></select></label><label>Текст содержит<input id="ruleContains" placeholder="не работает"></label><label>Действие<select id="ruleAction"><option value="notify">Уведомить меня</option><option value="label_chat">Поставить метку чату</option></select></label><label>Текст/метка<input id="ruleActionValue" placeholder="replacement"></label><button class="primary-button">Сохранить</button></form></dialog>
 
+
+  <dialog id="replacementDialog" class="modal">
+    <div class="modal-header"><div><span class="kicker">Безопасная выдача</span><h2>Замена содержимого</h2></div><button class="close-button" data-close>×</button></div>
+    <div id="replacementPreview"><div class="empty">Загрузка…</div></div>
+    <label>Причина<textarea id="replacementReason" rows="3" placeholder="Например: ключ заблокирован после проверки редакции"></textarea></label>
+    <button id="replacementConfirm" class="danger-button full">Подтвердить и отправить покупателю</button>
+  </dialog>
+
+  <dialog id="caseDialog" class="modal">
+    <div class="modal-header"><div><span class="kicker">Очередь поддержки</span><h2>Проблемный заказ</h2></div><button class="close-button" data-close>×</button></div>
+    <form id="caseForm" class="form-stack"><input id="caseId" type="hidden"><label>Номер заказа<input id="caseInvoice"></label><label>Товар<input id="caseProduct"></label><div class="two-cols"><label>Статус<select id="caseStatus"><option value="new">Новый</option><option value="diagnosis">Диагностика</option><option value="waiting">Ждём клиента</option><option value="replacement">Замена</option><option value="resolved">Решено</option><option value="closed">Закрыто</option></select></label><label>Приоритет<select id="casePriority"><option value="low">Низкий</option><option value="normal">Обычный</option><option value="high">Высокий</option><option value="critical">Критичный</option></select></label></div><div class="two-cols"><label>Категория<select id="caseCategory"><option value="activation">Активация</option><option value="installation">Установка</option><option value="not_received">Не получен товар</option><option value="refund">Возврат</option><option value="complaint">Жалоба</option><option value="other">Другое</option></select></label><label>Код ошибки<input id="caseError" placeholder="0xc004f050"></label></div><label>Причина<textarea id="caseReason" rows="3"></textarea></label><label>Внутренняя заметка<textarea id="caseNote" rows="3"></textarea></label><button class="primary-button">Сохранить</button></form>
+  </dialog>
+
+  <dialog id="diagnosticDialog" class="modal large-modal">
+    <div class="modal-header"><div><span class="kicker">Мастер</span><h2>Диагностика</h2></div><button class="close-button" data-close>×</button></div>
+    <form id="diagnosticForm" class="form-stack"><input id="diagnosticInvoice" type="hidden"><input id="diagnosticConversation" type="hidden"><label>Продукт<select id="diagnosticFamily"><option value="windows">Windows</option><option value="office">Office</option><option value="mac">macOS / Office Mac</option><option value="other">Другое</option></select></label><div class="two-cols"><label>Установленная редакция/версия<input id="diagnosticInstalled" placeholder="Windows 11 Home"></label><label>Купленная редакция/версия<input id="diagnosticPurchased" placeholder="Windows 11 Pro"></label></div><label>Код ошибки<input id="diagnosticError" placeholder="0xc004f050"></label><label>Описание ситуации<textarea id="diagnosticDescription" rows="4"></textarea></label><button class="primary-button">Получить решение</button></form>
+    <div id="diagnosticResult"></div>
+  </dialog>
+
+  <dialog id="knowledgeDialog" class="modal">
+    <div class="modal-header"><div><span class="kicker">База знаний</span><h2>Инструкция</h2></div><button class="close-button" data-close>×</button></div>
+    <form id="knowledgeForm" class="form-stack"><label>Категория<input id="knowledgeCategory" value="Общие"></label><label>Название<input id="knowledgeTitle" required></label><label>Для продукта<input id="knowledgeProductPattern" placeholder="windows или office"></label><label>Коды ошибок через запятую<input id="knowledgeErrors" placeholder="0xc004f050, 0x803fa067"></label><label>Текст<textarea id="knowledgeBody" rows="10" required></textarea></label><button class="primary-button">Сохранить</button></form>
+  </dialog>
+
+  <dialog id="knowledgePickerDialog" class="modal large-modal">
+    <div class="modal-header"><div><span class="kicker">Быстрый ответ</span><h2>Выбрать инструкцию</h2></div><button class="close-button" data-close>×</button></div><label class="search-field"><span>⌕</span><input id="knowledgePickerSearch" type="search" placeholder="Ошибка или тема"></label><div id="knowledgePickerList" class="list"></div>
+  </dialog>
+
+  <dialog id="supplierDialog" class="modal">
+    <div class="modal-header"><div><span class="kicker">Закупки</span><h2>Поставщик</h2></div><button class="close-button" data-close>×</button></div><form id="supplierForm" class="form-stack"><label>Название<input id="supplierName" required></label><label>Контакты<input id="supplierContact"></label><label>Валюта<select id="supplierCurrency"><option>RUB</option><option>CNY</option><option>USD</option><option>EUR</option></select></label><label>Заметка<textarea id="supplierNotes" rows="4"></textarea></label><button class="primary-button">Сохранить</button></form>
+  </dialog>
+
   <nav class="bottom-nav" aria-label="Основная навигация">
     <button class="tab active" data-section="dashboard"><span>⌂</span><small>Обзор</small></button>
     <button class="tab" data-section="offers"><span>▦</span><small>Товары</small></button>
@@ -368,6 +478,6 @@
   </nav>
 
   <div id="toast" class="toast hidden"></div>
-  <script src="{{ url_for('static', filename='miniapp.js', v='60') }}" defer></script>
+  <script src="{{ url_for('static', filename='miniapp.js', v='80') }}" defer></script>
 </body>
 </html>

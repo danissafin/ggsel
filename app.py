@@ -61,6 +61,9 @@ CONTENT_SEARCH_SECRET = os.environ.get("CONTENT_SEARCH_SECRET", BOT_TOKEN).strip
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "/data/backups").strip()
 SLA_WARNING_MINUTES = max(1, int(os.environ.get("SLA_WARNING_MINUTES", "30")))
 SLA_CRITICAL_MINUTES = max(SLA_WARNING_MINUTES, int(os.environ.get("SLA_CRITICAL_MINUTES", "60")))
+SETTLEMENT_TO_RUB_RATE = max(0.0, float(os.environ.get("SETTLEMENT_TO_RUB_RATE", "0") or 0))
+ISSUE_WINDOW_MINUTES = max(15, int(os.environ.get("ISSUE_WINDOW_MINUTES", "120")))
+ISSUE_ALERT_THRESHOLD = max(2, int(os.environ.get("ISSUE_ALERT_THRESHOLD", "3")))
 
 if not BOT_TOKEN or not OWNER_ID:
     raise RuntimeError("BOT_TOKEN and OWNER_ID (or CHAT_ID) must be set")
@@ -111,6 +114,16 @@ def as_float(value: Any, default: float = 0.0) -> float:
         return float(str(value).replace(",", "."))
     except (TypeError, ValueError):
         return default
+
+
+def get_any(obj: Any, keys: Iterable[str], default: Any = None) -> Any:
+    if not isinstance(obj, dict):
+        return default
+    for key in keys:
+        value = obj.get(key)
+        if value not in (None, ""):
+            return value
+    return default
 
 
 def compact_json(value: Any, limit: int = 3500) -> str:
@@ -3025,6 +3038,19 @@ def process_ggsel_event(data: dict[str, Any]) -> None:
             logger.exception("Unable to send photo")
             send_text(caption + f"\n\nСсылка: {safe(image_url)}")
 
+    try:
+        run_v7_message_intelligence(
+            invoice_id=invoice_id,
+            conversation_id=conversation_id,
+            debate_id=debate_id,
+            offer_id=str(order.get("item_id") or ""),
+            product_name=str(order.get("name") or ""),
+            message_text=message_text,
+            message_date=message_date,
+        )
+    except Exception:
+        logger.exception("Unable to process v7 message intelligence")
+
 
 # ============================================================
 # Mini App routes
@@ -3426,74 +3452,640 @@ def _message_payload(data: Any, debate_id: str) -> list[dict[str, Any]]:
     return combined
 
 
-def global_search_payload(query: str) -> dict[str, list[dict[str, Any]]]:
+ADVANCED_SEARCH_COMMANDS = {
+    "type": ("тип", "type", "раздел"),
+    "product": ("товар", "product", "offer", "оффер"),
+    "order": ("заказ", "order", "invoice"),
+    "client": ("клиент", "client", "buyer", "email"),
+    "chat": ("чат", "chat", "диалог"),
+    "key": ("ключ", "key", "content", "содержимое"),
+    "supplier": ("поставщик", "supplier"),
+    "batch": ("партия", "batch"),
+    "status": ("статус", "status"),
+    "tag": ("метка", "тег", "tag", "label"),
+    "note": ("заметка", "note", "comment", "комментарий"),
+    "error": ("ошибка", "error", "code"),
+    "category": ("категория", "category"),
+    "priority": ("приоритет", "priority"),
+    "stock": ("остаток", "stock", "quantity"),
+    "price": ("цена", "price"),
+    "amount": ("сумма", "amount"),
+    "profit": ("прибыль", "profit"),
+    "after": ("после", "after", "from"),
+    "before": ("до", "before", "to"),
+}
+_ADVANCED_SEARCH_ALIAS_MAP = {
+    alias.casefold(): canonical
+    for canonical, aliases in ADVANCED_SEARCH_COMMANDS.items()
+    for alias in aliases
+}
+_ADVANCED_SEARCH_TYPE_MAP = {
+    "товар": "offers", "товары": "offers", "offer": "offers", "offers": "offers", "product": "offers",
+    "заказ": "orders", "заказы": "orders", "order": "orders", "orders": "orders",
+    "клиент": "chats", "клиенты": "chats", "чат": "chats", "чаты": "chats", "chat": "chats", "customer": "chats",
+    "ключ": "inventory", "ключи": "inventory", "склад": "inventory", "inventory": "inventory", "content": "inventory",
+    "поставщик": "suppliers", "поставщики": "suppliers", "supplier": "suppliers", "suppliers": "suppliers",
+    "партия": "batches", "партии": "batches", "batch": "batches", "batches": "batches",
+    "проблема": "cases", "проблемы": "cases", "обращение": "cases", "case": "cases", "cases": "cases",
+    "инструкция": "knowledge", "инструкции": "knowledge", "knowledge": "knowledge", "article": "knowledge",
+    "ошибка": "errors", "ошибки": "errors", "error": "errors", "errors": "errors",
+    "заметка": "notes", "заметки": "notes", "note": "notes", "notes": "notes",
+}
+_ADVANCED_STATUS_ALIASES = {
+    "активен": "active", "активный": "active", "active": "active",
+    "пауза": "paused", "приостановлен": "paused", "paused": "paused",
+    "архив": "archived", "архивный": "archived", "archived": "archived",
+    "низкий": "low_stock", "заканчивается": "low_stock", "low": "low_stock", "low_stock": "low_stock",
+    "нет": "out_of_stock", "нулевой": "out_of_stock", "out": "out_of_stock", "out_of_stock": "out_of_stock",
+    "избранное": "favorite", "избранный": "favorite", "favorite": "favorite",
+    "проблемный": "problem", "проблемные": "problem", "problem": "problem", "open": "problem",
+    "новый": "new", "new": "new",
+    "диагностика": "diagnosis", "diagnosis": "diagnosis",
+    "ожидание": "waiting", "ждём": "waiting", "waiting": "waiting",
+    "замена": "replacement", "replacement": "replacement",
+    "решено": "resolved", "resolved": "resolved",
+    "закрыто": "closed", "closed": "closed",
+    "на_складе": "in_stock", "склад": "in_stock", "in_stock": "in_stock",
+    "продано": "sold", "sold": "sold",
+    "заменено": "replaced", "replaced": "replaced",
+}
+
+
+def _advanced_search_tokens(query: str) -> list[str]:
+    """Split a search query while preserving values wrapped in double quotes."""
+    return re.findall(r'(?:[^\s"]|"(?:\\.|[^"])*")+', str(query or ""))
+
+
+def parse_advanced_search(query: str) -> dict[str, Any]:
+    filters: dict[str, list[str]] = {}
+    terms: list[str] = []
+    unknown: list[str] = []
+    for token in _advanced_search_tokens(query):
+        if ":" not in token:
+            clean = token.strip().strip('"').strip()
+            if clean:
+                terms.append(clean)
+            continue
+        prefix, raw_value = token.split(":", 1)
+        canonical = _ADVANCED_SEARCH_ALIAS_MAP.get(prefix.casefold().strip())
+        if not canonical:
+            unknown.append(prefix.strip())
+            terms.append(token.strip().strip('"'))
+            continue
+        value = raw_value.strip()
+        if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+            value = value[1:-1].replace('\\"', '"')
+        if value:
+            filters.setdefault(canonical, []).append(value.strip())
+    requested_types: set[str] = set()
+    for value in filters.get("type", []):
+        for piece in re.split(r"[,|]", value):
+            mapped = _ADVANCED_SEARCH_TYPE_MAP.get(piece.casefold().strip())
+            if mapped:
+                requested_types.add(mapped)
+    return {
+        "raw": str(query or "").strip(),
+        "terms": terms,
+        "filters": filters,
+        "types": requested_types,
+        "unknown": list(dict.fromkeys(unknown)),
+    }
+
+
+def _filter_values(parsed: dict[str, Any], name: str) -> list[str]:
+    return [str(value).strip() for value in parsed.get("filters", {}).get(name, []) if str(value).strip()]
+
+
+def _all_text_matches(haystack: Any, values: Iterable[str]) -> bool:
+    folded = str(haystack or "").casefold()
+    return all(str(value).casefold() in folded for value in values if str(value).strip())
+
+
+def _search_score(haystack: Any, terms: Iterable[str], title: str = "") -> int:
+    folded = str(haystack or "").casefold()
+    title_folded = str(title or "").casefold()
+    score = 0
+    for term in terms:
+        needle = str(term).casefold().strip()
+        if not needle:
+            continue
+        if needle == title_folded:
+            score += 80
+        elif title_folded.startswith(needle):
+            score += 45
+        elif needle in title_folded:
+            score += 30
+        elif needle in folded:
+            score += 12
+    return score
+
+
+def _parse_number_condition(value: str) -> Optional[tuple[str, float]]:
+    match = re.fullmatch(r"\s*(<=|>=|<|>|=)?\s*(-?\d+(?:[.,]\d+)?)\s*", str(value or ""))
+    if not match:
+        return None
+    return match.group(1) or "=", as_float(match.group(2))
+
+
+def _number_matches(value: Any, conditions: Iterable[str]) -> bool:
+    number = as_float(value)
+    for raw in conditions:
+        parsed = _parse_number_condition(raw)
+        if not parsed:
+            return False
+        operator, target = parsed
+        if operator == "<" and not number < target: return False
+        if operator == "<=" and not number <= target: return False
+        if operator == ">" and not number > target: return False
+        if operator == ">=" and not number >= target: return False
+        if operator == "=" and not abs(number - target) < 1e-9: return False
+    return True
+
+
+def _normalize_search_date(value: str) -> Optional[datetime]:
+    text = str(value or "").strip()
+    for pattern in ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text, pattern).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return parse_iso_datetime(text)
+
+
+def _date_matches(value: Any, after_values: Iterable[str], before_values: Iterable[str]) -> bool:
+    date_value = parse_iso_datetime(value)
+    if date_value is None:
+        return not list(after_values) and not list(before_values)
+    for raw in after_values:
+        boundary = _normalize_search_date(raw)
+        if boundary and date_value < boundary:
+            return False
+    for raw in before_values:
+        boundary = _normalize_search_date(raw)
+        if boundary:
+            end_of_day = boundary + timedelta(days=1) - timedelta(microseconds=1)
+            if date_value > end_of_day:
+                return False
+    return True
+
+
+def _status_values(parsed: dict[str, Any]) -> list[str]:
+    result: list[str] = []
+    for value in _filter_values(parsed, "status"):
+        for piece in re.split(r"[,|]", value):
+            clean = piece.casefold().strip()
+            result.append(_ADVANCED_STATUS_ALIASES.get(clean, clean))
+    return list(dict.fromkeys(result))
+
+
+def _type_allowed(parsed: dict[str, Any], result_type: str) -> bool:
+    requested = parsed.get("types") or set()
+    return not requested or result_type in requested
+
+
+def _append_search_result(groups: dict[str, list[dict[str, Any]]], group: str, item: dict[str, Any], limit: int) -> None:
+    bucket = groups.setdefault(group, [])
+    if len(bucket) < limit:
+        bucket.append(item)
+
+
+def global_search_payload(query: str, limit: int = 12) -> dict[str, Any]:
     clean = str(query or "").strip()
+    parsed = parse_advanced_search(clean)
     if len(clean) < 2:
-        return {"offers": [], "orders": [], "chats": []}
-    folded = clean.casefold()
-
-    offers: list[dict[str, Any]] = []
-    try:
-        for item in enrich_offer_settings(collect_all_offers()):
-            haystack = " ".join(str(item.get(key) or "") for key in ("id", "title", "category")).casefold()
-            if folded in haystack:
-                offers.append({
-                    "type": "offer",
-                    "id": str(item.get("id") or ""),
-                    "title": str(item.get("title") or "Товар"),
-                    "subtitle": f"ID {item.get('id') or '—'} · остаток {as_int(item.get('quantity'))}",
-                    "status": item.get("status"),
-                    "favorite": bool(item.get("favorite")),
-                })
-            if len(offers) >= 10:
-                break
-    except Exception as exc:
-        logger.warning("Global offer search failed: %s", exc)
-
-    like = f"%{clean}%"
-    with db_connect() as conn:
-        order_rows = conn.execute(
-            """
-            SELECT invoice_id, item_id, product_name, buyer_email, amount, currency, purchase_date
-            FROM orders
-            WHERE invoice_id LIKE ? OR item_id LIKE ? OR product_name LIKE ? OR buyer_email LIKE ?
-            ORDER BY updated_at DESC LIMIT 10
-            """,
-            (like, like, like, like),
-        ).fetchall()
-    orders = [
-        {
-            "type": "order",
-            "id": str(row["invoice_id"]),
-            "title": str(row["product_name"] or f"Заказ #{row['invoice_id']}"),
-            "subtitle": f"#{row['invoice_id']} · {row['buyer_email'] or 'без email'}",
-            "amount": as_float(row["amount"]),
-            "currency": str(row["currency"] or "RUB"),
-            "date": row["purchase_date"],
+        return {
+            "offers": [], "orders": [], "chats": [], "inventory": [], "suppliers": [],
+            "batches": [], "cases": [], "knowledge": [], "errors": [], "notes": [],
+            "meta": {"query": clean, "terms": [], "filters": {}, "total": 0, "unknown": []},
         }
-        for row in order_rows
+
+    limit = max(3, min(as_int(limit, 12), 30))
+    groups: dict[str, list[dict[str, Any]]] = {
+        "offers": [], "orders": [], "chats": [], "inventory": [], "suppliers": [],
+        "batches": [], "cases": [], "knowledge": [], "errors": [], "notes": [],
+    }
+    terms = parsed["terms"]
+    product_filters = _filter_values(parsed, "product")
+    order_filters = _filter_values(parsed, "order")
+    client_filters = _filter_values(parsed, "client") + _filter_values(parsed, "chat")
+    key_filters = _filter_values(parsed, "key")
+    supplier_filters = _filter_values(parsed, "supplier")
+    batch_filters = _filter_values(parsed, "batch")
+    tag_filters = _filter_values(parsed, "tag")
+    note_filters = _filter_values(parsed, "note")
+    error_filters = [x.casefold() for x in _filter_values(parsed, "error")]
+    category_filters = _filter_values(parsed, "category")
+    priority_filters = [x.casefold() for x in _filter_values(parsed, "priority")]
+    stock_filters = _filter_values(parsed, "stock")
+    price_filters = _filter_values(parsed, "price")
+    amount_filters = _filter_values(parsed, "amount")
+    profit_filters = _filter_values(parsed, "profit")
+    after_filters = _filter_values(parsed, "after")
+    before_filters = _filter_values(parsed, "before")
+    statuses = _status_values(parsed)
+    warnings: list[str] = []
+
+    # Read local data once. This keeps the search deterministic and avoids an N+1 query per result.
+    with db_connect() as conn:
+        order_rows = [dict(row) for row in conn.execute("SELECT * FROM orders ORDER BY updated_at DESC LIMIT 3000").fetchall()]
+        conversation_rows = [dict(row) for row in conn.execute(
+            """SELECT c.*,COALESCE(p.note,'') profile_note,COALESCE(p.tags_json,'[]') tags_json,
+               COALESCE(p.pinned,0) pinned,COALESCE(p.favorite,0) favorite
+               FROM conversations c LEFT JOIN customer_profiles p ON p.conversation_id=c.conversation_id
+               ORDER BY COALESCE(c.last_message_at,c.updated_at) DESC LIMIT 1500"""
+        ).fetchall()]
+        message_rows = [dict(row) for row in conn.execute(
+            "SELECT conversation_id,debate_id,invoice_id,buyer_email,sender,message_text,message_date,id FROM messages ORDER BY id DESC LIMIT 10000"
+        ).fetchall()]
+        inventory_rows = [dict(row) for row in conn.execute(
+            """SELECT l.*,COALESCE(s.name,b.supplier_name,'') supplier_name,
+               COALESCE(b.notes,'') batch_notes,b.purchased_at,b.warranty_until
+               FROM inventory_ledger l
+               LEFT JOIN inventory_batches b ON b.id=l.batch_id
+               LEFT JOIN suppliers s ON s.id=COALESCE(l.supplier_id,b.supplier_id)
+               ORDER BY l.id DESC LIMIT 5000"""
+        ).fetchall()]
+        supplier_rows = [dict(row) for row in conn.execute(
+            """SELECT s.*,
+               (SELECT COUNT(*) FROM inventory_batches b WHERE b.supplier_id=s.id) batch_count,
+               (SELECT COUNT(*) FROM inventory_ledger l WHERE l.supplier_id=s.id) item_count
+               FROM suppliers s ORDER BY s.updated_at DESC LIMIT 1000"""
+        ).fetchall()]
+        batch_rows = [dict(row) for row in conn.execute(
+            """SELECT b.*,COALESCE(s.name,b.supplier_name,'') supplier_display,
+               (SELECT COUNT(*) FROM inventory_ledger l WHERE l.batch_id=b.id) ledger_count,
+               (SELECT COUNT(*) FROM inventory_ledger l WHERE l.batch_id=b.id AND l.status='in_stock') in_stock,
+               (SELECT COUNT(*) FROM inventory_ledger l WHERE l.batch_id=b.id AND l.status='sold') sold,
+               (SELECT COUNT(*) FROM inventory_ledger l WHERE l.batch_id=b.id AND l.status='replaced') replaced
+               FROM inventory_batches b LEFT JOIN suppliers s ON s.id=b.supplier_id ORDER BY b.id DESC LIMIT 1500"""
+        ).fetchall()]
+        case_rows = [dict(row) for row in conn.execute("SELECT * FROM problem_cases ORDER BY updated_at DESC LIMIT 3000").fetchall()]
+        knowledge_rows = [dict(row) for row in conn.execute("SELECT * FROM knowledge_articles ORDER BY updated_at DESC LIMIT 1500").fetchall()]
+        error_rows = [dict(row) for row in conn.execute("SELECT * FROM api_errors ORDER BY id DESC LIMIT 2000").fetchall()]
+        order_note_rows = [dict(row) for row in conn.execute("SELECT * FROM order_notes ORDER BY updated_at DESC LIMIT 2000").fetchall()]
+        profile_note_rows = [dict(row) for row in conn.execute(
+            """SELECT p.*,c.buyer_email,c.buyer_account,c.latest_invoice_id,c.product_name
+               FROM customer_profiles p JOIN conversations c ON c.conversation_id=p.conversation_id
+               WHERE p.note!='' OR p.tags_json NOT IN ('','[]') ORDER BY p.updated_at DESC LIMIT 1500"""
+        ).fetchall()]
+
+    notes_by_invoice = {str(row.get("invoice_id") or ""): row for row in order_note_rows}
+    cases_by_invoice: dict[str, list[dict[str, Any]]] = {}
+    for row in case_rows:
+        cases_by_invoice.setdefault(str(row.get("invoice_id") or ""), []).append(row)
+    inventory_by_invoice: dict[str, list[dict[str, Any]]] = {}
+    supplier_offer_ids: set[str] = set()
+    exact_key_hashes = {content_fingerprint(value) for value in key_filters if len(normalize_secret_content(value)) >= 4}
+    key_invoice_ids: set[str] = set()
+    key_offer_ids: set[str] = set()
+    key_batch_ids: set[str] = set()
+    key_supplier_ids: set[str] = set()
+    for row in inventory_rows:
+        invoice_id = str(row.get("invoice_id") or "")
+        if invoice_id:
+            inventory_by_invoice.setdefault(invoice_id, []).append(row)
+        if supplier_filters and _all_text_matches(row.get("supplier_name"), supplier_filters):
+            supplier_offer_ids.add(str(row.get("offer_id") or ""))
+        if exact_key_hashes and str(row.get("content_hash") or "") in exact_key_hashes:
+            if invoice_id: key_invoice_ids.add(invoice_id)
+            if row.get("offer_id") not in (None, ""): key_offer_ids.add(str(row.get("offer_id")))
+            if row.get("batch_id") not in (None, ""): key_batch_ids.add(str(row.get("batch_id")))
+            if row.get("supplier_id") not in (None, ""): key_supplier_ids.add(str(row.get("supplier_id")))
+
+    messages_by_conversation: dict[str, list[dict[str, Any]]] = {}
+    messages_by_debate: dict[str, list[dict[str, Any]]] = {}
+    for row in message_rows:
+        conversation_id = str(row.get("conversation_id") or "")
+        debate_id = str(row.get("debate_id") or "")
+        if conversation_id:
+            messages_by_conversation.setdefault(conversation_id, []).append(row)
+        if debate_id:
+            messages_by_debate.setdefault(debate_id, []).append(row)
+
+    # Offers are the only group that requires a live GGSEL catalogue call.
+    if _type_allowed(parsed, "offers"):
+        impossible = bool(order_filters or client_filters or batch_filters or error_filters or note_filters or priority_filters or amount_filters or profit_filters or tag_filters)
+        if not impossible:
+            try:
+                offers = enrich_offer_settings(collect_all_offers())
+                for item in offers:
+                    offer_id_value = str(item.get("id") or "")
+                    title = str(item.get("title") or "Товар")
+                    quantity = as_int(item.get("quantity"))
+                    status = str(item.get("status") or "unknown")
+                    effective_statuses = {status}
+                    if item.get("low_stock"): effective_statuses.add("low_stock")
+                    if quantity <= 0: effective_statuses.add("out_of_stock")
+                    if item.get("favorite"): effective_statuses.add("favorite")
+                    haystack = " ".join([offer_id_value, title, str(item.get("category") or ""), status])
+                    if terms and not _all_text_matches(haystack, terms): continue
+                    if product_filters and not _all_text_matches(haystack, product_filters): continue
+                    if category_filters and not _all_text_matches(item.get("category"), category_filters): continue
+                    if supplier_filters and offer_id_value not in supplier_offer_ids: continue
+                    if key_filters and offer_id_value not in key_offer_ids: continue
+                    if statuses and not any(value in effective_statuses for value in statuses): continue
+                    if stock_filters and not _number_matches(quantity, stock_filters): continue
+                    if price_filters and not _number_matches(item.get("price"), price_filters): continue
+                    if not _date_matches(item.get("updated_at") or item.get("created_at"), after_filters, before_filters): continue
+                    score = _search_score(haystack, terms + product_filters, title)
+                    _append_search_result(groups, "offers", {
+                        "type": "offer", "id": offer_id_value, "title": title,
+                        "subtitle": f"ID {offer_id_value or '—'} · остаток {quantity} · {status}",
+                        "badge": "Товар", "score": score, "status": status,
+                        "favorite": bool(item.get("favorite")), "quantity": quantity,
+                    }, limit)
+            except Exception as exc:
+                warnings.append(f"Каталог GGSEL временно недоступен: {exc}")
+                logger.warning("Advanced offer search failed: %s", exc)
+
+    if _type_allowed(parsed, "orders") and not stock_filters:
+        for row in order_rows:
+            invoice_id = str(row.get("invoice_id") or "")
+            product_name = str(row.get("product_name") or "")
+            note = notes_by_invoice.get(invoice_id, {})
+            cases = cases_by_invoice.get(invoice_id, [])
+            inventory = inventory_by_invoice.get(invoice_id, [])
+            case_text = " ".join(" ".join(str(case.get(k) or "") for k in ("status", "priority", "category", "error_code", "reason", "note")) for case in cases)
+            supplier_text = " ".join(str(item.get("supplier_name") or "") for item in inventory)
+            haystack = " ".join(str(row.get(k) or "") for k in ("invoice_id", "item_id", "product_name", "buyer_email", "buyer_account", "buyer_phone", "external_order_id"))
+            haystack = " ".join([haystack, str(note.get("tag") or ""), str(note.get("note") or ""), case_text, supplier_text])
+            if terms and not _all_text_matches(haystack, terms): continue
+            if product_filters and not _all_text_matches(" ".join([product_name, str(row.get("item_id") or "")]), product_filters): continue
+            if order_filters and not _all_text_matches(" ".join([invoice_id, str(row.get("external_order_id") or "")]), order_filters): continue
+            if key_filters and invoice_id not in key_invoice_ids: continue
+            if client_filters and not _all_text_matches(" ".join([str(row.get("buyer_email") or ""), str(row.get("buyer_account") or ""), str(row.get("buyer_phone") or "")]), client_filters): continue
+            if supplier_filters and not _all_text_matches(supplier_text, supplier_filters): continue
+            if tag_filters and not _all_text_matches(note.get("tag"), tag_filters): continue
+            if note_filters and not _all_text_matches(" ".join([str(note.get("note") or ""), case_text]), note_filters): continue
+            if error_filters and not _all_text_matches(case_text, error_filters): continue
+            if category_filters and not _all_text_matches(case_text, category_filters): continue
+            if priority_filters and not _all_text_matches(case_text, priority_filters): continue
+            if batch_filters and not any(_all_text_matches(str(item.get("batch_id") or ""), batch_filters) for item in inventory): continue
+            if statuses:
+                active_case_statuses = {str(case.get("status") or "") for case in cases}
+                if "problem" in statuses:
+                    if not any(status not in {"resolved", "closed"} for status in active_case_statuses): continue
+                elif not any(status in active_case_statuses for status in statuses):
+                    continue
+            if amount_filters and not _number_matches(row.get("amount"), amount_filters): continue
+            if price_filters and not _number_matches(row.get("amount"), price_filters): continue
+            if profit_filters and not _number_matches(row.get("profit"), profit_filters): continue
+            if not _date_matches(row.get("purchase_date") or row.get("date_pay") or row.get("updated_at"), after_filters, before_filters): continue
+            score = _search_score(haystack, terms + order_filters + product_filters + client_filters, product_name)
+            badge = "Проблемный" if any(str(case.get("status")) not in {"resolved", "closed"} for case in cases) else "Заказ"
+            _append_search_result(groups, "orders", {
+                "type": "order", "id": invoice_id, "title": product_name or f"Заказ #{invoice_id}",
+                "subtitle": f"#{invoice_id} · {row.get('buyer_email') or row.get('buyer_account') or 'покупатель не указан'}",
+                "badge": badge, "score": score, "amount": as_float(row.get("amount")),
+                "currency": str(row.get("currency") or "RUB"), "date": row.get("purchase_date") or row.get("date_pay"),
+            }, limit)
+
+    if _type_allowed(parsed, "chats") and not (stock_filters or price_filters or amount_filters or profit_filters or batch_filters):
+        for row in conversation_rows:
+            conversation_id = str(row.get("conversation_id") or "")
+            messages = messages_by_conversation.get(conversation_id, [])
+            if not messages and row.get("latest_debate_id"):
+                messages = messages_by_debate.get(str(row.get("latest_debate_id")), [])
+            message_text = " ".join(str(message.get("message_text") or "") for message in messages[:200])
+            tags_text = str(row.get("tags_json") or "")
+            profile_text = str(row.get("profile_note") or "")
+            haystack = " ".join(str(row.get(k) or "") for k in ("conversation_id", "buyer_email", "buyer_account", "latest_debate_id", "latest_invoice_id", "product_name", "last_message"))
+            haystack = " ".join([haystack, message_text, tags_text, profile_text])
+            if terms and not _all_text_matches(haystack, terms): continue
+            if product_filters and not _all_text_matches(row.get("product_name"), product_filters): continue
+            if order_filters and not _all_text_matches(row.get("latest_invoice_id"), order_filters): continue
+            conversation_invoice_ids = {str(message.get("invoice_id") or "") for message in messages if message.get("invoice_id")}
+            if row.get("latest_invoice_id"): conversation_invoice_ids.add(str(row.get("latest_invoice_id")))
+            if key_filters and not (conversation_invoice_ids & key_invoice_ids): continue
+            if client_filters and not _all_text_matches(" ".join([str(row.get("buyer_email") or ""), str(row.get("buyer_account") or ""), conversation_id]), client_filters): continue
+            linked_inventory = [item for invoice in conversation_invoice_ids for item in inventory_by_invoice.get(invoice, [])]
+            if supplier_filters and not _all_text_matches(" ".join(str(item.get("supplier_name") or "") for item in linked_inventory), supplier_filters): continue
+            if tag_filters and not _all_text_matches(tags_text, tag_filters): continue
+            if note_filters and not _all_text_matches(profile_text, note_filters): continue
+            if error_filters and not _all_text_matches(message_text, error_filters): continue
+            profile_statuses = set()
+            if row.get("pinned"): profile_statuses.add("pinned")
+            if row.get("favorite"): profile_statuses.add("favorite")
+            linked_cases = [case for case in case_rows if str(case.get("conversation_id") or "") == conversation_id or str(case.get("invoice_id") or "") in conversation_invoice_ids]
+            if category_filters and not _all_text_matches(" ".join(str(case.get("category") or "") for case in linked_cases), category_filters): continue
+            if priority_filters and not _all_text_matches(" ".join(str(case.get("priority") or "") for case in linked_cases), priority_filters): continue
+            if statuses:
+                linked_statuses = {str(case.get("status") or "") for case in linked_cases}
+                if "problem" in statuses:
+                    if not any(status not in {"resolved", "closed"} for status in linked_statuses): continue
+                elif not any(status in linked_statuses or status in profile_statuses for status in statuses): continue
+            if not _date_matches(row.get("last_message_at") or row.get("updated_at"), after_filters, before_filters): continue
+            excerpt = str(row.get("last_message") or "")
+            matched_message = next((str(message.get("message_text") or "") for message in messages if _all_text_matches(message.get("message_text"), terms + error_filters)), "")
+            if matched_message:
+                excerpt = matched_message[:220]
+            title = str(row.get("buyer_email") or row.get("buyer_account") or row.get("product_name") or "Клиент")
+            score = _search_score(haystack, terms + client_filters + product_filters, title)
+            _append_search_result(groups, "chats", {
+                "type": "chat", "id": conversation_id, "title": title,
+                "subtitle": excerpt or str(row.get("product_name") or "Открыть переписку"),
+                "invoice_id": str(row.get("latest_invoice_id") or ""), "badge": "Клиент",
+                "score": score, "date": row.get("last_message_at"),
+                "pinned": bool(row.get("pinned")), "favorite": bool(row.get("favorite")),
+            }, limit)
+
+    if _type_allowed(parsed, "inventory") and not (client_filters or error_filters or priority_filters or category_filters or stock_filters or price_filters or amount_filters or profit_filters or tag_filters):
+        exact_hashes = set(exact_key_hashes)
+        # A lone long token is also treated as a possible exact key, while remaining safe because only its HMAC is compared.
+        if not key_filters and len(terms) == 1 and len(normalize_secret_content(terms[0])) >= 12:
+            exact_hashes.add(content_fingerprint(terms[0]))
+        for row in inventory_rows:
+            exact_match = bool(exact_hashes and str(row.get("content_hash") or "") in exact_hashes)
+            haystack = " ".join(str(row.get(k) or "") for k in ("content_masked", "offer_id", "product_name", "status", "invoice_id", "source", "batch_id", "supplier_name", "batch_notes"))
+            if exact_hashes and not exact_match: continue
+            if terms and not exact_match and not _all_text_matches(haystack, terms): continue
+            if product_filters and not _all_text_matches(" ".join([str(row.get("product_name") or ""), str(row.get("offer_id") or "")]), product_filters): continue
+            if order_filters and not _all_text_matches(row.get("invoice_id"), order_filters): continue
+            if supplier_filters and not _all_text_matches(row.get("supplier_name"), supplier_filters): continue
+            if batch_filters and not _all_text_matches(row.get("batch_id"), batch_filters): continue
+            if note_filters and not _all_text_matches(" ".join([str(row.get("batch_notes") or ""), str(row.get("metadata_json") or "")]), note_filters): continue
+            if statuses and str(row.get("status") or "") not in statuses: continue
+            if not _date_matches(row.get("sold_at") or row.get("added_at"), after_filters, before_filters): continue
+            title = str(row.get("product_name") or f"Товар {row.get('offer_id') or '—'}")
+            subtitle = f"{row.get('content_masked') or '••••'} · {row.get('status') or '—'}"
+            if row.get("invoice_id"): subtitle += f" · заказ #{row.get('invoice_id')}"
+            if row.get("supplier_name"): subtitle += f" · {row.get('supplier_name')}"
+            _append_search_result(groups, "inventory", {
+                "type": "inventory", "id": str(row.get("id") or ""), "title": title,
+                "subtitle": subtitle, "invoice_id": str(row.get("invoice_id") or ""),
+                "offer_id": str(row.get("offer_id") or ""), "badge": "Ключ", "score": 100 if exact_match else _search_score(haystack, terms, title),
+            }, limit)
+
+    if _type_allowed(parsed, "suppliers"):
+        impossible = bool(order_filters or client_filters or statuses or error_filters or priority_filters or amount_filters or profit_filters or tag_filters or category_filters or stock_filters or price_filters)
+        if not impossible:
+            for row in supplier_rows:
+                related_products = " ".join(str(batch.get("product_name") or "") for batch in batch_rows if as_int(batch.get("supplier_id")) == as_int(row.get("id")))
+                haystack = " ".join([str(row.get("name") or ""), str(row.get("contact") or ""), str(row.get("notes") or ""), str(row.get("default_currency") or ""), related_products])
+                if terms and not _all_text_matches(haystack, terms): continue
+                if supplier_filters and not _all_text_matches(row.get("name"), supplier_filters): continue
+                if key_filters and str(row.get("id") or "") not in key_supplier_ids: continue
+                if product_filters and not _all_text_matches(related_products, product_filters): continue
+                if batch_filters and not any(_all_text_matches(batch.get("id"), batch_filters) for batch in batch_rows if as_int(batch.get("supplier_id")) == as_int(row.get("id"))): continue
+                if note_filters and not _all_text_matches(row.get("notes"), note_filters): continue
+                if not _date_matches(row.get("updated_at") or row.get("created_at"), after_filters, before_filters): continue
+                title = str(row.get("name") or "Поставщик")
+                _append_search_result(groups, "suppliers", {
+                    "type": "supplier", "id": str(row.get("id") or ""), "title": title,
+                    "subtitle": f"{as_int(row.get('batch_count'))} партий · {as_int(row.get('item_count'))} позиций · {row.get('default_currency') or 'RUB'}",
+                    "badge": "Поставщик", "score": _search_score(haystack, terms + supplier_filters, title),
+                }, limit)
+
+    if _type_allowed(parsed, "batches"):
+        impossible = bool(order_filters or client_filters or error_filters or priority_filters or amount_filters or profit_filters or tag_filters or category_filters)
+        if not impossible:
+            for row in batch_rows:
+                haystack = " ".join(str(row.get(k) or "") for k in ("id", "offer_id", "product_name", "supplier_display", "cost_currency", "purchased_at", "warranty_until", "notes"))
+                if terms and not _all_text_matches(haystack, terms): continue
+                if product_filters and not _all_text_matches(" ".join([str(row.get("product_name") or ""), str(row.get("offer_id") or "")]), product_filters): continue
+                if supplier_filters and not _all_text_matches(row.get("supplier_display"), supplier_filters): continue
+                if batch_filters and not _all_text_matches(row.get("id"), batch_filters): continue
+                if key_filters and str(row.get("id") or "") not in key_batch_ids: continue
+                if note_filters and not _all_text_matches(row.get("notes"), note_filters): continue
+                if statuses:
+                    if "in_stock" in statuses and as_int(row.get("in_stock")) <= 0: continue
+                    if "sold" in statuses and as_int(row.get("sold")) <= 0: continue
+                    if "replaced" in statuses and as_int(row.get("replaced")) <= 0: continue
+                    if not any(value in {"in_stock", "sold", "replaced"} for value in statuses): continue
+                if stock_filters and not _number_matches(row.get("in_stock"), stock_filters): continue
+                if price_filters and not _number_matches(row.get("unit_cost_rub"), price_filters): continue
+                if not _date_matches(row.get("purchased_at") or row.get("created_at"), after_filters, before_filters): continue
+                title = str(row.get("product_name") or f"Партия #{row.get('id')}")
+                _append_search_result(groups, "batches", {
+                    "type": "batch", "id": str(row.get("id") or ""), "title": title,
+                    "subtitle": f"Партия #{row.get('id')} · {row.get('supplier_display') or 'без поставщика'} · остаток {as_int(row.get('in_stock'))}/{as_int(row.get('ledger_count'))}",
+                    "badge": "Партия", "score": _search_score(haystack, terms + product_filters + supplier_filters, title),
+                }, limit)
+
+    if _type_allowed(parsed, "cases") and not (stock_filters or price_filters or amount_filters or profit_filters or tag_filters or batch_filters):
+        for row in case_rows:
+            haystack = " ".join(str(row.get(k) or "") for k in ("id", "invoice_id", "conversation_id", "offer_id", "product_name", "status", "priority", "category", "error_code", "reason", "source", "note"))
+            if terms and not _all_text_matches(haystack, terms): continue
+            if product_filters and not _all_text_matches(" ".join([str(row.get("product_name") or ""), str(row.get("offer_id") or "")]), product_filters): continue
+            if order_filters and not _all_text_matches(row.get("invoice_id"), order_filters): continue
+            if key_filters and str(row.get("invoice_id") or "") not in key_invoice_ids: continue
+            if client_filters and not _all_text_matches(row.get("conversation_id"), client_filters): continue
+            linked_case_inventory = inventory_by_invoice.get(str(row.get("invoice_id") or ""), [])
+            if supplier_filters and not _all_text_matches(" ".join(str(item.get("supplier_name") or "") for item in linked_case_inventory), supplier_filters): continue
+            if error_filters and not _all_text_matches(row.get("error_code"), error_filters): continue
+            if note_filters and not _all_text_matches(" ".join([str(row.get("note") or ""), str(row.get("reason") or "")]), note_filters): continue
+            if category_filters and not _all_text_matches(row.get("category"), category_filters): continue
+            if priority_filters and not _all_text_matches(row.get("priority"), priority_filters): continue
+            if statuses:
+                current_status = str(row.get("status") or "")
+                if "problem" in statuses:
+                    if current_status in {"resolved", "closed"}: continue
+                elif current_status not in statuses: continue
+            if not _date_matches(row.get("updated_at") or row.get("created_at"), after_filters, before_filters): continue
+            title = str(row.get("product_name") or f"Обращение #{row.get('id')}")
+            _append_search_result(groups, "cases", {
+                "type": "case", "id": str(row.get("id") or ""), "title": title,
+                "subtitle": f"Заказ #{row.get('invoice_id') or '—'} · {row.get('status')} · {row.get('error_code') or row.get('category') or 'другая проблема'}",
+                "invoice_id": str(row.get("invoice_id") or ""), "conversation_id": str(row.get("conversation_id") or ""),
+                "badge": "Проблема", "score": _search_score(haystack, terms + error_filters + product_filters, title),
+            }, limit)
+
+    if _type_allowed(parsed, "knowledge"):
+        impossible = bool(order_filters or client_filters or key_filters or supplier_filters or batch_filters or statuses or priority_filters or stock_filters or price_filters or amount_filters or profit_filters or note_filters or tag_filters)
+        if not impossible:
+            for row in knowledge_rows:
+                codes = str(row.get("error_codes_json") or "")
+                haystack = " ".join(str(row.get(k) or "") for k in ("id", "category", "title", "body", "product_pattern")) + " " + codes
+                if terms and not _all_text_matches(haystack, terms): continue
+                if product_filters and not _all_text_matches(" ".join([str(row.get("product_pattern") or ""), str(row.get("title") or ""), str(row.get("body") or "")]), product_filters): continue
+                if error_filters and not _all_text_matches(codes + " " + str(row.get("body") or ""), error_filters): continue
+                if category_filters and not _all_text_matches(row.get("category"), category_filters): continue
+                if not _date_matches(row.get("updated_at") or row.get("created_at"), after_filters, before_filters): continue
+                title = str(row.get("title") or "Инструкция")
+                _append_search_result(groups, "knowledge", {
+                    "type": "knowledge", "id": str(row.get("id") or ""), "title": title,
+                    "subtitle": f"{row.get('category') or 'Общие'} · {str(row.get('body') or '')[:180]}",
+                    "badge": "Инструкция", "score": _search_score(haystack, terms + error_filters + product_filters, title),
+                }, limit)
+
+    if _type_allowed(parsed, "errors"):
+        impossible = bool(product_filters or order_filters or client_filters or key_filters or supplier_filters or batch_filters or tag_filters or stock_filters or price_filters or amount_filters or profit_filters or priority_filters or category_filters)
+        if not impossible:
+            for row in error_rows:
+                haystack = " ".join(str(row.get(k) or "") for k in ("id", "service", "endpoint", "status", "message", "context_json"))
+                if terms and not _all_text_matches(haystack, terms): continue
+                if error_filters and not _all_text_matches(" ".join([str(row.get("message") or ""), str(row.get("status") or "")]), error_filters): continue
+                if statuses and str(row.get("status") or "").casefold() not in statuses: continue
+                if note_filters and not _all_text_matches(row.get("context_json"), note_filters): continue
+                if not _date_matches(row.get("created_at"), after_filters, before_filters): continue
+                title = str(row.get("service") or "Ошибка API")
+                _append_search_result(groups, "errors", {
+                    "type": "error", "id": str(row.get("id") or ""), "title": title,
+                    "subtitle": f"HTTP {row.get('status') or '—'} · {str(row.get('message') or '')[:200]}",
+                    "badge": "Ошибка API", "score": _search_score(haystack, terms + error_filters, title),
+                }, limit)
+
+    if _type_allowed(parsed, "notes"):
+        impossible = bool(supplier_filters or batch_filters or stock_filters or price_filters or amount_filters or profit_filters or error_filters or priority_filters or category_filters or statuses)
+        if not impossible:
+            for row in order_note_rows:
+                haystack = " ".join(str(row.get(k) or "") for k in ("invoice_id", "tag", "note"))
+                if terms and not _all_text_matches(haystack, terms): continue
+                if note_filters and not _all_text_matches(row.get("note"), note_filters): continue
+                if tag_filters and not _all_text_matches(row.get("tag"), tag_filters): continue
+                if order_filters and not _all_text_matches(row.get("invoice_id"), order_filters): continue
+                if key_filters and str(row.get("invoice_id") or "") not in key_invoice_ids: continue
+                if not _date_matches(row.get("updated_at"), after_filters, before_filters): continue
+                _append_search_result(groups, "notes", {
+                    "type": "order_note", "id": str(row.get("invoice_id") or ""),
+                    "title": f"Заметка к заказу #{row.get('invoice_id')}",
+                    "subtitle": f"{row.get('tag') or 'Без метки'} · {str(row.get('note') or '')[:200]}",
+                    "badge": "Заметка", "score": _search_score(haystack, terms + note_filters + tag_filters),
+                }, limit)
+            for row in profile_note_rows:
+                haystack = " ".join(str(row.get(k) or "") for k in ("conversation_id", "buyer_email", "buyer_account", "latest_invoice_id", "product_name", "note", "tags_json"))
+                if terms and not _all_text_matches(haystack, terms): continue
+                if note_filters and not _all_text_matches(row.get("note"), note_filters): continue
+                if tag_filters and not _all_text_matches(row.get("tags_json"), tag_filters): continue
+                if client_filters and not _all_text_matches(" ".join([str(row.get("buyer_email") or ""), str(row.get("buyer_account") or ""), str(row.get("conversation_id") or "")]), client_filters): continue
+                if key_filters and str(row.get("latest_invoice_id") or "") not in key_invoice_ids: continue
+                if product_filters and not _all_text_matches(row.get("product_name"), product_filters): continue
+                if not _date_matches(row.get("updated_at"), after_filters, before_filters): continue
+                title = str(row.get("buyer_email") or row.get("buyer_account") or "Заметка о клиенте")
+                _append_search_result(groups, "notes", {
+                    "type": "customer_note", "id": str(row.get("conversation_id") or ""), "title": title,
+                    "subtitle": f"{str(row.get('note') or '')[:200]}", "invoice_id": str(row.get("latest_invoice_id") or ""),
+                    "badge": "Заметка клиента", "score": _search_score(haystack, terms + note_filters + tag_filters, title),
+                }, limit)
+
+    # Sort each group by relevance, then by the natural retrieval order retained by Python's stable sort.
+    for values in groups.values():
+        values.sort(key=lambda item: as_int(item.get("score")), reverse=True)
+
+    total = sum(len(values) for values in groups.values())
+    display_filters = [
+        {"name": key, "label": ADVANCED_SEARCH_COMMANDS.get(key, (key,))[0], "value": value}
+        for key, values in parsed["filters"].items()
+        for value in values
     ]
-
-    chats: list[dict[str, Any]] = []
-    try:
-        for item in _chat_payload({}):
-            haystack = " ".join(str(item.get(key) or "") for key in ("id_i", "invoice_id", "email", "product_name", "preview")).casefold()
-            if folded in haystack:
-                chats.append({
-                    "type": "chat",
-                    "id": str(item.get("id_i") or ""),
-                    "title": str(item.get("email") or item.get("product_name") or "Диалог"),
-                    "subtitle": str(item.get("preview") or item.get("product_name") or "Открыть переписку"),
-                    "invoice_id": str(item.get("invoice_id") or ""),
-                    "label": str(item.get("label") or "new"),
-                    "date": item.get("last_message"),
-                })
-            if len(chats) >= 10:
-                break
-    except Exception as exc:
-        logger.warning("Global chat search failed: %s", exc)
-
-    return {"offers": offers, "orders": orders, "chats": chats}
+    groups["meta"] = {
+        "query": clean,
+        "terms": terms,
+        "filters": display_filters,
+        "types": sorted(parsed.get("types") or []),
+        "unknown": parsed.get("unknown") or [],
+        "warnings": warnings,
+        "total": total,
+        "limit": limit,
+        "commands": [
+            'товар:"Office 2021" остаток:<5',
+            'статус:проблемный ошибка:0xc004f050',
+            'поставщик:Китай после:2026-07-01',
+            'тип:заказ прибыль:<100',
+            'ключ:XXXXX-XXXXX-XXXXX-XXXXX-XXXXX',
+        ],
+    }
+    return groups
 
 
 def attention_center_payload() -> dict[str, Any]:
@@ -3591,7 +4183,7 @@ def miniapp_me(user: dict[str, Any]):
 @miniapp_api
 def miniapp_global_search(user: dict[str, Any]):
     query = str(request.args.get("q") or "").strip()
-    return miniapp_success(global_search_payload(query))
+    return miniapp_success(global_search_payload(query, as_int(request.args.get("limit"), 12)))
 
 
 @app.get("/app/api/attention")
@@ -3975,8 +4567,15 @@ def miniapp_add_products(user: dict[str, Any], offer_id_value: int):
     results: list[Any] = []
     for index in range(0, len(values), 100):
         results.append(ggsel.add_products_v2(offer_id_value, values[index : index + 100]))
-    record_inventory_upload(offer_id_value, values)
-    operation = record_operation("stock_add", offer_id_value, {"batches": results, "count": len(values)}, "completed")
+
+    offer_title = next((str(x.get("title") or x.get("name") or "") for x in get_all_offers_cached()
+                        if str(x.get("id") or x.get("offer_id") or "") == str(offer_id_value)), "")
+    batch_payload = body.get("batch") if isinstance(body.get("batch"), dict) else {}
+    batch_id = create_inventory_batch(
+        offer_id=str(offer_id_value), product_name=offer_title, quantity=len(values), payload=batch_payload
+    ) if batch_payload else None
+    record_inventory_upload(offer_id_value, values, offer_title, batch_id=batch_id)
+    operation = record_operation("stock_add", offer_id_value, {"batches": results, "count": len(values), "inventory_batch_id": batch_id}, "completed")
     settings = get_offer_settings(offer_id_value)
     activation_result: Any = None
     activate_once = body.get("auto_activate") is True
@@ -3985,7 +4584,7 @@ def miniapp_add_products(user: dict[str, Any], offer_id_value: int):
         record_operation("offer_activate", offer_id_value, activation_result)
     invalidate_offer_cache()
     audit_miniapp(user.get("id"), "stock_add", offer_id_value, {"count": len(values), "auto_activate": bool(activation_result)})
-    return miniapp_success({"added": len(values), "batches": len(results), "results": results, "operation": operation, "auto_activation": activation_result})
+    return miniapp_success({"added": len(values), "batches": len(results), "results": results, "operation": operation, "auto_activation": activation_result, "inventory_batch_id": batch_id})
 
 
 @app.delete("/app/api/offers/<int:offer_id_value>/products")
@@ -4198,6 +4797,9 @@ def miniapp_order(user: dict[str, Any], invoice_id: str):
         index_sold_content_from_order(invoice_id, raw)
     payload = _order_payload(invoice_id, raw)
     payload["note"] = get_order_note(invoice_id)
+    payload["profitability"] = order_profitability(invoice_id, payload)
+    payload["problem_case"] = get_problem_case(invoice_id=invoice_id)
+    payload["replacements"] = replacement_history(invoice_id)
     remember_recent_view("order", invoice_id, str(payload.get("name") or f"Заказ #{invoice_id}"), {"amount": payload.get("amount"), "currency": payload.get("currency")})
     return miniapp_success(payload)
 
@@ -4343,7 +4945,7 @@ def miniapp_audit_log(user: dict[str, Any]):
 
 @app.get("/")
 def health():
-    return jsonify({"ok": True, "service": "ggsel-telegram-bot-miniapp-v4.8"})
+    return jsonify({"ok": True, "service": "ggsel-telegram-bot-miniapp-v8.0"})
 
 
 @app.get("/setup-telegram-webhook")
@@ -4688,20 +5290,53 @@ def list_backups() -> list[dict[str,Any]]:
 
 
 def daily_report_payload() -> dict[str,Any]:
-    today=date.today(); analytics=calculate_receipts_analytics(today,today)
-    sla=sla_payload(); recs=recommendations_payload()
-    return {"date":today.isoformat(),"analytics":analytics,"sla":sla,"recommendations":recs[:10],"generated_at":_utc_now()}
+    today = date.today()
+    today_text = today.isoformat()
+    analytics = calculate_receipts_analytics(today, today)
+    sla = sla_payload()
+    recs = recommendations_payload()
+    profit = profitability_report(today_text, today_text)
+    with db_connect() as conn:
+        problem_count = as_int(conn.execute(
+            "SELECT COUNT(*) FROM problem_cases WHERE created_at>=? AND created_at<=?",
+            (f"{today_text}T00:00:00", f"{today_text}T23:59:59"),
+        ).fetchone()[0])
+        replacement_count = as_int(conn.execute(
+            "SELECT COUNT(*) FROM replacement_events WHERE status='sent' AND COALESCE(sent_at,created_at)>=? AND COALESCE(sent_at,created_at)<=?",
+            (f"{today_text}T00:00:00", f"{today_text}T23:59:59"),
+        ).fetchone()[0])
+    return {
+        "date": today_text,
+        "analytics": analytics,
+        "sla": sla,
+        "profitability": profit,
+        "problem_cases": problem_count,
+        "replacements": replacement_count,
+        "recommendations": recs[:10],
+        "generated_at": _utc_now(),
+    }
 
 
 def send_daily_report() -> dict[str,Any]:
-    data=daily_report_payload(); a=data.get("analytics") or {}
-    text=(f"📊 <b>Отчёт за {safe(data['date'])}</b>\n\n"
-          f"Продаж: <b>{as_int(a.get('orders') or a.get('count'))}</b>\n"
-          f"Сумма: <b>{safe(a.get('sales_total') or a.get('total') or 0)}</b>\n"
-          f"Без ответа: <b>{data['sla']['unanswered']}</b>\n"
-          f"Критичных: <b>{data['sla']['critical']}</b>\n"
-          f"Рекомендаций: <b>{len(data['recommendations'])}</b>")
-    send_text(text); return data
+    data = daily_report_payload()
+    a = data.get("analytics") or {}
+    p = data.get("profitability") or {}
+    net_line = ""
+    if as_int(p.get("cost_known_orders")):
+        net_line = f"Чистая прибыль: <b>{safe(p.get('net_profit_rub') or 0)} ₽</b> ({safe(p.get('coverage_percent') or 0)}% заказов с себестоимостью)\n"
+    text = (
+        f"📊 <b>Отчёт за {safe(data['date'])}</b>\n\n"
+        f"Продаж: <b>{as_int(a.get('orders') or a.get('count'))}</b>\n"
+        f"Сумма: <b>{safe(a.get('sales_total') or a.get('total') or 0)}</b>\n"
+        f"{net_line}"
+        f"Проблемных обращений: <b>{data['problem_cases']}</b>\n"
+        f"Замен: <b>{data['replacements']}</b>\n"
+        f"Без ответа: <b>{data['sla']['unanswered']}</b>\n"
+        f"Критичных: <b>{data['sla']['critical']}</b>\n"
+        f"Рекомендаций: <b>{len(data['recommendations'])}</b>"
+    )
+    send_text(text)
+    return data
 
 
 def run_automation_event(trigger_type: str, context: dict[str,Any]) -> list[dict[str,Any]]:
@@ -4897,7 +5532,1045 @@ def cron_daily_report():
     return jsonify({'ok':True,'data':send_daily_report()})
 
 
+# ============================================================
+# Business operations v7.0
+# ============================================================
+
+V7_CASE_STATUSES = {"new", "diagnosis", "waiting", "replacement", "resolved", "closed"}
+V7_CASE_PRIORITIES = {"low", "normal", "high", "critical"}
+
+
+def init_v7_db() -> None:
+    with db_connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS suppliers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                contact TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                default_currency TEXT NOT NULL DEFAULT 'RUB',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS inventory_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                offer_id TEXT,
+                product_name TEXT,
+                supplier_id INTEGER,
+                supplier_name TEXT,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                unit_cost REAL NOT NULL DEFAULT 0,
+                cost_currency TEXT NOT NULL DEFAULT 'RUB',
+                fx_to_rub REAL NOT NULL DEFAULT 1,
+                unit_cost_rub REAL NOT NULL DEFAULT 0,
+                purchased_at TEXT,
+                warranty_until TEXT,
+                notes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(supplier_id) REFERENCES suppliers(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS problem_cases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_id TEXT,
+                conversation_id TEXT,
+                offer_id TEXT,
+                product_name TEXT,
+                status TEXT NOT NULL DEFAULT 'new',
+                priority TEXT NOT NULL DEFAULT 'normal',
+                category TEXT NOT NULL DEFAULT 'other',
+                error_code TEXT,
+                reason TEXT,
+                source TEXT NOT NULL DEFAULT 'manual',
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                resolved_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS replacement_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_id TEXT NOT NULL,
+                conversation_id TEXT,
+                offer_id TEXT,
+                source_product_id TEXT,
+                old_content_masked TEXT,
+                new_content_hash TEXT,
+                new_content_masked TEXT,
+                reason TEXT,
+                status TEXT NOT NULL,
+                archive_result_json TEXT,
+                message_result_json TEXT,
+                error_text TEXT,
+                created_at TEXT NOT NULL,
+                sent_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS knowledge_articles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL DEFAULT 'Общие',
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                product_pattern TEXT NOT NULL DEFAULT '',
+                error_codes_json TEXT NOT NULL DEFAULT '[]',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS diagnostic_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice_id TEXT,
+                conversation_id TEXT,
+                product_family TEXT,
+                answers_json TEXT NOT NULL DEFAULT '{}',
+                recommendation_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'completed',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS issue_signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signature TEXT NOT NULL,
+                invoice_id TEXT,
+                conversation_id TEXT,
+                offer_id TEXT,
+                product_name TEXT,
+                error_code TEXT,
+                category TEXT,
+                message_excerpt TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS incident_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signature TEXT NOT NULL UNIQUE,
+                offer_id TEXT,
+                product_name TEXT,
+                error_code TEXT,
+                category TEXT,
+                signal_count INTEGER NOT NULL DEFAULT 0,
+                window_minutes INTEGER NOT NULL DEFAULT 120,
+                status TEXT NOT NULL DEFAULT 'open',
+                first_seen TEXT,
+                last_seen TEXT,
+                notified_at TEXT,
+                sample_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS review_events (
+                invoice_id TEXT PRIMARY KEY,
+                product_id TEXT,
+                product_name TEXT,
+                rating_label TEXT,
+                is_negative INTEGER NOT NULL DEFAULT 0,
+                review_text TEXT,
+                review_date TEXT,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS business_settings (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                settlement_currency TEXT NOT NULL DEFAULT 'USD',
+                settlement_to_rub REAL NOT NULL DEFAULT 0,
+                target_margin REAL NOT NULL DEFAULT 30,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_batches_offer ON inventory_batches(offer_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_batches_supplier ON inventory_batches(supplier_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_cases_status ON problem_cases(status, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_cases_invoice ON problem_cases(invoice_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_replacements_invoice ON replacement_events(invoice_id, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_issue_signals_signature ON issue_signals(signature, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_reviews_product ON review_events(product_id, is_negative);
+            """
+        )
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(inventory_ledger)").fetchall()}
+        additions = {
+            "batch_id": "INTEGER",
+            "supplier_id": "INTEGER",
+            "unit_cost": "REAL",
+            "cost_currency": "TEXT",
+            "unit_cost_rub": "REAL",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE inventory_ledger ADD COLUMN {name} {declaration}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_inventory_batch ON inventory_ledger(batch_id, status)")
+        row = conn.execute("SELECT id FROM business_settings WHERE id=1").fetchone()
+        if not row:
+            conn.execute(
+                "INSERT INTO business_settings(id,settlement_currency,settlement_to_rub,target_margin,updated_at) VALUES(1,'USD',?,?,?)",
+                (SETTLEMENT_TO_RUB_RATE, 30.0, _utc_now()),
+            )
+
+
+def seed_v7_knowledge() -> None:
+    defaults = [
+        ("Windows", "Ошибка 0xc004f050 — редакция не совпадает", "Ошибка 0xc004f050 чаще всего возникает, когда установленная редакция Windows не соответствует ключу. Проверьте: Параметры → Система → О системе → Выпуск Windows. Для ключа Pro должна быть установлена редакция Pro. После смены редакции перезагрузите компьютер и повторите активацию.", "windows", ["0xc004f050"]),
+        ("Windows", "Ошибка 0x803FA067", "Проверьте установленную редакцию Windows и подключение к интернету. Если установлена Home, а ключ предназначен для Pro, сначала выполните обновление редакции. Затем откройте Параметры → Система → Активация и повторите ввод ключа.", "windows", ["0x803fa067"]),
+        ("Windows", "Ошибка 0xC004C060", "Код 0xC004C060 может означать, что ключ был заблокирован. Сначала проверьте правильность редакции и отсутствие опечатки. Если всё совпадает, заказ следует перевести на диагностику и подготовить замену.", "windows", ["0xc004c060"]),
+        ("Office", "Полное удаление старого Office", "Перед установкой новой версии удалите все старые выпуски Microsoft Office, перезагрузите компьютер и только после этого установите полученный дистрибутив. Одновременное наличие разных выпусков часто вызывает ошибки лицензирования.", "office", []),
+        ("Office", "Office: ошибка 0xC004F074", "Ошибка 0xC004F074 обычно связана с установленным корпоративным/KMS-выпуском. Проверьте название продукта в окне «Учётная запись». Удалите несовместимый выпуск и установите версию, соответствующую приобретённой лицензии.", "office", ["0xc004f074"]),
+        ("Поддержка", "Запрос диагностического скриншота", "Пожалуйста, пришлите скриншот окна с ошибкой целиком. Для Windows также откройте Параметры → Система → О системе и пришлите строку «Выпуск Windows». Для Office откройте любое приложение → Файл → Учётная запись и пришлите название продукта.", "", []),
+        ("Поддержка", "Подтверждение замены", "Мы проверили ситуацию и подготовили замену. Новый код указан ниже. Пожалуйста, используйте его только на том же устройстве и сообщите результат активации.", "", []),
+    ]
+    now = _utc_now()
+    with db_connect() as conn:
+        for category, title, body, pattern, codes in defaults:
+            exists = conn.execute("SELECT id FROM knowledge_articles WHERE title=?", (title,)).fetchone()
+            if not exists:
+                conn.execute(
+                    "INSERT INTO knowledge_articles(category,title,body,product_pattern,error_codes_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,1,?,?)",
+                    (category, title, body, pattern, json.dumps(codes, ensure_ascii=False), now, now),
+                )
+
+
+def get_business_settings() -> dict[str, Any]:
+    with db_connect() as conn:
+        row = conn.execute("SELECT * FROM business_settings WHERE id=1").fetchone()
+    return dict(row) if row else {"settlement_currency": "USD", "settlement_to_rub": SETTLEMENT_TO_RUB_RATE, "target_margin": 30}
+
+
+def upsert_supplier(name: str, contact: str = "", notes: str = "", currency: str = "RUB") -> dict[str, Any]:
+    clean = str(name or "").strip()[:200]
+    if not clean:
+        raise ValueError("Укажите название поставщика")
+    now = _utc_now()
+    with db_connect() as conn:
+        conn.execute(
+            """INSERT INTO suppliers(name,contact,notes,default_currency,created_at,updated_at)
+               VALUES(?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET
+               contact=CASE WHEN excluded.contact!='' THEN excluded.contact ELSE suppliers.contact END,
+               notes=CASE WHEN excluded.notes!='' THEN excluded.notes ELSE suppliers.notes END,
+               default_currency=CASE WHEN excluded.default_currency!='' THEN excluded.default_currency ELSE suppliers.default_currency END,
+               updated_at=excluded.updated_at""",
+            (clean, str(contact or "")[:500], str(notes or "")[:4000], str(currency or "RUB").upper()[:8], now, now),
+        )
+        row = conn.execute("SELECT * FROM suppliers WHERE name=?", (clean,)).fetchone()
+    return dict(row)
+
+
+def create_inventory_batch(*, offer_id: str, product_name: str, quantity: int, payload: dict[str, Any]) -> Optional[int]:
+    supplier_name = str(payload.get("supplier_name") or "").strip()
+    supplier_id = as_int(payload.get("supplier_id"), 0)
+    currency = str(payload.get("currency") or "RUB").strip().upper()[:8]
+    unit_cost = max(0.0, as_float(payload.get("unit_cost"), 0))
+    fx = as_float(payload.get("fx_to_rub"), 1 if currency in {"RUB", "RUR"} else 0)
+    if currency in {"RUB", "RUR"}:
+        fx = 1.0
+    if unit_cost > 0 and fx <= 0:
+        raise ValueError("Для закупки не в рублях укажите курс валюты к ₽")
+    if supplier_name and not supplier_id:
+        supplier = upsert_supplier(supplier_name, currency=currency)
+        supplier_id = as_int(supplier.get("id"), 0)
+    elif supplier_id and not supplier_name:
+        with db_connect() as conn:
+            row = conn.execute("SELECT name FROM suppliers WHERE id=?", (supplier_id,)).fetchone()
+        supplier_name = str(row["name"] if row else "")
+    meaningful = supplier_id or supplier_name or unit_cost > 0 or str(payload.get("notes") or "").strip()
+    if not meaningful:
+        return None
+    purchased_at = str(payload.get("purchased_at") or date.today().isoformat())
+    warranty_days = max(0, as_int(payload.get("warranty_days"), 0))
+    warranty_until = ""
+    parsed_purchase = parse_iso_datetime(purchased_at)
+    if warranty_days and parsed_purchase:
+        warranty_until = (parsed_purchase + timedelta(days=warranty_days)).date().isoformat()
+    now = _utc_now()
+    with db_connect() as conn:
+        cur = conn.execute(
+            """INSERT INTO inventory_batches(offer_id,product_name,supplier_id,supplier_name,quantity,unit_cost,cost_currency,fx_to_rub,unit_cost_rub,purchased_at,warranty_until,notes,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (str(offer_id), str(product_name or ""), supplier_id or None, supplier_name, max(0, int(quantity)), unit_cost, currency, fx, round(unit_cost * fx, 4), purchased_at, warranty_until, str(payload.get("notes") or "")[:4000], now),
+        )
+        return int(cur.lastrowid)
+
+
+def record_inventory_upload(offer_id: Any, values: Iterable[str], product_name: str = "", batch_id: Optional[int] = None) -> int:
+    now = _utc_now()
+    inserted = 0
+    batch: dict[str, Any] = {}
+    if batch_id:
+        with db_connect() as conn:
+            row = conn.execute("SELECT * FROM inventory_batches WHERE id=?", (batch_id,)).fetchone()
+        batch = dict(row) if row else {}
+    with db_connect() as conn:
+        for value in values:
+            normalized = normalize_secret_content(value)
+            if not normalized:
+                continue
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO inventory_ledger
+                (offer_id,product_name,content_hash,content_masked,status,source,added_at,metadata_json,batch_id,supplier_id,unit_cost,cost_currency,unit_cost_rub)
+                VALUES(?,?,?,?, 'in_stock','upload',?,?,?,?,?,?,?)""",
+                (str(offer_id or ""), product_name, content_fingerprint(normalized), mask_secret_content(value), now,
+                 json.dumps({"length": len(normalized)}, ensure_ascii=False), batch_id, batch.get("supplier_id"), batch.get("unit_cost"), batch.get("cost_currency"), batch.get("unit_cost_rub")),
+            )
+            inserted += max(0, cur.rowcount)
+    return inserted
+
+
+def get_problem_case(*, invoice_id: str = "", case_id: int = 0) -> dict[str, Any]:
+    with db_connect() as conn:
+        if case_id:
+            row = conn.execute("SELECT * FROM problem_cases WHERE id=?", (case_id,)).fetchone()
+        else:
+            row = conn.execute("SELECT * FROM problem_cases WHERE invoice_id=? ORDER BY id DESC LIMIT 1", (str(invoice_id),)).fetchone()
+    return dict(row) if row else {}
+
+
+def upsert_problem_case(*, invoice_id: str, conversation_id: str = "", offer_id: str = "", product_name: str = "", status: str = "new", priority: str = "normal", category: str = "other", error_code: str = "", reason: str = "", source: str = "manual", note: str = "", case_id: int = 0) -> dict[str, Any]:
+    status = status if status in V7_CASE_STATUSES else "new"
+    priority = priority if priority in V7_CASE_PRIORITIES else "normal"
+    now = _utc_now()
+    with db_connect() as conn:
+        existing = conn.execute("SELECT id FROM problem_cases WHERE id=?", (int(case_id),)).fetchone() if case_id else None
+        if not existing and invoice_id:
+            existing = conn.execute("SELECT id FROM problem_cases WHERE invoice_id=? AND status NOT IN ('resolved','closed') ORDER BY id DESC LIMIT 1", (str(invoice_id),)).fetchone()
+        if not existing and conversation_id:
+            existing = conn.execute("SELECT id FROM problem_cases WHERE conversation_id=? AND status NOT IN ('resolved','closed') ORDER BY id DESC LIMIT 1", (str(conversation_id),)).fetchone()
+        resolved_at = now if status in {"resolved", "closed"} else None
+        if existing:
+            conn.execute(
+                """UPDATE problem_cases SET invoice_id=COALESCE(NULLIF(?,''),invoice_id),conversation_id=COALESCE(NULLIF(?,''),conversation_id),
+                offer_id=COALESCE(NULLIF(?,''),offer_id),product_name=COALESCE(NULLIF(?,''),product_name),status=?,priority=?,category=?,
+                error_code=COALESCE(NULLIF(?,''),error_code),reason=COALESCE(NULLIF(?,''),reason),source=?,note=CASE WHEN ?!='' THEN ? ELSE note END,
+                updated_at=?,resolved_at=? WHERE id=?""",
+                (invoice_id, conversation_id, offer_id, product_name, status, priority, category, error_code, reason, source, note, note, now, resolved_at, existing["id"]),
+            )
+            case_id = int(existing["id"])
+        else:
+            cur = conn.execute(
+                """INSERT INTO problem_cases(invoice_id,conversation_id,offer_id,product_name,status,priority,category,error_code,reason,source,note,created_at,updated_at,resolved_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (invoice_id, conversation_id, offer_id, product_name, status, priority, category, error_code, reason, source, note, now, now, resolved_at),
+            )
+            case_id = int(cur.lastrowid)
+        row = conn.execute("SELECT * FROM problem_cases WHERE id=?", (case_id,)).fetchone()
+    return dict(row)
+
+
+def problem_cases_payload(status: str = "", query: str = "", limit: int = 200) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if status and status != "all":
+        clauses.append("status=?"); params.append(status)
+    if query:
+        folded = f"%{query.casefold()}%"
+        clauses.append("(lower(invoice_id) LIKE ? OR lower(product_name) LIKE ? OR lower(reason) LIKE ? OR lower(error_code) LIKE ? OR lower(note) LIKE ?)")
+        params.extend([folded] * 5)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    with db_connect() as conn:
+        rows = conn.execute(f"SELECT * FROM problem_cases{where} ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, updated_at DESC LIMIT ?", (*params, max(1, min(limit, 500)))).fetchall()
+    return [dict(row) for row in rows]
+
+
+def extract_error_code(text: str) -> str:
+    match = re.search(r"\b0x[0-9a-fA-F]{6,10}\b", str(text or ""))
+    return match.group(0).lower() if match else ""
+
+
+def classify_issue(text: str) -> dict[str, str]:
+    folded = str(text or "").casefold()
+    error = extract_error_code(text)
+    # An activation/error code is itself a strong activation signal. Handle it
+    # before textual categories so it cannot accidentally become a refund.
+    if error:
+        return {"category": "activation", "priority": "high", "error_code": error}
+    patterns = [
+        ("refund", "high", ("возврат", "верните деньги", "refund")),
+        ("not_received", "critical", ("не пришло", "ничего не получил", "не получил товар")),
+        ("activation", "high", ("не работает", "не активируется", "ошибка активации", "ключ недействителен", "уже использован", "заблокирован")),
+        ("installation", "normal", ("не устанавливается", "ошибка установки", "не могу установить")),
+        ("complaint", "critical", ("обман", "мошен", "жалоба", "негативный отзыв")),
+    ]
+    for category, priority, words in patterns:
+        if any(word in folded for word in words):
+            return {"category": category, "priority": priority, "error_code": ""}
+    return {"category": "", "priority": "normal", "error_code": ""}
+
+
+def _issue_signature(offer_id: str, product_name: str, category: str, error_code: str) -> str:
+    base = "|".join([str(offer_id or "unknown"), str(product_name or "").casefold()[:100], error_code or category or "other"])
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()
+
+
+def refresh_incident(signature: str) -> dict[str, Any]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=ISSUE_WINDOW_MINUTES)).isoformat()
+    now = _utc_now()
+    with db_connect() as conn:
+        rows = conn.execute("SELECT * FROM issue_signals WHERE signature=? AND created_at>=? ORDER BY created_at", (signature, cutoff)).fetchall()
+        if len(rows) < ISSUE_ALERT_THRESHOLD:
+            return {"created": False, "count": len(rows)}
+        sample = [dict(row) for row in rows[-5:]]
+        first = rows[0]
+        existing = conn.execute("SELECT * FROM incident_alerts WHERE signature=?", (signature,)).fetchone()
+        notified_at = existing["notified_at"] if existing else None
+        conn.execute(
+            """INSERT INTO incident_alerts(signature,offer_id,product_name,error_code,category,signal_count,window_minutes,status,first_seen,last_seen,notified_at,sample_json,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,'open',?,?,?,?,?,?) ON CONFLICT(signature) DO UPDATE SET
+               signal_count=excluded.signal_count,last_seen=excluded.last_seen,sample_json=excluded.sample_json,status='open',updated_at=excluded.updated_at""",
+            (signature, first["offer_id"], first["product_name"], first["error_code"], first["category"], len(rows), ISSUE_WINDOW_MINUTES,
+             rows[0]["created_at"], rows[-1]["created_at"], notified_at, json.dumps(sample, ensure_ascii=False), now, now),
+        )
+        alert = conn.execute("SELECT * FROM incident_alerts WHERE signature=?", (signature,)).fetchone()
+        should_notify = not notified_at
+        if should_notify:
+            conn.execute("UPDATE incident_alerts SET notified_at=? WHERE signature=?", (now, signature))
+    result = dict(alert) if alert else {"signature": signature, "signal_count": len(rows)}
+    result["created"] = should_notify
+    return result
+
+
+def run_v7_message_intelligence(*, invoice_id: str, conversation_id: str, debate_id: str, offer_id: str, product_name: str, message_text: str, message_date: str) -> None:
+    issue = classify_issue(message_text)
+    if not issue.get("category"):
+        return
+    case = upsert_problem_case(
+        invoice_id=invoice_id, conversation_id=conversation_id, offer_id=offer_id, product_name=product_name,
+        status="new", priority=issue["priority"], category=issue["category"], error_code=issue["error_code"],
+        reason=str(message_text or "")[:1000], source="webhook",
+    )
+    signature = _issue_signature(offer_id, product_name, issue["category"], issue["error_code"])
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO issue_signals(signature,invoice_id,conversation_id,offer_id,product_name,error_code,category,message_excerpt,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (signature, invoice_id, conversation_id, offer_id, product_name, issue["error_code"], issue["category"], str(message_text or "")[:500], normalize_datetime_text(message_date) or _utc_now()),
+        )
+    incident = refresh_incident(signature)
+    if incident.get("created"):
+        send_text(
+            f"⚠️ <b>Возможная массовая проблема</b>\n\n"
+            f"Товар: <b>{safe(product_name or offer_id)}</b>\n"
+            f"Сигналов за {ISSUE_WINDOW_MINUTES} мин.: <b>{safe(incident.get('signal_count'))}</b>\n"
+            f"Ошибка/тип: <code>{safe(issue.get('error_code') or issue.get('category'))}</code>\n"
+            f"Последний заказ: <code>{safe(invoice_id)}</code>"
+        )
+    logger.info("Problem case %s updated from debate %s", case.get("id"), debate_id)
+
+
+def _conversation_id_for_invoice(invoice_id: str) -> str:
+    with db_connect() as conn:
+        row = conn.execute("SELECT conversation_id FROM conversation_debates WHERE invoice_id=? ORDER BY updated_at DESC LIMIT 1", (str(invoice_id),)).fetchone()
+        if not row:
+            row = conn.execute("SELECT conversation_id FROM conversations WHERE latest_invoice_id=? ORDER BY updated_at DESC LIMIT 1", (str(invoice_id),)).fetchone()
+    return str(row["conversation_id"] if row else "")
+
+
+def _raw_stock_entries(offer_id: int, max_pages: int = 3) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for page in range(1, max_pages + 1):
+        raw = ggsel.products_v2(offer_id, page, 100)
+        items = extract_list(raw, ("items", "products", "rows", "data"))
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            product_id = get_any(item, ("id", "product_id", "id_product", "content_id"), "")
+            value = get_any(item, ("value", "content", "text", "product_value", "code", "key"), "")
+            if product_id not in (None, "") and str(value or "").strip():
+                result.append({"id": str(product_id), "value": str(value), "status": item.get("status"), "raw": item})
+        if len(items) < 100:
+            break
+    return result
+
+
+def replacement_preview(invoice_id: str, offer_id: str = "") -> dict[str, Any]:
+    with db_connect() as conn:
+        order = conn.execute("SELECT * FROM orders WHERE invoice_id=?", (str(invoice_id),)).fetchone()
+    if not order:
+        raw = ggsel.order_info(invoice_id)
+        if isinstance(raw, dict):
+            upsert_order(invoice_id, raw)
+        with db_connect() as conn:
+            order = conn.execute("SELECT * FROM orders WHERE invoice_id=?", (str(invoice_id),)).fetchone()
+    if not order:
+        raise ValueError("Заказ не найден")
+    resolved_offer = str(offer_id or order["item_id"] or "")
+    if not resolved_offer.isdigit():
+        raise ValueError("Не удалось определить ID товара для замены")
+    entries = _raw_stock_entries(int(resolved_offer))
+    if not entries:
+        raise ValueError("На складе этого товара нет доступного содержимого")
+    candidate = entries[0]
+    return {
+        "invoice_id": str(invoice_id), "offer_id": resolved_offer, "product_name": order["product_name"],
+        "product_id": candidate["id"], "content_masked": mask_secret_content(candidate["value"]), "stock_available": len(entries),
+        "conversation_id": _conversation_id_for_invoice(invoice_id),
+    }
+
+
+def replacement_history(invoice_id: str) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        rows = conn.execute("SELECT * FROM replacement_events WHERE invoice_id=? ORDER BY id DESC", (str(invoice_id),)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def ensure_async_operation_not_failed(result: Any) -> dict[str, Any]:
+    """Check an async GGSEL result once and stop only on an explicit failure.
+
+    A queued/running job is still considered accepted; it remains visible in
+    the operations centre and can be refreshed there.
+    """
+    job_id = extract_job_id(result)
+    if not job_id:
+        return {"job_id": "", "state": "synchronous", "result": result}
+    try:
+        check = ggsel.async_job_v2(job_id)
+    except Exception as exc:
+        logger.info("Async job %s is not ready yet: %s", job_id, exc)
+        return {"job_id": job_id, "state": "queued", "result": result}
+    text = json.dumps(check, ensure_ascii=False, default=str).casefold()
+    if any(word in text for word in ("failed", "error", "ошиб", "cancelled", "canceled")):
+        raise RuntimeError(f"GGSEL не зарезервировал содержимое: {check}")
+    if any(word in text for word in ("completed", "success", "done", "успеш")):
+        return {"job_id": job_id, "state": "completed", "result": check}
+    return {"job_id": job_id, "state": "running", "result": check}
+
+
+def execute_replacement(*, invoice_id: str, offer_id: str, product_id: str, reason: str, user_id: Any) -> dict[str, Any]:
+    preview = replacement_preview(invoice_id, offer_id)
+    if str(preview["product_id"]) != str(product_id):
+        entries = _raw_stock_entries(int(preview["offer_id"]))
+        candidate = next((x for x in entries if str(x["id"]) == str(product_id)), None)
+        if not candidate:
+            raise ValueError("Выбранное содержимое уже недоступно. Обновите предварительный просмотр")
+    else:
+        entries = _raw_stock_entries(int(preview["offer_id"]))
+        candidate = next((x for x in entries if str(x["id"]) == str(product_id)), None)
+    if not candidate:
+        raise ValueError("Содержимое не найдено на складе")
+    conversation_id = preview.get("conversation_id") or _conversation_id_for_invoice(invoice_id)
+    if not conversation_id:
+        raise ValueError("Для заказа не найден диалог покупателя")
+    summary = _conversation_summary(str(conversation_id))
+    debate_id = str(summary.get("latest_debate_id") or "")
+    if not debate_id:
+        raise ValueError("У покупателя нет активного ID диалога GGSEL")
+    value = str(candidate["value"])
+    now = _utc_now()
+    archive_result: Any = None
+    message_result: Any = None
+    status = "started"
+    error_text = ""
+    try:
+        archive_result = ggsel.archive_products_v2(int(preview["offer_id"]), [int(candidate["id"])], False)
+        operation = record_operation("replacement_reserve", preview["offer_id"], archive_result)
+        reservation_check = ensure_async_operation_not_failed(archive_result)
+        archive_result = {"request": archive_result, "operation": operation, "check": reservation_check}
+        status = "reserved"
+        message = (
+            "Мы подготовили замену по вашему заказу.\n\n"
+            f"Новый код/содержимое:\n{value}\n\n"
+            "Пожалуйста, используйте его на том же устройстве и сообщите результат."
+        )
+        if reason:
+            message = f"По результатам проверки: {reason.strip()}\n\n" + message
+        message_result = ggsel.send_chat_message(debate_id, message)
+        save_message_record(message_id="", debate_id=debate_id, invoice_id=str(invoice_id), sender="seller", message_text=message, image_url="", message_date=now, conversation_id=str(conversation_id), buyer_email=str(summary.get("buyer_email") or ""))
+        ensure_conversation(debate_id=debate_id, invoice_id=str(invoice_id), email=str(summary.get("buyer_email") or ""), account=str(summary.get("buyer_account") or ""), product_name=str(preview.get("product_name") or ""), preview=message, when=now)
+        status = "sent"
+    except Exception as exc:
+        error_text = str(exc)
+        if status == "reserved":
+            try:
+                ggsel.add_products_v2(int(preview["offer_id"]), [value])
+                status = "rolled_back"
+            except Exception as rollback_exc:
+                status = "rollback_failed"
+                error_text += f"; возврат на склад не выполнен: {rollback_exc}"
+        with db_connect() as conn:
+            conn.execute(
+                """INSERT INTO replacement_events(invoice_id,conversation_id,offer_id,source_product_id,new_content_hash,new_content_masked,reason,status,archive_result_json,message_result_json,error_text,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (str(invoice_id), str(conversation_id), str(preview["offer_id"]), str(candidate["id"]), content_fingerprint(value), mask_secret_content(value), reason, status,
+                 json.dumps(archive_result, ensure_ascii=False, default=str) if archive_result is not None else None,
+                 json.dumps(message_result, ensure_ascii=False, default=str) if message_result is not None else None, error_text, now),
+            )
+        raise RuntimeError(f"Замена не завершена: {error_text}") from exc
+    old_mask = ""
+    with db_connect() as conn:
+        old = conn.execute("SELECT content_masked FROM inventory_ledger WHERE invoice_id=? ORDER BY id DESC LIMIT 1", (str(invoice_id),)).fetchone()
+        old_mask = str(old["content_masked"] if old else "")
+        conn.execute("UPDATE inventory_ledger SET status='replaced',replaced_at=? WHERE invoice_id=?", (now, str(invoice_id)))
+        conn.execute(
+            """INSERT INTO inventory_ledger(offer_id,product_name,content_hash,content_masked,status,invoice_id,source,added_at,sold_at,metadata_json)
+               VALUES(?,?,?,?, 'sold',?,'replacement',?,?,?)""",
+            (str(preview["offer_id"]), str(preview.get("product_name") or ""), content_fingerprint(value), mask_secret_content(value), str(invoice_id), now, now,
+             json.dumps({"source_product_id": str(candidate["id"]), "reason": reason}, ensure_ascii=False)),
+        )
+        cur = conn.execute(
+            """INSERT INTO replacement_events(invoice_id,conversation_id,offer_id,source_product_id,old_content_masked,new_content_hash,new_content_masked,reason,status,archive_result_json,message_result_json,created_at,sent_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (str(invoice_id), str(conversation_id), str(preview["offer_id"]), str(candidate["id"]), old_mask, content_fingerprint(value), mask_secret_content(value), reason, "sent",
+             json.dumps(archive_result, ensure_ascii=False, default=str), json.dumps(message_result, ensure_ascii=False, default=str), now, now),
+        )
+        event_id = int(cur.lastrowid)
+    upsert_problem_case(invoice_id=str(invoice_id), conversation_id=str(conversation_id), offer_id=str(preview["offer_id"]), product_name=str(preview.get("product_name") or ""), status="resolved", priority="normal", category="activation", reason=reason, source="replacement")
+    audit_miniapp(user_id, "one_click_replacement", str(invoice_id), {"offer_id": preview["offer_id"], "product_id": candidate["id"], "replacement_id": event_id})
+    invalidate_offer_cache()
+    return {"replacement_id": event_id, "invoice_id": str(invoice_id), "content_masked": mask_secret_content(value), "status": "sent", "conversation_id": conversation_id}
+
+
+def _cost_rows_for_invoice(invoice_id: str) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        rows = conn.execute("SELECT unit_cost,cost_currency,unit_cost_rub,batch_id,supplier_id,content_masked,status FROM inventory_ledger WHERE invoice_id=?", (str(invoice_id),)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def order_profitability(invoice_id: str, payload: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    if payload is None:
+        with db_connect() as conn:
+            row = conn.execute("SELECT * FROM orders WHERE invoice_id=?", (str(invoice_id),)).fetchone()
+        payload = dict(row) if row else {}
+    costs = _cost_rows_for_invoice(invoice_id)
+    cost_rub = round(sum(as_float(row.get("unit_cost_rub"), 0) for row in costs), 2)
+    settings = get_business_settings()
+    currency = str(payload.get("currency") or payload.get("currency_type") or "RUB").upper()
+    platform_profit = as_float(payload.get("profit"), 0)
+    rate = 1.0 if currency in {"RUB", "RUR"} else as_float(settings.get("settlement_to_rub"), 0) if currency == str(settings.get("settlement_currency") or "USD").upper() else 0
+    platform_profit_rub = round(platform_profit * rate, 2) if rate > 0 else None
+    net_rub = round(platform_profit_rub - cost_rub, 2) if platform_profit_rub is not None and costs else None
+    margin = round(net_rub / platform_profit_rub * 100, 2) if net_rub is not None and platform_profit_rub else None
+    return {
+        "platform_profit": platform_profit, "currency": currency, "platform_profit_rub": platform_profit_rub,
+        "cost_rub": cost_rub, "net_profit_rub": net_rub, "margin_percent": margin,
+        "cost_known": bool(costs), "cost_items": len(costs), "settlement_rate": rate or None,
+    }
+
+
+def profitability_report(start: str = "", end: str = "") -> dict[str, Any]:
+    clauses = []
+    params: list[Any] = []
+    if start:
+        clauses.append("COALESCE(NULLIF(date_pay,''),purchase_date,updated_at)>=?"); params.append(f"{start}T00:00:00")
+    if end:
+        clauses.append("COALESCE(NULLIF(date_pay,''),purchase_date,updated_at)<=?"); params.append(f"{end}T23:59:59")
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    with db_connect() as conn:
+        rows = conn.execute(f"SELECT * FROM orders{where} ORDER BY COALESCE(NULLIF(date_pay,''),purchase_date,updated_at) DESC LIMIT 2000", params).fetchall()
+    items = []
+    known = 0
+    total_platform_rub = total_cost_rub = total_net_rub = 0.0
+    for row in rows:
+        data = dict(row)
+        p = order_profitability(str(row["invoice_id"]), {**data, "currency": data.get("currency")})
+        item = {"invoice_id": row["invoice_id"], "product_name": row["product_name"], "date": row["date_pay"] or row["purchase_date"], **p}
+        items.append(item)
+        if p["platform_profit_rub"] is not None:
+            total_platform_rub += p["platform_profit_rub"]
+        if p["cost_known"]:
+            known += 1
+            total_cost_rub += p["cost_rub"]
+            if p["net_profit_rub"] is not None:
+                total_net_rub += p["net_profit_rub"]
+    return {
+        "orders": len(items), "cost_known_orders": known, "coverage_percent": round(known / len(items) * 100, 1) if items else 0,
+        "platform_profit_rub": round(total_platform_rub, 2), "cost_rub": round(total_cost_rub, 2), "net_profit_rub": round(total_net_rub, 2),
+        "items": items[:200], "settings": get_business_settings(),
+    }
+
+
+def sync_recent_orders_for_profitability(limit: int = 20) -> dict[str, Any]:
+    limit = max(1, min(as_int(limit, 20), 50))
+    raw_sales = ggsel.last_sales()
+    upsert_sales(raw_sales)
+    sales = _sales_payload(raw_sales)[:limit]
+    synced = 0
+    indexed = 0
+    errors: list[dict[str, str]] = []
+    for sale in sales:
+        invoice_id = str(sale.get("invoice_id") or "")
+        if not invoice_id:
+            continue
+        try:
+            raw_order = ggsel.order_info(invoice_id)
+            if isinstance(raw_order, dict):
+                upsert_order(invoice_id, raw_order)
+                indexed += index_sold_content_from_order(invoice_id, raw_order)
+                synced += 1
+        except Exception as exc:
+            errors.append({"invoice_id": invoice_id, "error": str(exc)})
+    return {
+        "requested": len(sales),
+        "synced": synced,
+        "indexed_content": indexed,
+        "errors": errors,
+        "report": profitability_report(),
+    }
+
+
+def list_knowledge(query: str = "", category: str = "", product: str = "", error_code: str = "") -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        rows = conn.execute("SELECT * FROM knowledge_articles WHERE enabled=1 ORDER BY category,title").fetchall()
+    result = []
+    folded = query.casefold().strip()
+    product_folded = product.casefold().strip()
+    error = error_code.casefold().strip()
+    for row in rows:
+        item = dict(row)
+        codes = json.loads(item.get("error_codes_json") or "[]")
+        item["error_codes"] = codes
+        hay = " ".join([item.get("title") or "", item.get("body") or "", item.get("category") or ""]).casefold()
+        if folded and folded not in hay:
+            continue
+        if category and item.get("category") != category:
+            continue
+        pattern = str(item.get("product_pattern") or "").casefold()
+        if product_folded and pattern and pattern not in product_folded:
+            continue
+        if error and codes and error not in [str(x).casefold() for x in codes]:
+            continue
+        result.append(item)
+    return result
+
+
+def diagnostic_recommendation(payload: dict[str, Any]) -> dict[str, Any]:
+    family = str(payload.get("product_family") or "other").casefold()
+    error = extract_error_code(str(payload.get("error_code") or payload.get("description") or "")) or str(payload.get("error_code") or "").casefold().strip()
+    installed = str(payload.get("installed_edition") or "").casefold()
+    purchased = str(payload.get("purchased_edition") or "").casefold()
+    steps: list[str] = []
+    action = "diagnosis"
+    title = "Нужна дополнительная проверка"
+    if family == "windows":
+        if error == "0xc004f050" or (installed and purchased and installed != purchased):
+            title = "Вероятно, не совпадает редакция Windows"
+            steps = ["Проверить выпуск Windows в разделе «О системе».", "Если установлен Home, а ключ Pro — сначала обновить редакцию до Pro.", "Перезагрузить компьютер и повторить активацию."]
+        elif error in {"0xc004c060", "0xc004c003"}:
+            title = "Возможна блокировка ключа"
+            steps = ["Проверить соответствие редакции.", "Проверить отсутствие опечатки.", "Если редакция верна — подготовить замену."]
+            action = "replacement"
+        else:
+            title = "Диагностика Windows"
+            steps = ["Уточнить редакцию Windows.", "Получить полный скриншот ошибки.", "Проверить подключение к интернету и дату/время.", "Повторить активацию после перезагрузки."]
+    elif family == "office":
+        if error == "0xc004f074":
+            title = "Вероятно, установлен KMS/корпоративный Office"
+            steps = ["Открыть Файл → Учётная запись и проверить название продукта.", "Удалить несовместимый корпоративный выпуск.", "Перезагрузить ПК и установить нужный дистрибутив."]
+        elif error in {"0xc004c060", "0xc004c003"}:
+            title = "Возможна блокировка ключа Office"
+            steps = ["Проверить версию Office и тип лицензии.", "Удалить старые выпуски Office.", "Если версия совпадает — подготовить замену."]
+            action = "replacement"
+        else:
+            title = "Диагностика Office"
+            steps = ["Проверить версию Office в разделе «Учётная запись».", "Удалить старые или конфликтующие выпуски.", "Перезагрузить ПК и повторить установку/активацию."]
+    else:
+        steps = ["Запросить полный скриншот ошибки.", "Уточнить устройство, систему и версию продукта.", "Сопоставить данные с карточкой товара и инструкцией."]
+    articles = list_knowledge(product=family, error_code=error)
+    response_text = title + "\n\n" + "\n".join(f"{i+1}. {step}" for i, step in enumerate(steps))
+    if articles:
+        response_text += "\n\nПодходящая инструкция:\n" + articles[0]["body"]
+    return {"title": title, "action": action, "steps": steps, "error_code": error, "articles": articles[:5], "response_text": response_text}
+
+
+def sync_reviews_snapshot(page: int = 1) -> int:
+    rows = _review_payload(ggsel.reviews(page))
+    now = _utc_now()
+    count = 0
+    with db_connect() as conn:
+        for item in rows:
+            invoice = str(get_any(item, ("invoice_id", "inv", "invoice"), ""))
+            if not invoice:
+                continue
+            product_id = str(get_any(item, ("item_id", "product_id", "id_goods"), ""))
+            conn.execute(
+                """INSERT INTO review_events(invoice_id,product_id,product_name,rating_label,is_negative,review_text,review_date,updated_at)
+                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(invoice_id) DO UPDATE SET product_id=excluded.product_id,product_name=excluded.product_name,
+                rating_label=excluded.rating_label,is_negative=excluded.is_negative,review_text=excluded.review_text,review_date=excluded.review_date,updated_at=excluded.updated_at""",
+                (invoice, product_id, str(item.get("product_name") or ""), str(item.get("rating_label") or ""),
+                 1 if (item.get("is_positive") is False or str(item.get("rating_label") or "").casefold() in {"отрицательный", "negative", "негативный"}) else 0,
+                 str(item.get("text") or "")[:4000], str(get_any(item, ("date", "created_at", "date_written"), "")), now),
+            )
+            count += 1
+    return count
+
+
+def quality_payload() -> dict[str, Any]:
+    try:
+        sync_reviews_snapshot(1)
+    except Exception as exc:
+        record_api_error("GGSEL V1", "/reviews", getattr(exc, "status", 0), str(exc))
+    with db_connect() as conn:
+        sales_rows = conn.execute(
+            "SELECT COALESCE(NULLIF(product_id,''),'unknown') product_id,COALESCE(NULLIF(product_name,''),'Без названия') product_name,COUNT(*) sales_count FROM sales GROUP BY product_id,product_name"
+        ).fetchall()
+        case_rows = conn.execute("SELECT offer_id,product_name,invoice_id,conversation_id FROM problem_cases").fetchall()
+        replacement_rows = conn.execute("SELECT offer_id,invoice_id FROM replacement_events WHERE status='sent'").fetchall()
+        negative_rows = conn.execute("SELECT product_id,product_name,invoice_id FROM review_events WHERE is_negative=1").fetchall()
+        supplier_rows = conn.execute(
+            """SELECT b.supplier_id,COALESCE(s.name,b.supplier_name,'Без поставщика') supplier_name,
+            COUNT(l.id) total_items,SUM(CASE WHEN l.status IN ('sold','replaced') THEN 1 ELSE 0 END) sold_items,
+            SUM(CASE WHEN l.status='replaced' THEN 1 ELSE 0 END) replaced_items,
+            SUM(COALESCE(l.unit_cost_rub,0)) inventory_cost_rub
+            FROM inventory_batches b LEFT JOIN suppliers s ON s.id=b.supplier_id LEFT JOIN inventory_ledger l ON l.batch_id=b.id
+            GROUP BY b.supplier_id,supplier_name ORDER BY total_items DESC"""
+        ).fetchall()
+
+    def identity_keys(product_id: Any, product_name: Any) -> list[str]:
+        keys: list[str] = []
+        pid = str(product_id or "").strip()
+        name = str(product_name or "").casefold().strip()
+        if pid and pid != "unknown":
+            keys.append(f"id:{pid}")
+        if name and name != "без названия":
+            keys.append(f"name:{name}")
+        return keys
+
+    affected_map: dict[str, set[str]] = {}
+    case_map: dict[str, set[str]] = {}
+    replacement_map: dict[str, set[str]] = {}
+    negative_map: dict[str, set[str]] = {}
+
+    def add_event(target: dict[str, set[str]], keys: list[str], invoice: Any, fallback: Any = "") -> None:
+        marker = str(invoice or fallback or "").strip()
+        if not marker:
+            return
+        for key in keys:
+            target.setdefault(key, set()).add(marker)
+            affected_map.setdefault(key, set()).add(marker)
+
+    for row in case_rows:
+        add_event(case_map, identity_keys(row["offer_id"], row["product_name"]), row["invoice_id"], row["conversation_id"])
+    for row in replacement_rows:
+        add_event(replacement_map, identity_keys(row["offer_id"], ""), row["invoice_id"])
+    for row in negative_rows:
+        add_event(negative_map, identity_keys(row["product_id"], row["product_name"]), row["invoice_id"])
+
+    def union_for(mapping: dict[str, set[str]], keys: list[str]) -> set[str]:
+        result: set[str] = set()
+        for key in keys:
+            result.update(mapping.get(key, set()))
+        return result
+
+    products = []
+    for row in sales_rows:
+        pid = str(row["product_id"])
+        pname = str(row["product_name"])
+        keys = identity_keys(pid, pname)
+        sales_count = as_int(row["sales_count"])
+        affected = min(sales_count, len(union_for(affected_map, keys)))
+        reliability = round(max(0, (sales_count - affected) / sales_count * 100), 1) if sales_count else None
+        products.append({
+            "product_id": pid,
+            "product_name": pname,
+            "sales_count": sales_count,
+            "problem_orders": len(union_for(case_map, keys)),
+            "replacements": len(union_for(replacement_map, keys)),
+            "negative_reviews": len(union_for(negative_map, keys)),
+            "affected_orders": affected,
+            "reliability": reliability,
+        })
+    products.sort(key=lambda item: (item["reliability"] is None, item["reliability"] if item["reliability"] is not None else 101, -item["sales_count"]))
+
+    suppliers = []
+    for row in supplier_rows:
+        sold = as_int(row["sold_items"])
+        replaced = as_int(row["replaced_items"])
+        suppliers.append({**dict(row), "quality": round(max(0, (sold - replaced) / sold * 100), 1) if sold else None})
+    with db_connect() as conn:
+        incidents = [dict(r) for r in conn.execute("SELECT * FROM incident_alerts WHERE status='open' ORDER BY signal_count DESC,last_seen DESC LIMIT 100").fetchall()]
+    return {"products": products, "suppliers": suppliers, "incidents": incidents}
+
+
+@app.get('/app/api/suppliers')
+@miniapp_api
+def miniapp_suppliers(user: dict[str, Any]):
+    with db_connect() as conn:
+        rows = conn.execute("SELECT * FROM suppliers ORDER BY name").fetchall()
+    return miniapp_success([dict(row) for row in rows])
+
+
+@app.post('/app/api/suppliers')
+@miniapp_api
+def miniapp_supplier_create(user: dict[str, Any]):
+    body = request.get_json(silent=True) or {}
+    result = upsert_supplier(str(body.get('name') or ''), str(body.get('contact') or ''), str(body.get('notes') or ''), str(body.get('default_currency') or 'RUB'))
+    audit_miniapp(user.get('id'), 'supplier_save', result.get('id'), {'name': result.get('name')})
+    return miniapp_success(result)
+
+
+@app.delete('/app/api/suppliers/<int:supplier_id>')
+@miniapp_api
+def miniapp_supplier_delete(user: dict[str, Any], supplier_id: int):
+    with db_connect() as conn:
+        conn.execute("DELETE FROM suppliers WHERE id=?", (supplier_id,))
+    audit_miniapp(user.get('id'), 'supplier_delete', supplier_id, {})
+    return miniapp_success({'deleted': supplier_id})
+
+
+@app.get('/app/api/batches')
+@miniapp_api
+def miniapp_batches(user: dict[str, Any]):
+    with db_connect() as conn:
+        rows = conn.execute("""SELECT b.*,COALESCE(s.name,b.supplier_name,'') supplier_display,
+            (SELECT COUNT(*) FROM inventory_ledger l WHERE l.batch_id=b.id) ledger_count,
+            (SELECT COUNT(*) FROM inventory_ledger l WHERE l.batch_id=b.id AND l.status='in_stock') in_stock,
+            (SELECT COUNT(*) FROM inventory_ledger l WHERE l.batch_id=b.id AND l.status='sold') sold,
+            (SELECT COUNT(*) FROM inventory_ledger l WHERE l.batch_id=b.id AND l.status='replaced') replaced
+            FROM inventory_batches b LEFT JOIN suppliers s ON s.id=b.supplier_id ORDER BY b.id DESC LIMIT 300""").fetchall()
+    return miniapp_success([dict(row) for row in rows])
+
+
+@app.get('/app/api/profitability')
+@miniapp_api
+def miniapp_profitability(user: dict[str, Any]):
+    return miniapp_success(profitability_report(str(request.args.get('start') or ''), str(request.args.get('end') or '')))
+
+
+@app.post('/app/api/profitability/sync')
+@miniapp_api
+def miniapp_profitability_sync(user: dict[str, Any]):
+    body = request.get_json(silent=True) or {}
+    result = sync_recent_orders_for_profitability(as_int(body.get('limit'), 20))
+    audit_miniapp(user.get('id'), 'profitability_sync', str(result.get('synced')), {'requested': result.get('requested'), 'errors': len(result.get('errors') or [])})
+    return miniapp_success(result)
+
+
+@app.get('/app/api/business-settings')
+@miniapp_api
+def miniapp_business_settings(user: dict[str, Any]):
+    return miniapp_success(get_business_settings())
+
+
+@app.put('/app/api/business-settings')
+@miniapp_api
+def miniapp_business_settings_put(user: dict[str, Any]):
+    body = request.get_json(silent=True) or {}
+    currency = str(body.get('settlement_currency') or 'USD').upper()[:8]
+    rate = max(0, as_float(body.get('settlement_to_rub'), 0))
+    margin = max(0, min(as_float(body.get('target_margin'), 30), 1000))
+    with db_connect() as conn:
+        conn.execute("INSERT OR REPLACE INTO business_settings(id,settlement_currency,settlement_to_rub,target_margin,updated_at) VALUES(1,?,?,?,?)", (currency, rate, margin, _utc_now()))
+    return miniapp_success(get_business_settings())
+
+
+@app.get('/app/api/problem-cases')
+@miniapp_api
+def miniapp_problem_cases(user: dict[str, Any]):
+    return miniapp_success(problem_cases_payload(str(request.args.get('status') or ''), str(request.args.get('q') or ''), as_int(request.args.get('limit'), 200)))
+
+
+@app.post('/app/api/problem-cases')
+@miniapp_api
+def miniapp_problem_case_create(user: dict[str, Any]):
+    body = request.get_json(silent=True) or {}
+    case = upsert_problem_case(invoice_id=str(body.get('invoice_id') or ''), conversation_id=str(body.get('conversation_id') or ''), offer_id=str(body.get('offer_id') or ''), product_name=str(body.get('product_name') or ''), status=str(body.get('status') or 'new'), priority=str(body.get('priority') or 'normal'), category=str(body.get('category') or 'other'), error_code=str(body.get('error_code') or ''), reason=str(body.get('reason') or ''), source='manual', note=str(body.get('note') or ''))
+    audit_miniapp(user.get('id'), 'problem_case_create', case.get('id'), {'invoice_id': case.get('invoice_id')})
+    return miniapp_success(case)
+
+
+@app.patch('/app/api/problem-cases/<int:case_id>')
+@miniapp_api
+def miniapp_problem_case_patch(user: dict[str, Any], case_id: int):
+    body = request.get_json(silent=True) or {}
+    current = get_problem_case(case_id=case_id)
+    if not current:
+        raise ValueError('Обращение не найдено')
+    case = upsert_problem_case(invoice_id=str(current.get('invoice_id') or ''), conversation_id=str(current.get('conversation_id') or ''), offer_id=str(current.get('offer_id') or ''), product_name=str(current.get('product_name') or ''), status=str(body.get('status') or current.get('status') or 'new'), priority=str(body.get('priority') or current.get('priority') or 'normal'), category=str(body.get('category') or current.get('category') or 'other'), error_code=str(body.get('error_code') if body.get('error_code') is not None else current.get('error_code') or ''), reason=str(body.get('reason') if body.get('reason') is not None else current.get('reason') or ''), source=str(current.get('source') or 'manual'), note=str(body.get('note') if body.get('note') is not None else current.get('note') or ''), case_id=case_id)
+    audit_miniapp(user.get('id'), 'problem_case_update', case_id, {'status': case.get('status')})
+    return miniapp_success(case)
+
+
+@app.get('/app/api/orders/<invoice_id>/replacement/preview')
+@miniapp_api
+def miniapp_replacement_preview(user: dict[str, Any], invoice_id: str):
+    return miniapp_success(replacement_preview(invoice_id, str(request.args.get('offer_id') or '')))
+
+
+@app.post('/app/api/orders/<invoice_id>/replacement')
+@miniapp_api
+def miniapp_replacement_execute(user: dict[str, Any], invoice_id: str):
+    body = request.get_json(silent=True) or {}
+    require_confirmation(body)
+    return miniapp_success(execute_replacement(invoice_id=invoice_id, offer_id=str(body.get('offer_id') or ''), product_id=str(body.get('product_id') or ''), reason=str(body.get('reason') or ''), user_id=user.get('id')))
+
+
+@app.get('/app/api/knowledge')
+@miniapp_api
+def miniapp_knowledge(user: dict[str, Any]):
+    return miniapp_success(list_knowledge(str(request.args.get('q') or ''), str(request.args.get('category') or ''), str(request.args.get('product') or ''), str(request.args.get('error_code') or '')))
+
+
+@app.post('/app/api/knowledge')
+@miniapp_api
+def miniapp_knowledge_create(user: dict[str, Any]):
+    body = request.get_json(silent=True) or {}
+    title = str(body.get('title') or '').strip()
+    article_body = str(body.get('body') or '').strip()
+    if not title or not article_body:
+        raise ValueError('Укажите название и текст инструкции')
+    codes = body.get('error_codes') if isinstance(body.get('error_codes'), list) else [x.strip().lower() for x in str(body.get('error_codes') or '').split(',') if x.strip()]
+    now = _utc_now()
+    with db_connect() as conn:
+        cur = conn.execute("INSERT INTO knowledge_articles(category,title,body,product_pattern,error_codes_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,1,?,?)", (str(body.get('category') or 'Общие'), title, article_body, str(body.get('product_pattern') or ''), json.dumps(codes, ensure_ascii=False), now, now))
+    audit_miniapp(user.get('id'), 'knowledge_create', cur.lastrowid, {'title': title})
+    return miniapp_success({'id': cur.lastrowid})
+
+
+@app.patch('/app/api/knowledge/<int:article_id>')
+@miniapp_api
+def miniapp_knowledge_patch(user: dict[str, Any], article_id: int):
+    body = request.get_json(silent=True) or {}
+    with db_connect() as conn:
+        current = conn.execute("SELECT * FROM knowledge_articles WHERE id=?", (article_id,)).fetchone()
+        if not current:
+            raise ValueError('Инструкция не найдена')
+        codes = body.get('error_codes') if isinstance(body.get('error_codes'), list) else json.loads(current['error_codes_json'] or '[]')
+        conn.execute("UPDATE knowledge_articles SET category=?,title=?,body=?,product_pattern=?,error_codes_json=?,enabled=?,updated_at=? WHERE id=?", (str(body.get('category') if body.get('category') is not None else current['category']), str(body.get('title') if body.get('title') is not None else current['title']), str(body.get('body') if body.get('body') is not None else current['body']), str(body.get('product_pattern') if body.get('product_pattern') is not None else current['product_pattern']), json.dumps(codes, ensure_ascii=False), 1 if body.get('enabled', bool(current['enabled'])) else 0, _utc_now(), article_id))
+    return miniapp_success({'id': article_id})
+
+
+@app.delete('/app/api/knowledge/<int:article_id>')
+@miniapp_api
+def miniapp_knowledge_delete(user: dict[str, Any], article_id: int):
+    with db_connect() as conn:
+        conn.execute("DELETE FROM knowledge_articles WHERE id=?", (article_id,))
+    audit_miniapp(user.get('id'), 'knowledge_delete', article_id, {})
+    return miniapp_success({'deleted': article_id})
+
+
+@app.post('/app/api/diagnostics')
+@miniapp_api
+def miniapp_diagnostics(user: dict[str, Any]):
+    body = request.get_json(silent=True) or {}
+    result = diagnostic_recommendation(body)
+    now = _utc_now()
+    with db_connect() as conn:
+        cur = conn.execute("INSERT INTO diagnostic_sessions(invoice_id,conversation_id,product_family,answers_json,recommendation_json,status,created_at,updated_at) VALUES(?,?,?,?,?,'completed',?,?)", (str(body.get('invoice_id') or ''), str(body.get('conversation_id') or ''), str(body.get('product_family') or ''), json.dumps(body, ensure_ascii=False), json.dumps(result, ensure_ascii=False), now, now))
+    result['session_id'] = cur.lastrowid
+    if body.get('invoice_id'):
+        upsert_problem_case(invoice_id=str(body.get('invoice_id')), conversation_id=str(body.get('conversation_id') or ''), status='replacement' if result.get('action') == 'replacement' else 'diagnosis', priority='high' if result.get('action') == 'replacement' else 'normal', category='activation', error_code=str(result.get('error_code') or ''), reason=str(body.get('description') or ''), source='diagnostic', note=str(result.get('title') or ''))
+    return miniapp_success(result)
+
+
+@app.get('/app/api/quality')
+@miniapp_api
+def miniapp_quality(user: dict[str, Any]):
+    return miniapp_success(quality_payload())
+
+
+@app.patch('/app/api/incidents/<int:incident_id>')
+@miniapp_api
+def miniapp_incident_patch(user: dict[str, Any], incident_id: int):
+    body = request.get_json(silent=True) or {}
+    status = str(body.get('status') or 'resolved')
+    if status not in {'open','investigating','resolved'}:
+        raise ValueError('Неизвестный статус инцидента')
+    with db_connect() as conn:
+        conn.execute("UPDATE incident_alerts SET status=?,updated_at=? WHERE id=?", (status, _utc_now(), incident_id))
+    return miniapp_success({'id': incident_id, 'status': status})
+
+
 init_db()
+init_v7_db()
+seed_v7_knowledge()
 
 
 if __name__ == "__main__":
