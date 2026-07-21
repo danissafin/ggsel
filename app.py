@@ -171,6 +171,9 @@ def parse_iso_datetime(value: Any) -> Optional[datetime]:
         "%Y-%m-%d %H:%M:%S",
         "%d.%m.%Y %H:%M:%S",
         "%d.%m.%Y %H:%M",
+        "%d/%m/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M",
+        "%d/%m/%Y",
         "%Y-%m-%d",
     ):
         try:
@@ -428,6 +431,36 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS conversations (
+                conversation_id TEXT PRIMARY KEY,
+                customer_key TEXT NOT NULL,
+                buyer_email TEXT,
+                buyer_account TEXT,
+                latest_debate_id TEXT,
+                latest_invoice_id TEXT,
+                product_name TEXT,
+                last_message TEXT,
+                last_message_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS conversation_debates (
+                debate_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                invoice_id TEXT,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS customer_profiles (
+                conversation_id TEXT PRIMARY KEY,
+                note TEXT NOT NULL DEFAULT '',
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                pinned INTEGER NOT NULL DEFAULT 0,
+                favorite INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_inventory_hash ON inventory_ledger(content_hash);
             CREATE INDEX IF NOT EXISTS idx_inventory_invoice ON inventory_ledger(invoice_id);
             CREATE INDEX IF NOT EXISTS idx_inventory_offer ON inventory_ledger(offer_id, status);
@@ -439,6 +472,14 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_operations_created ON async_operations(created_at);
             """
         )
+        # Lightweight migrations for installations created before CRM v6.0.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "conversation_id" not in columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN conversation_id TEXT")
+        if "buyer_email" not in columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN buyer_email TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at)")
 
 
 def remember_event(event_key: str) -> bool:
@@ -462,14 +503,16 @@ def save_message_record(
     message_text: str,
     image_url: str,
     message_date: str,
+    conversation_id: str = "",
+    buyer_email: str = "",
 ) -> None:
     with db_connect() as conn:
         conn.execute(
             """
             INSERT INTO messages(
                 message_id, debate_id, invoice_id, sender, message_text,
-                image_url, message_date, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                image_url, message_date, created_at, conversation_id, buyer_email
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 message_id,
@@ -480,6 +523,8 @@ def save_message_record(
                 image_url,
                 normalize_datetime_text(message_date),
                 datetime.now(timezone.utc).isoformat(),
+                conversation_id or None,
+                buyer_email or None,
             ),
         )
 
@@ -850,21 +895,36 @@ class GGSELClient:
         )
 
     def send_chat_message(self, debate_id: str, message: str) -> Any:
+        """Send a text message to a GGSEL conversation.
+
+        The V1 endpoint expects the fields named exactly ``id_i`` and ``text``.
+        Older builds incorrectly sent ``id_i`` as a query parameter and used
+        ``message`` in the body, which produces:
+        ``invalid id_i or text parameter``.
+        """
         path = "/api_sellers/api/debates/v2"
-        params = {"id_i": debate_id}
+        debate_text = str(debate_id).strip()
+        message_text = str(message).strip()
+        if not debate_text or not message_text:
+            raise ValueError("Для отправки нужны id_i и текст сообщения")
+
+        # GGSEL documents id_i as an integer. Keep a numeric value whenever
+        # possible, but retain compatibility with installations returning it
+        # as a numeric string.
         try:
-            return self.v1_request(
-                "POST",
-                path,
-                params=params,
-                json_body={"message": message, "files": []},
-            )
+            normalized_id: Any = int(debate_text)
+        except ValueError:
+            normalized_id = debate_text
+
+        payload = {"id_i": normalized_id, "text": message_text}
+        try:
+            return self.v1_request("POST", path, json_body=payload)
         except APIError as exc:
             if exc.status not in (400, 415, 422):
                 raise
-            return self.v1_request(
-                "POST", path, params=params, form_body={"message": message}
-            )
+            # Some GGSEL installations accept the same fields only as
+            # application/x-www-form-urlencoded. Retry without changing names.
+            return self.v1_request("POST", path, form_body=payload)
 
     # ---------- V2: categories/offers/products ----------
 
@@ -2756,6 +2816,148 @@ def handle_command(text: str) -> None:
         send_text(f"❌ Непредвиденная ошибка: <code>{safe(exc)}</code>")
 
 
+
+# ============================================================
+# CRM conversations and customer profiles
+# ============================================================
+
+
+def _clean_identity(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip().casefold())
+
+
+def _conversation_identity(email: str = "", account: str = "", invoice_id: str = "", debate_id: str = "") -> str:
+    email_key = _clean_identity(email)
+    account_key = _clean_identity(account)
+    if email_key:
+        return f"email:{email_key}"
+    if account_key:
+        return f"account:{account_key}"
+    if invoice_id:
+        return f"invoice:{str(invoice_id).strip()}"
+    return f"debate:{str(debate_id).strip()}"
+
+
+def _conversation_id(identity: str) -> str:
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+
+
+def ensure_conversation(*, debate_id: str, invoice_id: str = "", email: str = "", account: str = "", product_name: str = "", preview: str = "", when: str = "") -> str:
+    identity = _conversation_identity(email, account, invoice_id, debate_id)
+    conversation_id = _conversation_id(identity)
+    now = datetime.now(timezone.utc).isoformat()
+    normalized_when = normalize_datetime_text(when) or now
+    with db_connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations(
+                conversation_id, customer_key, buyer_email, buyer_account,
+                latest_debate_id, latest_invoice_id, product_name, last_message,
+                last_message_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(conversation_id) DO UPDATE SET
+                buyer_email=COALESCE(NULLIF(excluded.buyer_email,''), conversations.buyer_email),
+                buyer_account=COALESCE(NULLIF(excluded.buyer_account,''), conversations.buyer_account),
+                latest_debate_id=COALESCE(NULLIF(excluded.latest_debate_id,''), conversations.latest_debate_id),
+                latest_invoice_id=COALESCE(NULLIF(excluded.latest_invoice_id,''), conversations.latest_invoice_id),
+                product_name=COALESCE(NULLIF(excluded.product_name,''), conversations.product_name),
+                last_message=CASE WHEN excluded.last_message_at >= COALESCE(conversations.last_message_at,'') THEN excluded.last_message ELSE conversations.last_message END,
+                last_message_at=MAX(COALESCE(conversations.last_message_at,''), excluded.last_message_at),
+                updated_at=excluded.updated_at
+            """,
+            (conversation_id, identity, email, account, debate_id, invoice_id, product_name, preview, normalized_when, now, now),
+        )
+        if debate_id:
+            conn.execute(
+                """
+                INSERT INTO conversation_debates(debate_id, conversation_id, invoice_id, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(debate_id) DO UPDATE SET
+                    conversation_id=excluded.conversation_id,
+                    invoice_id=COALESCE(NULLIF(excluded.invoice_id,''), conversation_debates.invoice_id),
+                    updated_at=excluded.updated_at
+                """,
+                (debate_id, conversation_id, invoice_id, now),
+            )
+        conn.execute(
+            "UPDATE messages SET conversation_id=?, buyer_email=COALESCE(NULLIF(buyer_email,''), ?) WHERE debate_id=?",
+            (conversation_id, email, debate_id),
+        )
+    return conversation_id
+
+
+def rebuild_conversations() -> None:
+    """Merge historical messages by customer email/account, then by order/debate."""
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT m.debate_id, m.invoice_id, m.message_text, m.image_url,
+                   COALESCE(NULLIF(m.message_date,''),m.created_at) AS when_at,
+                   o.buyer_email, o.buyer_account, o.product_name
+            FROM messages m
+            LEFT JOIN orders o ON o.invoice_id=m.invoice_id
+            WHERE COALESCE(m.debate_id,'')!=''
+            ORDER BY m.id
+            """
+        ).fetchall()
+    for row in rows:
+        ensure_conversation(
+            debate_id=str(row['debate_id'] or ''), invoice_id=str(row['invoice_id'] or ''),
+            email=str(row['buyer_email'] or ''), account=str(row['buyer_account'] or ''),
+            product_name=str(row['product_name'] or ''),
+            preview=str(row['message_text'] or ('[Изображение]' if row['image_url'] else '')),
+            when=str(row['when_at'] or ''),
+        )
+
+
+def _customer_profile(conversation_id: str) -> dict[str, Any]:
+    with db_connect() as conn:
+        row = conn.execute("SELECT note,tags_json,pinned,favorite,updated_at FROM customer_profiles WHERE conversation_id=?", (conversation_id,)).fetchone()
+    if not row:
+        return {"note":"", "tags":[], "pinned":False, "favorite":False}
+    try:
+        tags = json.loads(row['tags_json'] or '[]')
+    except json.JSONDecodeError:
+        tags = []
+    return {"note":row['note'] or '', "tags":tags if isinstance(tags,list) else [], "pinned":bool(row['pinned']), "favorite":bool(row['favorite']), "updated_at":row['updated_at']}
+
+
+def _conversation_orders(conversation_id: str) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        conv = conn.execute("SELECT buyer_email,buyer_account FROM conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
+        if not conv:
+            return []
+        rows = conn.execute(
+            """
+            SELECT invoice_id,item_id,product_name,amount,currency,profit,invoice_state,purchase_date,date_pay
+            FROM orders
+            WHERE (COALESCE(?, '')!='' AND lower(buyer_email)=lower(?))
+               OR (COALESCE(?, '')!='' AND lower(buyer_account)=lower(?))
+            ORDER BY COALESCE(NULLIF(date_pay,''),purchase_date,updated_at) DESC
+            LIMIT 100
+            """,
+            (conv['buyer_email'], conv['buyer_email'], conv['buyer_account'], conv['buyer_account']),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _conversation_summary(conversation_id: str) -> dict[str, Any]:
+    with db_connect() as conn:
+        conv = conn.execute("SELECT * FROM conversations WHERE conversation_id=?", (conversation_id,)).fetchone()
+        debates = conn.execute("SELECT debate_id,invoice_id FROM conversation_debates WHERE conversation_id=? ORDER BY updated_at DESC", (conversation_id,)).fetchall()
+    if not conv:
+        return {}
+    orders = _conversation_orders(conversation_id)
+    total_spent = sum(as_float(item.get('amount')) for item in orders)
+    return {
+        **dict(conv),
+        "debate_ids":[str(row['debate_id']) for row in debates],
+        "orders_count":len(orders),
+        "total_spent":total_spent,
+        "orders":orders,
+        "profile":_customer_profile(conversation_id),
+    }
+
 # ============================================================
 # GGSEL incoming message webhook
 # ============================================================
@@ -2769,16 +2971,6 @@ def process_ggsel_event(data: dict[str, Any]) -> None:
     message_text = str(data.get("Message") or "")
     image_url = str(data.get("ImagePath") or "")
 
-    save_message_record(
-        message_id=message_id,
-        debate_id=debate_id,
-        invoice_id=invoice_id,
-        sender="buyer",
-        message_text=message_text,
-        image_url=image_url,
-        message_date=message_date,
-    )
-
     order: dict[str, Any] = {}
     if invoice_id:
         try:
@@ -2789,6 +2981,17 @@ def process_ggsel_event(data: dict[str, Any]) -> None:
             logger.exception("Unable to load order %s", invoice_id)
 
     buyer = order.get("buyer_info") if isinstance(order.get("buyer_info"), dict) else {}
+    conversation_id = ensure_conversation(
+        debate_id=debate_id, invoice_id=invoice_id,
+        email=str(buyer.get("email") or ""), account=str(buyer.get("account") or ""),
+        product_name=str(order.get("name") or ""), preview=message_text or ("[Изображение]" if image_url else ""),
+        when=message_date,
+    )
+    save_message_record(
+        message_id=message_id, debate_id=debate_id, invoice_id=invoice_id, sender="buyer",
+        message_text=message_text, image_url=image_url, message_date=message_date,
+        conversation_id=conversation_id, buyer_email=str(buyer.get("email") or ""),
+    )
     prefix = "🚨 <b>ПРОБЛЕМНОЕ СООБЩЕНИЕ</b>\n\n" if any(
         word in message_text.casefold()
         for word in ("не работает", "возврат", "обман", "ошибка", "не пришло")
@@ -2980,6 +3183,72 @@ def _review_payload(data: Any) -> list[dict[str, Any]]:
     return result
 
 
+
+def _conversation_chat_payload(query: str = "") -> list[dict[str, Any]]:
+    rebuild_conversations()
+    folded = str(query or '').strip().casefold()
+    with db_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT c.*, cp.note AS customer_note, cp.tags_json, COALESCE(cp.pinned,0) AS pinned,
+                   COALESCE(cp.favorite,0) AS favorite,
+                   COALESCE(cl.label,'new') AS label, COALESCE(cl.note,'') AS label_note,
+                   (SELECT COUNT(*) FROM conversation_debates d WHERE d.conversation_id=c.conversation_id) AS debate_count,
+                   (SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.conversation_id AND m.sender='buyer') AS buyer_messages
+            FROM conversations c
+            LEFT JOIN customer_profiles cp ON cp.conversation_id=c.conversation_id
+            LEFT JOIN chat_labels cl ON cl.debate_id=c.conversation_id
+            ORDER BY pinned DESC, COALESCE(c.last_message_at,c.updated_at) DESC
+            LIMIT 500
+            """
+        ).fetchall()
+        matched_ids: set[str] = set()
+        if folded:
+            pattern = f"%{folded}%"
+            for row in conn.execute(
+                """SELECT DISTINCT conversation_id FROM messages
+                   WHERE conversation_id IS NOT NULL AND (lower(message_text) LIKE ? OR lower(buyer_email) LIKE ?)""",
+                (pattern, pattern),
+            ).fetchall():
+                matched_ids.add(str(row['conversation_id']))
+    result=[]
+    for row in rows:
+        item=dict(row)
+        hay=' '.join(str(item.get(k) or '') for k in ('buyer_email','buyer_account','latest_invoice_id','product_name','last_message','customer_note')).casefold()
+        if folded and folded not in hay and item['conversation_id'] not in matched_ids:
+            continue
+        try: tags=json.loads(item.get('tags_json') or '[]')
+        except json.JSONDecodeError: tags=[]
+        result.append({
+            **item,
+            'id_i':item.get('latest_debate_id') or item['conversation_id'],
+            'conversation_id':item['conversation_id'],
+            'invoice_id':item.get('latest_invoice_id') or '',
+            'email':item.get('buyer_email') or item.get('buyer_account') or '',
+            'preview':item.get('last_message') or '',
+            'last_message':item.get('last_message_at') or item.get('updated_at'),
+            'tags':tags if isinstance(tags,list) else [],
+            'pinned':bool(item.get('pinned')), 'favorite':bool(item.get('favorite')),
+        })
+    return result
+
+
+def _conversation_messages(conversation_id: str) -> list[dict[str, Any]]:
+    with db_connect() as conn:
+        rows=conn.execute(
+            """SELECT message_id,sender,message_text,image_url,message_date,created_at,debate_id,invoice_id
+               FROM messages WHERE conversation_id=?
+               ORDER BY COALESCE(NULLIF(message_date,''),created_at),id""", (conversation_id,)
+        ).fetchall()
+    return [{
+        'id':row['message_id'] or '', 'seller':str(row['sender'] or '').lower()=='seller',
+        'buyer':str(row['sender'] or '').lower()=='buyer', 'message':row['message_text'] or '',
+        'url':row['image_url'] or '', 'is_img':bool(row['image_url']),
+        'date_written':row['message_date'] or row['created_at'], 'debate_id':row['debate_id'] or '',
+        'invoice_id':row['invoice_id'] or '', 'source':'local',
+    } for row in rows]
+
+
 def _local_chat_payload() -> list[dict[str, Any]]:
     with db_connect() as conn:
         rows = conn.execute(
@@ -3077,11 +3346,27 @@ def _chat_payload(data: Any) -> list[dict[str, Any]]:
     for debate_id, item in merged.items():
         item.update(labels.get(debate_id, {"label": "new", "note": ""}))
 
-    def sort_key(item: dict[str, Any]) -> float:
-        parsed = parse_iso_datetime(item.get("last_message"))
-        return parsed.timestamp() if parsed else 0.0
+    def sort_key(item: dict[str, Any]) -> tuple[float, int]:
+        # GGSEL and webhook payloads use several date formats. Normalize all of
+        # them before sorting so the newest conversation is always first.
+        candidates = (
+            item.get("last_message"),
+            item.get("date"),
+            item.get("date_written"),
+            item.get("message_date"),
+            item.get("created_at"),
+        )
+        parsed = next((parse_iso_datetime(value) for value in candidates if parse_iso_datetime(value)), None)
+        # Debate ID is only a deterministic tie-breaker; chronology is primary.
+        return (parsed.timestamp() if parsed else 0.0, as_int(item.get("id_i"), 0))
 
-    return sorted(merged.values(), key=sort_key, reverse=True)
+    result = sorted(merged.values(), key=sort_key, reverse=True)
+    for position, item in enumerate(result):
+        item["sort_position"] = position
+        parsed = parse_iso_datetime(item.get("last_message"))
+        if parsed:
+            item["last_message_iso"] = parsed.isoformat()
+    return result
 
 
 def _local_messages(debate_id: str) -> list[dict[str, Any]]:
@@ -3936,97 +4221,89 @@ def miniapp_reviews(user: dict[str, Any]):
 @app.get("/app/api/chats/status")
 @miniapp_api
 def miniapp_chat_status(user: dict[str, Any]):
+    rebuild_conversations()
     with db_connect() as conn:
-        row = conn.execute(
-            "SELECT message_date, created_at, debate_id, invoice_id FROM messages WHERE sender='buyer' ORDER BY id DESC LIMIT 1"
-        ).fetchone()
-        total = conn.execute("SELECT COUNT(DISTINCT debate_id) AS total FROM messages WHERE debate_id != ''").fetchone()
-    signed_url = f"{APP_URL}/ggsel" + (f"?secret={GGSEL_WEBHOOK_SECRET}" if GGSEL_WEBHOOK_SECRET else "")
-    return miniapp_success({
-        "last_webhook_message": dict(row) if row else None,
-        "local_chats": as_int(total["total"] if total else 0),
-        "webhook_url": signed_url,
-        "compat_mode": GGSEL_WEBHOOK_COMPAT_MODE,
-        "note": "GGSEL API возвращает только непрочитанные чаты. Прочитанные диалоги доступны, если сообщения пришли через webhook и сохранились в базе.",
-    })
-
-
-@app.put("/app/api/chats/<debate_id>/label")
-@miniapp_api
-def miniapp_chat_label(user: dict[str, Any], debate_id: str):
-    body = request.get_json(silent=True) or {}
-    require_confirmation(body)
-    label = str(body.get("label") or "new").strip().lower()
-    if label not in {"new", "waiting", "replacement", "resolved"}:
-        raise ValueError("Неизвестная метка")
-    note = str(body.get("note") or "").strip()[:1000]
-    with db_connect() as conn:
-        conn.execute(
-            """
-            INSERT INTO chat_labels(debate_id, label, note, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(debate_id) DO UPDATE SET label=excluded.label, note=excluded.note, updated_at=excluded.updated_at
-            """,
-            (str(debate_id), label, note, datetime.now(timezone.utc).isoformat()),
-        )
-    audit_miniapp(user.get("id"), "chat_label", debate_id, {"label": label})
-    return miniapp_success({"debate_id": debate_id, "label": label, "note": note})
+        row = conn.execute("SELECT message_date,created_at,debate_id,invoice_id FROM messages WHERE sender='buyer' ORDER BY id DESC LIMIT 1").fetchone()
+        total = conn.execute("SELECT COUNT(*) AS total FROM conversations").fetchone()
+    signed_url=f"{APP_URL}/ggsel"+(f"?secret={GGSEL_WEBHOOK_SECRET}" if GGSEL_WEBHOOK_SECRET else "")
+    return miniapp_success({"last_webhook_message":dict(row) if row else None,"local_chats":as_int(total['total'] if total else 0),"webhook_url":signed_url,"compat_mode":GGSEL_WEBHOOK_COMPAT_MODE,"note":"Сообщения объединяются по email/аккаунту покупателя. Один клиент отображается одной перепиской, даже если GGSEL создаёт новые ID диалогов."})
 
 
 @app.get("/app/api/chats")
 @miniapp_api
 def miniapp_chats(user: dict[str, Any]):
-    page = max(1, as_int(request.args.get("page"), 1))
-    try:
-        api_data = ggsel.chats(page)
-    except Exception as exc:
-        logger.warning("Unable to load GGSEL unread chats; using local history: %s", exc)
-        api_data = {}
-    return miniapp_success(_chat_payload(api_data))
+    return miniapp_success(_conversation_chat_payload(str(request.args.get('query') or '')))
 
 
-@app.get("/app/api/chats/<debate_id>")
+@app.get("/app/api/conversations/<conversation_id>")
 @miniapp_api
-def miniapp_chat_messages(user: dict[str, Any], debate_id: str):
-    try:
-        api_data = ggsel.chat_messages(debate_id)
-    except Exception as exc:
-        logger.warning("Unable to load GGSEL chat %s; using local history: %s", debate_id, exc)
-        api_data = {}
-    chat = next((item for item in _chat_payload({}) if str(item.get("id_i") or "") == str(debate_id)), {})
-    remember_recent_view(
-        "chat", debate_id, str(chat.get("email") or chat.get("product_name") or f"Диалог {debate_id}"),
-        {"invoice_id": chat.get("invoice_id"), "product_name": chat.get("product_name")},
-    )
-    return miniapp_success(_message_payload(api_data, debate_id))
+def miniapp_conversation(user: dict[str, Any], conversation_id: str):
+    rebuild_conversations()
+    summary=_conversation_summary(conversation_id)
+    if not summary:
+        raise ValueError("Диалог не найден")
+    # Pull the latest GGSEL thread once and merge it into local history.
+    latest=str(summary.get('latest_debate_id') or '')
+    api_data={}
+    if latest:
+        try: api_data=ggsel.chat_messages(latest)
+        except Exception as exc: logger.warning("Unable to load GGSEL chat %s: %s", latest, exc)
+    messages=_message_payload(api_data, latest) if api_data else []
+    local=_conversation_messages(conversation_id)
+    merged=[]; seen=set()
+    for item in [*messages,*local]:
+        key=(str(item.get('id') or ''),str(item.get('date_written') or ''),str(item.get('message') or item.get('url') or ''),bool(item.get('seller')))
+        if key in seen: continue
+        seen.add(key); merged.append(item)
+    merged.sort(key=lambda x: parse_iso_datetime(x.get('date_written')) or datetime.min.replace(tzinfo=timezone.utc))
+    remember_recent_view('chat',conversation_id,str(summary.get('buyer_email') or summary.get('product_name') or 'Клиент'),{'invoice_id':summary.get('latest_invoice_id')})
+    return miniapp_success({'conversation':summary,'messages':merged})
 
 
-@app.post("/app/api/chats/<debate_id>/messages")
+@app.put("/app/api/conversations/<conversation_id>/profile")
 @miniapp_api
-def miniapp_send_chat_message(user: dict[str, Any], debate_id: str):
-    body = request.get_json(silent=True) or {}
-    require_confirmation(body)
-    message = str(body.get("message") or "").strip()
-    if not message:
-        raise ValueError("Сообщение пустое")
-    if len(message) > 4000:
-        raise ValueError("Сообщение слишком длинное")
-    result = ggsel.send_chat_message(debate_id, message)
+def miniapp_conversation_profile(user: dict[str, Any], conversation_id: str):
+    body=request.get_json(silent=True) or {}
+    note=str(body.get('note') or '').strip()[:4000]
+    tags=[str(x).strip()[:40] for x in (body.get('tags') or []) if str(x).strip()][:20]
+    pinned=1 if body.get('pinned') else 0; favorite=1 if body.get('favorite') else 0
+    now=datetime.now(timezone.utc).isoformat()
     with db_connect() as conn:
-        row = conn.execute(
-            "SELECT invoice_id FROM messages WHERE debate_id = ? ORDER BY id DESC LIMIT 1",
-            (str(debate_id),),
-        ).fetchone()
-    save_message_record(
-        message_id="",
-        debate_id=str(debate_id),
-        invoice_id=str(row["invoice_id"] or "") if row else "",
-        sender="seller",
-        message_text=message,
-        image_url="",
-        message_date=datetime.now(timezone.utc).isoformat(),
-    )
-    audit_miniapp(user.get("id"), "chat_reply", debate_id, {"length": len(message)})
+        conn.execute("""INSERT INTO customer_profiles(conversation_id,note,tags_json,pinned,favorite,updated_at)
+                        VALUES(?,?,?,?,?,?) ON CONFLICT(conversation_id) DO UPDATE SET
+                        note=excluded.note,tags_json=excluded.tags_json,pinned=excluded.pinned,favorite=excluded.favorite,updated_at=excluded.updated_at""",
+                     (conversation_id,note,json.dumps(tags,ensure_ascii=False),pinned,favorite,now))
+    audit_miniapp(user.get('id'),'customer_profile',conversation_id,{'tags':tags,'pinned':bool(pinned),'favorite':bool(favorite)})
+    return miniapp_success(_customer_profile(conversation_id))
+
+
+@app.put("/app/api/conversations/<conversation_id>/label")
+@miniapp_api
+def miniapp_conversation_label(user: dict[str, Any], conversation_id: str):
+    body=request.get_json(silent=True) or {}; require_confirmation(body)
+    label=str(body.get('label') or 'new').strip().lower()
+    if label not in {'new','waiting','replacement','resolved'}: raise ValueError('Неизвестная метка')
+    note=str(body.get('note') or '').strip()[:1000]
+    with db_connect() as conn:
+        conn.execute("""INSERT INTO chat_labels(debate_id,label,note,updated_at) VALUES(?,?,?,?)
+                        ON CONFLICT(debate_id) DO UPDATE SET label=excluded.label,note=excluded.note,updated_at=excluded.updated_at""",
+                     (conversation_id,label,note,datetime.now(timezone.utc).isoformat()))
+    return miniapp_success({'conversation_id':conversation_id,'label':label,'note':note})
+
+
+@app.post("/app/api/conversations/<conversation_id>/messages")
+@miniapp_api
+def miniapp_send_conversation_message(user: dict[str, Any], conversation_id: str):
+    body=request.get_json(silent=True) or {}; require_confirmation(body)
+    message=str(body.get('message') or '').strip()
+    if not message: raise ValueError('Сообщение пустое')
+    if len(message)>4000: raise ValueError('Сообщение слишком длинное')
+    summary=_conversation_summary(conversation_id); debate_id=str(summary.get('latest_debate_id') or '')
+    if not debate_id: raise ValueError('У клиента нет активного ID диалога GGSEL')
+    result=ggsel.send_chat_message(debate_id,message)
+    save_message_record(message_id='',debate_id=debate_id,invoice_id=str(summary.get('latest_invoice_id') or ''),sender='seller',message_text=message,image_url='',message_date=datetime.now(timezone.utc).isoformat(),conversation_id=conversation_id,buyer_email=str(summary.get('buyer_email') or ''))
+    ensure_conversation(debate_id=debate_id,invoice_id=str(summary.get('latest_invoice_id') or ''),email=str(summary.get('buyer_email') or ''),account=str(summary.get('buyer_account') or ''),product_name=str(summary.get('product_name') or ''),preview=message,when=datetime.now(timezone.utc).isoformat())
+    audit_miniapp(user.get('id'),'chat_reply',conversation_id,{'debate_id':debate_id,'length':len(message)})
     return miniapp_success(result)
 
 

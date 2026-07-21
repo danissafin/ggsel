@@ -325,8 +325,23 @@
       <button class="chip" data-set-chat-label="replacement">Замена</button>
       <button class="chip" data-set-chat-label="resolved">Решено</button>
     </div>
-    <div id="chatMessages" class="messages"></div>
-    <form id="chatReplyForm" class="reply-form"><textarea id="chatReplyText" rows="3" placeholder="Ответ покупателю"></textarea><button class="primary-button" type="submit">Отправить</button></form>
+    <div class="crm-chat-layout">
+      <section class="crm-thread">
+        <div id="chatMessages" class="messages"></div>
+        <form id="chatReplyForm" class="reply-form"><textarea id="chatReplyText" rows="3" placeholder="Ответ покупателю"></textarea><button class="primary-button" type="submit">Отправить</button></form>
+      </section>
+      <aside class="customer-panel">
+        <div class="panel-heading"><div><span class="kicker">CRM</span><h3>Карточка клиента</h3></div></div>
+        <div id="customerStats" class="customer-stats"></div>
+        <label class="switch-row"><span>📌 Закрепить клиента</span><input id="customerPinned" type="checkbox"></label>
+        <label class="switch-row"><span>★ Избранный клиент</span><input id="customerFavorite" type="checkbox"></label>
+        <label>Теги через запятую<input id="customerTags" placeholder="VIP, замена, постоянный"></label>
+        <label>Приватная заметка<textarea id="customerNote" rows="4" placeholder="Видна только вам"></textarea></label>
+        <button id="saveCustomerProfile" class="secondary-button" type="button">Сохранить карточку</button>
+        <div class="subsection-title"><span>История покупок</span></div>
+        <div id="customerOrders" class="customer-orders"><div class="empty">Загрузка…</div></div>
+      </aside>
+    </div>
   </dialog>
 
   <dialog id="globalSearchDialog" class="modal large-modal search-modal">
@@ -353,6 +368,6 @@
   </nav>
 
   <div id="toast" class="toast hidden"></div>
-  <script src="{{ url_for('static', filename='miniapp.js', v='50') }}" defer></script>
+  <script src="{{ url_for('static', filename='miniapp.js', v='60') }}" defer></script>
 </body>
 </html>

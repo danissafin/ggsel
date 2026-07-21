@@ -678,19 +678,32 @@
 
   function renderChats() {
     const query = state.chatQuery.toLowerCase();
+    const chatTimestamp = item => {
+      const raw = item.last_message_iso || item.last_message || item.date || item.date_written || item.message_date || item.created_at || '';
+      if (!raw) return 0;
+      if (/^\d+(?:\.\d+)?$/.test(String(raw))) {
+        let value = Number(raw);
+        if (value < 100000000000) value *= 1000;
+        return Number.isFinite(value) ? value : 0;
+      }
+      const normalized = String(raw)
+        .replace(/^(\d{2})[./](\d{2})[./](\d{4})(?:[ ,T]+(\d{2}):(\d{2})(?::(\d{2}))?)?$/, (_,d,m,y,h='00',min='00',sec='00') => `${y}-${m}-${d}T${h}:${min}:${sec}Z`);
+      const value = new Date(normalized).getTime();
+      return Number.isNaN(value) ? 0 : value;
+    };
     const items = (state.chats || []).filter(item => {
       if (state.chatLabel !== 'all' && (item.label || 'new') !== state.chatLabel) return false;
       if (!query) return true;
       return [item.email,item.invoice_id,item.product_name,item.preview,item.id_i].some(value => String(value || '').toLowerCase().includes(query));
-    });
+    }).sort((a, b) => chatTimestamp(b) - chatTimestamp(a));
     if (!items.length) { $('#chatsList').innerHTML = '<div class="empty">Чаты не найдены</div>'; return; }
     $('#chatsList').innerHTML = items.map(item => {
-      const id = getAny(item, ['id_i','debate_id','id','invoice_id']);
+      const id = getAny(item, ['conversation_id','id_i','debate_id','id','invoice_id']);
       const title = getAny(item, ['product_name','name','subject','email'], item.invoice_id ? `Заказ #${item.invoice_id}` : `Диалог #${id}`);
       const preview = getAny(item, ['preview','message','text'], 'Открыть переписку');
       const unread = Number(item.cnt_new || 0);
       const meta = [item.email, item.invoice_id ? `заказ #${item.invoice_id}` : '', formatDate(item.last_message)].filter(Boolean).join(' · ');
-      return `<button class="chat-card plain-button" data-chat="${esc(id)}"><div class="panel-heading"><strong>${esc(title)}</strong><span class="badge">#${esc(id)}${unread > 0 ? ` · ${unread} новых` : ''}</span></div><p>${esc(typeof preview === 'object' ? JSON.stringify(preview) : preview)}</p><div class="chat-card-footer"><span class="badge chat-${esc(item.label || 'new')}">${esc(chatLabelName(item.label || 'new'))}</span><span class="muted">${esc(meta)}</span></div></button>`;
+      return `<button class="chat-card plain-button" data-chat="${esc(id)}"><div class="panel-heading"><strong>${item.pinned ? '📌 ' : ''}${item.favorite ? '★ ' : ''}${esc(title)}</strong><span class="badge">${Number(item.debate_count||1)>1 ? `${esc(item.debate_count)} ветки` : `#${esc(item.id_i||id)}`}${unread > 0 ? ` · ${unread} новых` : ''}</span></div><p>${esc(typeof preview === 'object' ? JSON.stringify(preview) : preview)}</p><div class="chat-card-footer"><span class="badge chat-${esc(item.label || 'new')}">${esc(chatLabelName(item.label || 'new'))}</span><span class="muted">${esc(meta)}</span></div></button>`;
     }).join('');
   }
 
@@ -707,31 +720,56 @@
     } catch (error) { $('#chatStatus').innerHTML = `<b>Не удалось проверить webhook:</b> ${esc(error.message)}`; }
   }
 
-  async function loadChats() {
+  async function loadChats(query = state.chatQuery) {
     $('#chatsList').innerHTML = '<div class="empty">Загрузка…</div>';
     await loadChatStatus();
-    const {data} = await api('/app/api/chats');
+    const params = new URLSearchParams();
+    if (query && query.trim().length >= 2) params.set('query', query.trim());
+    const {data} = await api(`/app/api/chats${params.toString() ? `?${params}` : ''}`);
     state.chats = data || [];
     renderChats();
   }
 
+  function renderCustomerPanel(conv) {
+    const profile = conv.profile || {};
+    const orders = conv.orders || [];
+    $('#customerStats').innerHTML = `
+      <div class="customer-stat"><span>Заказов</span><b>${Number(conv.orders_count || 0)}</b></div>
+      <div class="customer-stat"><span>Потрачено</span><b>${money(conv.total_spent || 0, conv.currency || 'RUB')}</b></div>
+      <div class="customer-stat"><span>Диалогов GGSEL</span><b>${(conv.debate_ids || []).length}</b></div>`;
+    $('#customerNote').value = profile.note || '';
+    $('#customerTags').value = (profile.tags || []).join(', ');
+    $('#customerPinned').checked = !!profile.pinned;
+    $('#customerFavorite').checked = !!profile.favorite;
+    $('#customerOrders').innerHTML = orders.length ? orders.slice(0,20).map(order => `
+      <button class="customer-order plain-button" data-open-order="${esc(order.invoice_id)}">
+        <div><strong>${esc(order.product_name || 'Товар')}</strong><span class="muted">Заказ #${esc(order.invoice_id)} · ${formatDate(order.date_pay || order.purchase_date)}</span></div>
+        <b>${money(order.amount || 0, order.currency || 'RUB')}</b>
+      </button>`).join('') : '<div class="empty">История покупок пока не собрана</div>';
+  }
+
   async function openChat(id) {
     state.currentChat = String(id);
-    state.currentChatInfo = state.chats.find(item => String(getAny(item,['id_i','debate_id','id'])) === String(id)) || {};
-    $('#chatDialogTitle').textContent = state.currentChatInfo.product_name || state.currentChatInfo.email || `Диалог #${id}`;
-    $('#chatDialogMeta').innerHTML = `<b>${esc(state.currentChatInfo.email || '')}</b><span class="muted">${state.currentChatInfo.invoice_id ? `Заказ #${esc(state.currentChatInfo.invoice_id)} · ` : ''}Диалог #${esc(id)}</span>`;
+    state.currentChatInfo = state.chats.find(item => String(getAny(item,['conversation_id','id_i','debate_id','id'])) === String(id)) || {};
+    $('#chatDialogTitle').textContent = state.currentChatInfo.product_name || state.currentChatInfo.email || 'Переписка с клиентом';
+    $('#chatDialogMeta').innerHTML = `<b>${esc(state.currentChatInfo.email || '')}</b><span class="muted">${state.currentChatInfo.invoice_id ? `Последний заказ #${esc(state.currentChatInfo.invoice_id)} · ` : ''}${Number(state.currentChatInfo.debate_count||1)} веток GGSEL объединено</span>`;
     $$('.chat-label-actions [data-set-chat-label]').forEach(btn => btn.classList.toggle('active', btn.dataset.setChatLabel === (state.currentChatInfo.label || 'new')));
     $('#chatMessages').innerHTML = '<div class="empty">Загрузка…</div>';
     openDialog($('#chatDialog'));
     try {
-      const {data} = await api(`/app/api/chats/${encodeURIComponent(id)}`);
-      if (!data?.length) { $('#chatMessages').innerHTML = '<div class="empty">Сообщений нет</div>'; return; }
-      $('#chatMessages').innerHTML = data.map(item => {
+      const {data} = await api(`/app/api/conversations/${encodeURIComponent(id)}`);
+      const conv = data.conversation || {};
+      state.currentChatInfo = {...state.currentChatInfo, ...conv};
+      renderCustomerPanel(conv);
+      const messages = data.messages || [];
+      if (!messages.length) { $('#chatMessages').innerHTML = '<div class="empty">Сообщений нет</div>'; return; }
+      $('#chatMessages').innerHTML = messages.map(item => {
         const seller = item.seller === true || Number(item.seller) === 1 || item.is_seller === true || Number(item.is_seller) === 1 || String(item.sender || '').toLowerCase() === 'seller';
         const body = getAny(item, ['message','text'], item.is_img ? '[Изображение]' : '[Файл]');
         const when = getAny(item, ['date_written','date','created_at']);
         const attachment = item.url ? `<a href="${esc(item.url)}" target="_blank" rel="noopener">Открыть вложение</a>` : '';
-        return `<div class="message ${seller ? 'seller' : ''}">${esc(body)}${attachment}<small>${formatDate(when)}</small></div>`;
+        const thread = item.debate_id ? `<em>ветка #${esc(item.debate_id)}</em>` : '';
+        return `<div class="message ${seller ? 'seller' : ''}">${esc(body)}${attachment}<small>${thread}${formatDate(when)}</small></div>`;
       }).join('');
       $('#chatMessages').scrollTop = $('#chatMessages').scrollHeight;
     } catch (error) { $('#chatMessages').innerHTML = `<div class="notice">${esc(error.message)}</div>`; }
@@ -740,8 +778,8 @@
   async function setChatLabel(label) {
     if (!state.currentChat) return;
     try {
-      await api(`/app/api/chats/${encodeURIComponent(state.currentChat)}/label`, {method:'PUT', body:JSON.stringify({label, confirm:true})});
-      const item = state.chats.find(x => String(getAny(x,['id_i','debate_id','id'])) === String(state.currentChat));
+      await api(`/app/api/conversations/${encodeURIComponent(state.currentChat)}/label`, {method:'PUT', body:JSON.stringify({label, confirm:true})});
+      const item = state.chats.find(x => String(getAny(x,['conversation_id','id_i','debate_id','id'])) === String(state.currentChat));
       if (item) item.label = label;
       state.currentChatInfo = item || state.currentChatInfo;
       $$('.chat-label-actions [data-set-chat-label]').forEach(btn => btn.classList.toggle('active', btn.dataset.setChatLabel === label));
@@ -756,7 +794,7 @@
     if (!message) return;
     if (!await confirmAction('Отправить сообщение покупателю?')) return;
     try {
-      await api(`/app/api/chats/${encodeURIComponent(state.currentChat)}/messages`, {method:'POST', body:JSON.stringify({message, confirm:true})});
+      await api(`/app/api/conversations/${encodeURIComponent(state.currentChat)}/messages`, {method:'POST', body:JSON.stringify({message, confirm:true})});
       $('#chatReplyText').value = ''; toast('Сообщение отправлено'); await openChat(state.currentChat);
     } catch (error) { toast(error.message, true); }
   }
@@ -956,9 +994,18 @@
     $$('.finance-presets [data-period]').forEach(button => button.addEventListener('click', () => applyFinancePeriod(button.dataset.period)));
     $('#receiptsRefresh').addEventListener('click', loadReceipts);
     $('#chatsRefresh').addEventListener('click', loadChats);
-    $('#chatSearch').addEventListener('input', event => { state.chatQuery = event.target.value.trim(); renderChats(); });
+    let chatSearchTimer; $('#chatSearch').addEventListener('input', event => { state.chatQuery = event.target.value.trim(); clearTimeout(chatSearchTimer); chatSearchTimer = setTimeout(() => loadChats(state.chatQuery), 320); });
     $('#chatFilters').addEventListener('click', event => { const chip = event.target.closest('[data-chat-label]'); if (!chip) return; $$('#chatFilters .chip').forEach(x => x.classList.toggle('active', x === chip)); state.chatLabel = chip.dataset.chatLabel; renderChats(); });
     $$('.chat-label-actions [data-set-chat-label]').forEach(button => button.addEventListener('click', () => setChatLabel(button.dataset.setChatLabel)));
+    $('#saveCustomerProfile')?.addEventListener('click', async () => {
+      if (!state.currentChat) return;
+      const tags = $('#customerTags').value.split(',').map(x => x.trim()).filter(Boolean);
+      try {
+        await api(`/app/api/conversations/${encodeURIComponent(state.currentChat)}/profile`, {method:'PUT', body:JSON.stringify({note:$('#customerNote').value,tags,pinned:$('#customerPinned').checked,favorite:$('#customerFavorite').checked})});
+        toast('Карточка клиента сохранена'); await loadChats();
+      } catch (error) { toast(error.message, true); }
+    });
+    $('#customerOrders')?.addEventListener('click', event => { const id=event.target.closest('[data-open-order]')?.dataset.openOrder; if(id){ closeDialog($('#chatDialog')); switchSection('orders').then(()=>{ $('#invoiceInput').value=id; $('#orderForm').requestSubmit(); }); } });
     $('#chatsList').addEventListener('click', event => { const id = event.target.closest('[data-chat]')?.dataset.chat; if (id) openChat(id); });
     $('#chatReplyForm').addEventListener('submit', sendChatReply);
     $('#reviewsRefresh').addEventListener('click', loadReviews);
