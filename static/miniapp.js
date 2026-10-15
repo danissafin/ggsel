@@ -25,6 +25,9 @@
     attention: {count: 0, items: [], summary: {}},
     recent: [],
     searchTimer: null,
+    searchVersion: 0,
+    searchCache: new Map(),
+    refreshing: false,
     currentOrder: null,
     replacementPreview: null,
     cases: [],
@@ -107,6 +110,7 @@
 
   async function switchSection(name) {
     state.section = name;
+    $('#currentSectionLabel')?.replaceChildren(document.createTextNode(({dashboard:'Обзор',offers:'Товары',orders:'Заказы',chats:'Чаты',finance:'Финансы',more:'Ещё',reviews:'Отзывы',cases:'Обращения',inventory:'Ключи',quality:'Качество',supply:'Закупки',knowledge:'База знаний'})[name] || name));
     $$('.tab').forEach(tab => tab.classList.toggle('active', tab.dataset.section === name));
     $$('.section').forEach(section => section.classList.toggle('active', section.id === `section-${name}`));
     if (!state.loaded.has(name)) {
@@ -221,6 +225,7 @@
   }
 
   async function runGlobalSearch(query) {
+    const requestVersion = ++state.searchVersion;
     const clean = String(query || '').trim();
     if (clean.length < 2) {
       $('#globalSearchMeta').innerHTML = '';
@@ -230,13 +235,23 @@
     $('#globalSearchMeta').innerHTML = '<div class="search-summary"><span class="muted">Разбираю запрос…</span></div>';
     $('#globalSearchResults').innerHTML = '<div class="empty">Ищу по кабинету…</div>';
     try {
-      const {data} = await api(`/app/api/search?q=${encodeURIComponent(clean)}&limit=14`);
+      const cacheAllowed = !/(?:^|\s)ключ\s*:/i.test(clean);
+      const cached = cacheAllowed ? state.searchCache.get(clean) : null;
+      const data = cached && Date.now() - cached.time < 20000
+        ? cached.data
+        : (await api(`/app/api/search?q=${encodeURIComponent(clean)}&limit=14`)).data;
+      if (requestVersion !== state.searchVersion || !$('#globalSearchDialog').open) return;
+      if (cacheAllowed) {
+        state.searchCache.set(clean, {time: Date.now(), data});
+        if (state.searchCache.size > 20) state.searchCache.delete(state.searchCache.keys().next().value);
+      }
       renderSearchMeta(data.meta || {});
       const html = SEARCH_GROUPS.map(([key,title,icon]) => renderSearchGroup(title, data[key], icon)).join('');
       $('#globalSearchResults').innerHTML = html || '<div class="empty">Ничего не найдено. Попробуйте убрать часть фильтров.</div>';
       rememberSearch(clean);
       renderRecentSearches();
     } catch (error) {
+      if (requestVersion !== state.searchVersion || !$('#globalSearchDialog').open) return;
       $('#globalSearchMeta').innerHTML = '';
       $('#globalSearchResults').innerHTML = `<div class="notice">${esc(error.message)}</div>`;
     }
@@ -973,6 +988,12 @@
   }
 
   async function globalRefresh() {
+    if (state.refreshing) return;
+    state.refreshing = true;
+    const button = $('#globalRefresh');
+    const section = state.section;
+    button.disabled = true; button.classList.add('is-loading'); button.setAttribute('aria-busy', 'true');
+    try {
     state.loaded.delete(state.section);
     if (state.section === 'dashboard') await loadDashboard(true);
     else if (state.section === 'offers') await loadOffers(true);
@@ -983,8 +1004,10 @@
     else if (state.section === 'categories') await loadCategories();
     else if (state.section === 'operations') await loadOperations(true);
     else if (state.section === 'audit') await loadAudit();
-    state.loaded.add(state.section);
+    state.loaded.add(section);
     toast('Данные обновлены');
+    } catch (error) { toast(`Не удалось обновить: ${error.message}`, true); }
+    finally { state.refreshing = false; button.disabled = false; button.classList.remove('is-loading'); button.removeAttribute('aria-busy'); }
   }
 
 
@@ -1299,9 +1322,30 @@
     $('#exportOffersBtn').addEventListener('click', exportOffers);
     $('#globalSearchInput').addEventListener('input', event => { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(() => runGlobalSearch(event.target.value), 280); });
     $('#globalSearchDialog').addEventListener('click', event => { const example=event.target.closest('[data-search-example]'); if(example) applySearchExample(example.dataset.searchExample); });
-    $('#globalSearchClearBtn')?.addEventListener('click', () => { $('#globalSearchInput').value=''; $('#globalSearchMeta').innerHTML=''; $('#globalSearchResults').innerHTML='<div class="empty">Введите минимум 2 символа или выберите пример команды</div>'; $('#globalSearchInput').focus(); });
+    $('#globalSearchDialog').addEventListener('close', () => { state.searchVersion++; clearTimeout(state.searchTimer); });
+    $('#globalSearchClearBtn')?.addEventListener('click', () => { state.searchVersion++; clearTimeout(state.searchTimer); $('#globalSearchInput').value=''; $('#globalSearchMeta').innerHTML=''; $('#globalSearchResults').innerHTML='<div class="empty">Введите минимум 2 символа или выберите пример команды</div>'; $('#globalSearchInput').focus(); });
     $('#globalSearchResults').addEventListener('click', event => { const node = event.target.closest('[data-search-type]'); if (node) handleNavigationItem(node.dataset.searchType, node.dataset.searchId, node.dataset.searchInvoice, node.dataset.searchQuery, node.dataset.searchOffer, node.dataset.searchConversation); });
-    document.addEventListener('keydown', event => { const typing=['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName); if ((event.key === '/' && !typing) || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k')) { event.preventDefault(); openGlobalSearch(); } if (event.key === 'Escape') $$('.modal').forEach(closeDialog); });
+    document.addEventListener('keydown', event => {
+      const typing = ['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName) || document.activeElement?.isContentEditable;
+      if ((event.key === '/' && !typing) || ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k')) {
+        event.preventDefault(); openGlobalSearch(); return;
+      }
+      if (event.key === 'Escape') { $$('.modal').forEach(closeDialog); return; }
+      if (!typing && !$$('dialog[open]').length && event.altKey && !event.ctrlKey && !event.metaKey && /^[1-5]$/.test(event.key)) {
+        event.preventDefault(); switchSection(['dashboard','offers','orders','chats','more'][Number(event.key)-1]);
+      }
+      if (!typing && !$$('dialog[open]').length && event.altKey && event.key.toLowerCase() === 'r') {
+        event.preventDefault(); globalRefresh();
+      }
+    });
+    const backToTop = $('#backToTop');
+    let scrollScheduled = false;
+    window.addEventListener('scroll', () => {
+      if (scrollScheduled) return;
+      scrollScheduled = true;
+      requestAnimationFrame(() => { backToTop?.classList.toggle('visible', window.scrollY > 650); scrollScheduled = false; });
+    }, {passive: true});
+    backToTop?.addEventListener('click', () => window.scrollTo({top:0, behavior:'smooth'}));
     $$('[data-close]').forEach(button => button.addEventListener('click', () => closeDialog(button.closest('dialog'))));
   }
 

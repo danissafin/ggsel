@@ -6,14 +6,14 @@
   <meta name="color-scheme" content="light dark">
   <title>GGSEL Seller</title>
   <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
-  <link rel="stylesheet" href="{{ url_for('static', filename='miniapp.css', v='80') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='miniapp.css', v='81') }}">
 </head>
 <body>
   <div id="app" class="app-shell">
     <header class="topbar">
       <div>
         <div class="eyebrow">SELLER CONTROL</div>
-        <h1>GGSEL</h1>
+        <h1>GGSEL <span id="currentSectionLabel" class="header-section-label">Обзор</span></h1>
       </div>
       <div class="topbar-actions">
         <button id="globalSearchBtn" class="icon-button" aria-label="Расширенный поиск по кабинету">⌕</button>
@@ -477,7 +477,8 @@
     <button class="tab" data-section="more"><span>•••</span><small>Ещё</small></button>
   </nav>
 
+  <button id="backToTop" class="back-to-top" type="button" aria-label="Вернуться наверх" title="Наверх">↑</button>
   <div id="toast" class="toast hidden"></div>
-  <script src="{{ url_for('static', filename='miniapp.js', v='80') }}" defer></script>
+  <script src="{{ url_for('static', filename='miniapp.js', v='81') }}" defer></script>
 </body>
 </html>
