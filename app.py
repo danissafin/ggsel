@@ -1389,53 +1389,10 @@ def refresh_operations() -> list[dict[str, Any]]:
 
 
 def maybe_send_low_stock_alerts(offers: list[dict[str, Any]]) -> None:
-    # v8.3 monitors ALL stock in the background and sends grouped transition alerts.
-    # Prevent duplicate notifications from the old dashboard-triggered watcher.
-    if GGSEL_MONITOR_ENABLED:
-        return
-    configured = get_offer_settings_map()
-    for item in enrich_offer_settings(offers):
-        offer_id_value = str(item.get("id") or "")
-        if offer_id_value not in configured:
-            continue
-        settings = item.get("settings") or {}
-        quantity = as_int(item.get("quantity"))
-        threshold = as_int(settings.get("min_stock"), LOW_STOCK_DEFAULT)
-        low = quantity <= threshold
-        if not offer_id_value:
-            continue
-        if low and not settings.get("alert_sent"):
-            try:
-                send_text(
-                    "⚠️ <b>Заканчивается товар</b>\n\n"
-                    f"{safe(item.get('title'))}\n"
-                    f"Остаток: <b>{quantity}</b>\n"
-                    f"Минимум: <b>{threshold}</b>\n"
-                    f"ID: <code>{safe(offer_id_value)}</code>"
-                )
-            except Exception:
-                logger.exception("Unable to send low stock alert")
-            with db_connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO offer_settings(offer_id, min_stock, auto_activate, auto_pause, alert_sent, updated_at)
-                    VALUES (?, ?, ?, ?, 1, ?)
-                    ON CONFLICT(offer_id) DO UPDATE SET alert_sent=1, updated_at=excluded.updated_at
-                    """,
-                    (
-                        offer_id_value,
-                        threshold,
-                        int(bool(settings.get("auto_activate"))),
-                        int(bool(settings.get("auto_pause"))),
-                        datetime.now(timezone.utc).isoformat(),
-                    ),
-                )
-        elif not low and settings.get("alert_sent"):
-            with db_connect() as conn:
-                conn.execute(
-                    "UPDATE offer_settings SET alert_sent=0, updated_at=? WHERE offer_id=?",
-                    (datetime.now(timezone.utc).isoformat(), offer_id_value),
-                )
+    # Legacy dashboard callback retained for compatibility.
+    # The background monitor is the ONLY source of stock Telegram alerts.
+    # In particular, low-stock thresholds never trigger a Telegram message.
+    return
 
 
 def _offer_quantity(item: dict[str, Any]) -> int:
@@ -6661,47 +6618,52 @@ def _monitor_stock_bucket(quantity: int, minimum: int) -> str:
 def monitor_check_stock() -> dict[str, int]:
     config = monitor_config()
     if not config.get('stock_enabled'):
-        return {'checked': 0, 'alerts': 0}
-    # Always refresh: a user need not open the Mini App for a stock change to be detected.
+        return {'checked': 0, 'alerts': 0, 'restocked': 0}
+    # Refresh independently of opening the Mini App.
     offers = collect_all_offers(force=True)
     if not offers:
-        # An empty or malformed API response should not be treated as zero-stock.
+        # Missing API data is not evidence that the store is out of stock.
         raise RuntimeError('GGSEL returned no offers; stock snapshot was not changed')
     thresholds = get_offer_settings_map()
-    changes = []
+    empty_items = []
     restocked = []
     observations = []
     with db_connect() as conn:
         known = {str(row['offer_id']): dict(row) for row in conn.execute('SELECT * FROM monitor_stock')}
     for item in offers:
         identifier = str(item.get('id') or '').strip()
-        if not identifier or item.get('status') == 'archived':
+        if not identifier or str(item.get('status') or '').lower() == 'archived':
             continue
-        count = max(0, as_int(item.get('quantity')))
+        # A missing stock field must never generate a false zero-stock warning.
+        raw_quantity = item.get('quantity')
+        if raw_quantity is None or str(raw_quantity).strip() == '':
+            continue
+        count = max(0, as_int(raw_quantity))
         minimum = max(0, as_int(thresholds.get(identifier, {}).get('min_stock'), LOW_STOCK_DEFAULT))
         bucket = _monitor_stock_bucket(count, minimum)
         previous = known.get(identifier)
         observations.append((identifier, count, bucket))
-        if bucket in ('low', 'empty') and (previous is None or previous['bucket'] != bucket):
-            changes.append((item, count, bucket, minimum))
-        if bucket == 'ok' and previous and previous['bucket'] in ('low', 'empty'):
+        # Only a ZERO stock level generates an alert. Previous low levels are silent.
+        # Existing v8.3 snapshots are preserved, so a previously notified empty
+        # item is not announced again after upgrading.
+        if count == 0 and (previous is None or previous['bucket'] != 'empty'):
+            empty_items.append((item, count))
+        if count > 0 and previous and previous['bucket'] == 'empty':
             restocked.append((item, count))
-    if changes:
-        lines = ['📦 <b>GGSEL — контроль остатков</b>', '']
-        for item, count, bucket, minimum in changes[:20]:
-            icon = '🚨' if bucket == 'empty' else '⚠️'
-            label = 'ЗАКОНЧИЛСЯ' if bucket == 'empty' else 'МАЛО КЛЮЧЕЙ'
-            lines.append(f"{icon} <b>{safe(item.get('title') or 'Товар')}</b> — {label}\nОстаток: <b>{count}</b> · порог: {minimum} · ID <code>{safe(item.get('id'))}</code>")
-        if len(changes) > 20:
-            lines.append(f'И ещё {len(changes)-20} товаров требуют внимания.')
-        # Save the baseline only AFTER delivery; Telegram failures will be retried.
+    if empty_items:
+        lines = ['🚨 <b>GGSEL — товары закончились</b>', '']
+        for item, count in empty_items[:20]:
+            lines.append(f"📦 <b>{safe(item.get('title') or 'Товар')}</b> — ЗАКОНЧИЛСЯ\nОстаток: <b>0</b> · ID <code>{safe(item.get('id'))}</code>")
+        if len(empty_items) > 20:
+            lines.append(f'И ещё {len(empty_items)-20} товаров с нулевым остатком.')
+        # Store the snapshot only after Telegram delivery, allowing safe retry.
         send_text('\n\n'.join(lines))
     now = datetime.now(timezone.utc).isoformat()
     with db_connect() as conn:
         conn.executemany("""INSERT INTO monitor_stock(offer_id,quantity,bucket,updated_at) VALUES(?,?,?,?)
             ON CONFLICT(offer_id) DO UPDATE SET quantity=excluded.quantity,bucket=excluded.bucket,updated_at=excluded.updated_at""",
             [(oid, qty, bucket, now) for oid, qty, bucket in observations])
-    return {'checked': len(observations), 'alerts': len(changes), 'restocked': len(restocked)}
+    return {'checked': len(observations), 'alerts': len(empty_items), 'restocked': len(restocked)}
 
 
 def _monitor_message_key(item: dict[str, Any]) -> str:

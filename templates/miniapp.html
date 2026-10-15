@@ -309,7 +309,7 @@
           <div class="panel-heading"><div><h3>🔔 Telegram-уведомления GGSEL</h3><p class="muted">Проверка склада работает без открытого Mini App. Служебные чаты подключаются только после проверки API.</p></div><button id="monitorRefreshBtn" class="secondary-button small">Проверить сейчас</button></div>
           <div id="monitorStatus" class="monitor-summary"><span class="muted">Загрузка состояния…</span></div>
           <form id="monitorConfigForm" class="form-stack">
-            <label class="switch-row"><span><strong>Уведомления об остатках</strong><small class="muted">Когда ключей мало или они закончились</small></span><input id="monitorStockEnabled" type="checkbox" checked></label>
+            <label class="switch-row"><span><strong>Уведомления об остатках</strong><small class="muted">Только когда остаток стал 0. Малые остатки не отправляются в Telegram</small></span><input id="monitorStockEnabled" type="checkbox" checked></label>
             <div class="monitor-service">
               <label class="switch-row"><span><strong>🚨 Чат поддержки GGSEL</strong><small class="muted">Только если переписка доступна по API</small></span><input id="monitorSupportEnabled" type="checkbox"></label>
               <label class="monitor-field">ID переписки поддержки <input id="monitorSupportDebate" type="text" placeholder="id_i из проверки API" autocomplete="off"></label>
