@@ -4,21 +4,39 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="light dark">
-  <title>GGSEL Seller</title>
+  <meta name="theme-color" content="#f5f7fc">
+  <title>GGSEL · Панель продавца</title>
   <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
-  <link rel="stylesheet" href="{{ url_for('static', filename='miniapp.css', v='81') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='miniapp.css', v='82') }}">
 </head>
 <body>
   <div id="app" class="app-shell">
+    <aside class="desktop-sidebar" aria-label="Разделы приложения">
+      <div class="sidebar-brand"><span class="brand-mark"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></span><span><b>GGSEL</b><small>SELLER WORKSPACE</small></span></div>
+      <button class="sidebar-search" type="button" data-open-search><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg> <span>Найти что угодно</span><kbd>⌘ K</kbd></button>
+      <div class="sidebar-group-title">РАБОЧЕЕ МЕСТО</div>
+      <nav class="sidebar-nav">
+        <button class="sidebar-link active" data-section="dashboard"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/></svg><span>Обзор</span></button>
+        <button class="sidebar-link " data-section="offers"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 9v12"/></svg><span>Товары</span></button>
+        <button class="sidebar-link " data-section="orders"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M4 3h16v18l-4-2-4 2-4-2-4 2zM8 8h8M8 12h8M8 16h4"/></svg><span>Заказы</span></button>
+        <button class="sidebar-link " data-section="chats"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5 9 9 0 0 1-4-.9L3 21l1.9-5.5a9 9 0 0 1-.9-4A8.5 8.5 0 1 1 21 11.5Z"/><path d="M8 12h8"/></svg><span>Чаты</span></button>
+        <button class="sidebar-link " data-section="finance"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><rect x="3" y="5" width="18" height="15" rx="3"/><path d="M3 9h18M17 14h1"/></svg><span>Финансы</span></button>
+      </nav><div class="sidebar-group-title">УПРАВЛЕНИЕ</div><nav class="sidebar-nav">
+        <button class="sidebar-link" data-section="cases"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M5 21V4M5 5q4-4 8 0t8 0v11q-4 4-8 0t-8 0"/></svg><span>Обращения</span></button>
+        <button class="sidebar-link" data-section="inventory"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><rect x="3" y="4" width="18" height="5" rx="1"/><path d="M5 9v11h14V9M10 14h4"/></svg><span>История ключей</span></button>
+        <button class="sidebar-link" data-section="supply"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M3 20h18M7 16V9M12 16V4M17 16v-6"/></svg><span>Закупки</span></button>
+        <button class="sidebar-link" data-section="more"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><span>Все инструменты</span></button>
+      </nav><div class="sidebar-bottom"><span class="sidebar-status-dot"></span><span>Личная панель продавца<small>Данные в вашем кабинете</small></span></div>
+    </aside>
     <header class="topbar">
-      <div>
-        <div class="eyebrow">SELLER CONTROL</div>
-        <h1>GGSEL <span id="currentSectionLabel" class="header-section-label">Обзор</span></h1>
+      <div class="topbar-brandline">
+        <div class="eyebrow">ПАНЕЛЬ ПРОДАВЦА <span class="eyebrow-dot">·</span> GGSEL</div>
+        <h1 id="topbarTitle">Обзор <span id="currentSectionLabel" class="header-section-label">Рабочее место</span></h1>
       </div>
       <div class="topbar-actions">
-        <button id="globalSearchBtn" class="icon-button" aria-label="Расширенный поиск по кабинету">⌕</button>
-        <button id="attentionBtn" class="icon-button notification-button" aria-label="Что требует внимания">♢<span id="attentionBadge" class="notification-badge hidden">0</span></button>
-        <button id="globalRefresh" class="icon-button" aria-label="Обновить">↻</button>
+        <button id="globalSearchBtn" class="icon-button" title="Поиск · Ctrl+K" aria-label="Расширенный поиск"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg></button>
+        <button id="attentionBtn" class="icon-button notification-button" title="Центр внимания" aria-label="Что требует внимания"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></svg><span id="attentionBadge" class="notification-badge hidden">0</span></button>
+        <button id="globalRefresh" class="icon-button" title="Обновить данные" aria-label="Обновить"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M20 7v5h-5M4 17v-5h5M5 10a8 8 0 0 1 14-3l1 5M4 12l1 5a8 8 0 0 0 14-3"/></svg></button>
       </div>
     </header>
 
@@ -37,6 +55,19 @@
         <div class="section-heading">
           <div><span class="kicker">Аналитика</span><h2>Дашборд</h2></div>
           <span id="ownerName" class="muted"></span>
+        </div>
+
+        <div class="welcome-hero">
+          <div class="welcome-content">
+            <span class="welcome-eyebrow">ВАШ МАГАЗИН • ВСЁ В ОДНОМ МЕСТЕ</span>
+            <h3 id="welcomeGreeting">Управляйте продажами с комфортом</h3>
+            <p>Заказы, покупатели и остатки — под рукой. Начните с самого важного.</p>
+            <div class="welcome-actions">
+              <button type="button" data-quick-action="search" class="welcome-primary"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg> Найти в кабинете</button>
+              <button type="button" data-quick-action="chats" class="welcome-secondary"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5 9 9 0 0 1-4-.9L3 21l1.9-5.5a9 9 0 0 1-.9-4A8.5 8.5 0 1 1 21 11.5Z"/><path d="M8 12h8"/></svg> Открыть чаты</button>
+            </div>
+          </div>
+          <div class="welcome-art" aria-hidden="true"><div class="art-orbit art-orbit-one"></div><div class="art-orbit art-orbit-two"></div><div class="art-center"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M3 20h18M7 16V9M12 16V4M17 16v-6"/></svg></div></div>
         </div>
 
         <div class="dashboard-controls panel compact-panel">
@@ -81,6 +112,8 @@
             <div id="dashboardRecent" class="list"><div class="empty">Загрузка…</div></div>
           </div>
         </div>
+
+        <div class="dashboard-shortcuts" id="dashboardShortcuts"><div class="shortcuts-head"><span>Мои инструменты</span><button type="button" data-edit-shortcuts="1">Настроить →</button></div><div id="shortcutButtons" class="shortcut-buttons"></div></div>
 
         <div class="panel quick-actions-panel">
           <div class="panel-heading"><h3>Быстрые действия</h3></div>
@@ -240,10 +273,15 @@
           <button class="more-card" data-goto="knowledge"><span>◎</span><b>База знаний</b><small>Инструкции поддержки</small></button>
           <button class="more-card" data-goto="quality"><span>◇</span><b>Качество</b><small>Товары, поставщики и сбои</small></button>
         </div>
+        <div class="panel pinned-tools-panel">
+          <div class="panel-heading"><h3>Быстрые разделы</h3><span class="muted">Появятся на главной</span></div>
+          <div id="shortcutSettings" class="shortcut-settings"></div>
+        </div>
         <div class="panel preferences-panel">
           <div class="panel-heading"><h3>Интерфейс</h3></div>
           <label class="switch-row"><span><b>Компактные карточки</b><small>Больше информации на экране</small></span><input id="compactModeToggle" type="checkbox"></label>
           <label class="switch-row"><span><b>Скрывать баланс</b><small>Полезно при демонстрации экрана</small></span><input id="hideBalanceToggle" type="checkbox"></label>
+          <label class="preference-select"><span><b>Оформление</b><small>Светлая, тёмная или системная тема</small></span><select id="themePreference"><option value="auto">Как в Telegram</option><option value="light">Светлая</option><option value="dark">Тёмная</option></select></label>
         </div>
       </section>
 
@@ -361,6 +399,7 @@
   <dialog id="chatDialog" class="modal large-modal">
     <div class="modal-header"><div><span class="kicker">Диалог</span><h2 id="chatDialogTitle">Чат</h2></div><button class="close-button" data-close>×</button></div>
     <div id="chatDialogMeta" class="chat-dialog-meta"></div>
+    <div class="chat-dialog-toptools"><button type="button" id="customerViewToggle" class="customer-view-toggle">Профиль клиента</button></div>
     <div class="chips chat-label-actions">
       <button class="chip" data-set-chat-label="new">Новый</button>
       <button class="chip" data-set-chat-label="waiting">Ждём клиента</button>
@@ -376,9 +415,9 @@
           <button id="chatCaseBtn" class="secondary-button small" type="button">⚑ Проблема</button>
           <button id="chatReplacementBtn" class="danger-button small" type="button">↺ Замена</button>
         </div>
-        <form id="chatReplyForm" class="reply-form"><textarea id="chatReplyText" rows="3" placeholder="Ответ покупателю"></textarea><button class="primary-button" type="submit">Отправить</button></form>
+        <form id="chatReplyForm" class="reply-form"><label class="composer-field"><span class="sr-only">Ответ покупателю</span><textarea id="chatReplyText" rows="2" placeholder="Напишите ответ покупателю…" aria-describedby="chatReplyHint"></textarea></label><div class="composer-footer"><small id="chatReplyHint">Ctrl + Enter — отправить</small><span id="chatReplyCounter" class="muted">0 символов</span><button class="primary-button" type="submit">Отправить <svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="m5 12 14 0m-6-6 6 6-6 6"/></svg></button></div></form>
       </section>
-      <aside class="customer-panel">
+      <aside class="customer-panel" id="customerPanel">
         <div class="panel-heading"><div><span class="kicker">CRM</span><h3>Карточка клиента</h3></div></div>
         <div id="customerStats" class="customer-stats"></div>
         <label class="switch-row"><span>📌 Закрепить клиента</span><input id="customerPinned" type="checkbox"></label>
@@ -470,15 +509,15 @@
   </dialog>
 
   <nav class="bottom-nav" aria-label="Основная навигация">
-    <button class="tab active" data-section="dashboard"><span>⌂</span><small>Обзор</small></button>
-    <button class="tab" data-section="offers"><span>▦</span><small>Товары</small></button>
-    <button class="tab" data-section="orders"><span>＃</span><small>Заказы</small></button>
-    <button class="tab" data-section="chats"><span>✉</span><small>Чаты</small></button>
-    <button class="tab" data-section="more"><span>•••</span><small>Ещё</small></button>
+    <button class="tab active" data-section="dashboard"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1z"/></svg><small>Обзор</small></button>
+    <button class="tab" data-section="offers"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 9v12"/></svg><small>Товары</small></button>
+    <button class="tab" data-section="orders"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M4 3h16v18l-4-2-4 2-4-2-4 2zM8 8h8M8 12h8M8 16h4"/></svg><small>Заказы</small></button>
+    <button class="tab" data-section="chats"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5 9 9 0 0 1-4-.9L3 21l1.9-5.5a9 9 0 0 1-.9-4A8.5 8.5 0 1 1 21 11.5Z"/><path d="M8 12h8"/></svg><small>Чаты</small></button>
+    <button class="tab" data-section="more"><svg class="ui-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg><small>Ещё</small></button>
   </nav>
 
   <button id="backToTop" class="back-to-top" type="button" aria-label="Вернуться наверх" title="Наверх">↑</button>
   <div id="toast" class="toast hidden"></div>
-  <script src="{{ url_for('static', filename='miniapp.js', v='81') }}" defer></script>
+  <script src="{{ url_for('static', filename='miniapp.js', v='82') }}" defer></script>
 </body>
 </html>

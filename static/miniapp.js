@@ -88,8 +88,10 @@
   }
 
   function openDialog(dialog) {
-    dialog.showModal();
-    tg?.HapticFeedback?.impactOccurred('light');
+    if (!dialog.open) {
+      dialog.showModal();
+      tg?.HapticFeedback?.impactOccurred('light');
+    }
   }
   function closeDialog(dialog) { if (dialog.open) dialog.close(); }
 
@@ -102,7 +104,62 @@
     const hideToggle = $('#hideBalanceToggle');
     if (compactToggle) compactToggle.checked = compact;
     if (hideToggle) hideToggle.checked = hideBalance;
+    applyUiTheme();
   }
+
+  const UI_SECTIONS = {
+    dashboard:'Обзор', offers:'Товары', orders:'Заказы', chats:'Чаты',
+    finance:'Финансы', more:'Инструменты', reviews:'Отзывы', cases:'Обращения',
+    inventory:'История ключей', quality:'Качество', supply:'Закупки',
+    knowledge:'База знаний', workspace:'Автоматизация', health:'Система',
+    categories:'Категории', operations:'Операции', audit:'История действий'
+  };
+  const SHORTCUT_SECTIONS = ['cases','supply','inventory','workspace','knowledge','quality','finance','health'];
+  const SHORTCUT_ICONS = {cases:'⚑',supply:'◫',inventory:'⌁',workspace:'⚙',knowledge:'◎',quality:'◇',finance:'₽',health:'✚'};
+
+  function applyUiTheme() {
+    const preference = localStorage.getItem('ggselUiTheme') || 'auto';
+    const chosen = ['auto','dark','light'].includes(preference) ? preference : 'auto';
+    const dark = chosen === 'auto' ? (tg?.colorScheme === 'dark' || (!tg && window.matchMedia?.('(prefers-color-scheme: dark)').matches)) : chosen === 'dark';
+    document.documentElement.dataset.uiTheme = dark ? 'dark' : 'light';
+    const picker = $('#themePreference');
+    if (picker) picker.value = chosen;
+    document.querySelector('meta[name="theme-color"]')?.setAttribute('content', dark ? '#111827' : '#f5f7fc');
+  }
+
+  function readShortcuts() {
+    try {
+      const stored = JSON.parse(localStorage.getItem('ggselQuickShortcuts') || 'null');
+      return Array.isArray(stored) ? [...new Set(stored)].filter(x => SHORTCUT_SECTIONS.includes(x)).slice(0,6) : ['cases','supply','inventory'];
+    } catch { return ['cases','supply','inventory']; }
+  }
+  function renderShortcuts() {
+    const selected = readShortcuts();
+    const buttons = $('#shortcutButtons');
+    const settings = $('#shortcutSettings');
+    if (buttons) buttons.innerHTML = selected.length ? selected.map(key => `<button type="button" class="shortcut-button" data-shortcut-section="${key}"><span aria-hidden="true">${SHORTCUT_ICONS[key]}</span>${UI_SECTIONS[key]}</button>`).join('') : '<span class="muted">Выберите любимые разделы в настройках.</span>';
+    if (settings) settings.innerHTML = SHORTCUT_SECTIONS.map(key => `<label class="shortcut-setting"><input type="checkbox" value="${key}" ${selected.includes(key) ? 'checked' : ''}><span>${UI_SECTIONS[key]}</span></label>`).join('');
+  }
+  function updateWelcome() {
+    const hour = new Date().getHours();
+    const greeting = hour < 6 ? 'Хорошей ночи!' : hour < 12 ? 'Доброе утро!' : hour < 18 ? 'Добрый день!' : 'Добрый вечер!';
+    const node = $('#welcomeGreeting');
+    if (node) node.textContent = greeting + ' Всё под контролем.';
+  }
+  function setupBackNavigation() {
+    const primary = new Set(['dashboard','offers','orders','chats','finance','more']);
+    $$('.section').forEach(section => {
+      const key = section.id.replace(/^section-/, '');
+      if (primary.has(key)) return;
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'secondary-back';
+      button.textContent = '← Все инструменты';
+      button.addEventListener('click', () => switchSection('more'));
+      section.insertBefore(button, section.firstChild);
+    });
+  }
+
 
   function statusLabel(status) {
     return ({active:'Активен', paused:'Приостановлен', archived:'В архиве', unknown:'Неизвестно'})[status] || status || 'Неизвестно';
@@ -110,8 +167,15 @@
 
   async function switchSection(name) {
     state.section = name;
-    $('#currentSectionLabel')?.replaceChildren(document.createTextNode(({dashboard:'Обзор',offers:'Товары',orders:'Заказы',chats:'Чаты',finance:'Финансы',more:'Ещё',reviews:'Отзывы',cases:'Обращения',inventory:'Ключи',quality:'Качество',supply:'Закупки',knowledge:'База знаний'})[name] || name));
-    $$('.tab').forEach(tab => tab.classList.toggle('active', tab.dataset.section === name));
+    const title = UI_SECTIONS[name] || name;
+    const heading = $('#topbarTitle');
+    if (heading?.firstChild) heading.firstChild.textContent = `${title} `;
+    $('#currentSectionLabel')?.replaceChildren(document.createTextNode(['dashboard','offers','orders','chats','finance','more'].includes(name) ? 'Рабочее место' : 'Инструменты'));
+    $$('.tab,.sidebar-link').forEach(tab => {
+      const active = tab.dataset.section === name || (tab.classList.contains('sidebar-link') && !$$(`.sidebar-link[data-section="${name}"]`).length && tab.dataset.section === 'more');
+      tab.classList.toggle('active', active);
+      if (tab.classList.contains('sidebar-link')) tab.setAttribute('aria-current', active ? 'page' : 'false');
+    });
     $$('.section').forEach(section => section.classList.toggle('active', section.id === `section-${name}`));
     if (!state.loaded.has(name)) {
       state.loaded.add(name);
@@ -836,7 +900,7 @@
       if (state.chatLabel !== 'all' && (item.label || 'new') !== state.chatLabel) return false;
       if (!query) return true;
       return [item.email,item.invoice_id,item.product_name,item.preview,item.id_i].some(value => String(value || '').toLowerCase().includes(query));
-    }).sort((a, b) => chatTimestamp(b) - chatTimestamp(a));
+    }).sort((a, b) => Number(!!b.pinned) - Number(!!a.pinned) || chatTimestamp(b) - chatTimestamp(a));
     if (!items.length) { $('#chatsList').innerHTML = '<div class="empty">Чаты не найдены</div>'; return; }
     $('#chatsList').innerHTML = items.map(item => {
       const id = getAny(item, ['conversation_id','id_i','debate_id','id','invoice_id']);
@@ -844,13 +908,28 @@
       const preview = getAny(item, ['preview','message','text'], 'Открыть переписку');
       const unread = Number(item.cnt_new || 0);
       const meta = [item.email, item.invoice_id ? `заказ #${item.invoice_id}` : '', formatDate(item.last_message)].filter(Boolean).join(' · ');
-      return `<button class="chat-card plain-button" data-chat="${esc(id)}"><div class="panel-heading"><strong>${item.pinned ? '📌 ' : ''}${item.favorite ? '★ ' : ''}${esc(title)}</strong><span class="badge">${Number(item.debate_count||1)>1 ? `${esc(item.debate_count)} ветки` : `#${esc(item.id_i||id)}`}${unread > 0 ? ` · ${unread} новых` : ''}</span></div><p>${esc(typeof preview === 'object' ? JSON.stringify(preview) : preview)}</p><div class="chat-card-footer"><span class="badge chat-${esc(item.label || 'new')}">${esc(chatLabelName(item.label || 'new'))}</span><span class="muted">${esc(meta)}</span></div></button>`;
+      const who = String(item.email || title).trim();
+      const initials = (who.includes('@') ? who.split('@')[0] : who).split(/[\s._-]+/).slice(0,2).map(x => x[0] || '').join('').toUpperCase().slice(0,2) || '•';
+      const tone = [...who].reduce((a,ch) => a+ch.charCodeAt(0),0) % 4;
+      const readableDate = formatDate(item.last_message_iso || item.last_message || item.created_at);
+      return `<button class="chat-card plain-button" data-chat="${esc(id)}" aria-label="Открыть переписку: ${esc(title)}">
+        <span class="chat-avatar tone-${tone}">${esc(initials)}</span>
+        <div class="chat-card-main">
+          <strong>${item.pinned ? '<span class="chat-pin">📌 </span>' : ''}${item.favorite ? '★ ' : ''}${esc(title)}</strong>
+          <p class="chat-preview">${esc(typeof preview === 'object' ? JSON.stringify(preview) : preview)}</p>
+          <span class="muted chat-meta">${esc(item.email || (item.invoice_id ? `Заказ #${item.invoice_id}` : `#${id}`))}</span>
+          <div class="chat-card-footer"><span class="badge chat-${esc(item.label || 'new')}">${esc(chatLabelName(item.label || 'new'))}</span>${Number(item.debate_count || 1) > 1 ? `<span class="badge">${Number(item.debate_count)} ветки</span>` : ''}</div>
+        </div>
+        <span class="chat-card-side"><time class="chat-timestamp">${esc(readableDate)}</time>${unread ? `<span class="chat-unread">${unread > 99 ? '99+' : unread}</span>` : ''}</span>
+      </button>`;
     }).join('');
   }
 
-  async function loadChatStatus() {
+  async function loadChatStatus(force = false) {
+    if (!force && state.lastChatStatusAt && Date.now() - state.lastChatStatusAt < 60000) return;
     try {
       const {data} = await api('/app/api/chats/status');
+      state.lastChatStatusAt = Date.now();
       const last = data.last_webhook_message;
       const lastDate = last ? formatDate(last.message_date || last.created_at) : 'ещё не было';
       const lastMs = last ? new Date(last.message_date || last.created_at).getTime() : NaN;
@@ -862,11 +941,13 @@
   }
 
   async function loadChats(query = state.chatQuery) {
-    $('#chatsList').innerHTML = '<div class="empty">Загрузка…</div>';
-    await loadChatStatus();
+    const requestId = state.chatRequestId = (state.chatRequestId || 0) + 1;
+    $('#chatsList').innerHTML = '<div class="empty">Загрузка переписок…</div>';
+    loadChatStatus().catch(() => {});
     const params = new URLSearchParams();
     if (query && query.trim().length >= 2) params.set('query', query.trim());
     const {data} = await api(`/app/api/chats${params.toString() ? `?${params}` : ''}`);
+    if (requestId !== state.chatRequestId) return;
     state.chats = data || [];
     renderChats();
   }
@@ -891,6 +972,8 @@
 
   async function openChat(id) {
     state.currentChat = String(id);
+    $('#chatDialog')?.classList.remove('customer-view');
+    $('#customerViewToggle').textContent = 'Профиль клиента';
     state.currentChatInfo = state.chats.find(item => String(getAny(item,['conversation_id','id_i','debate_id','id'])) === String(id)) || {};
     $('#chatDialogTitle').textContent = state.currentChatInfo.product_name || state.currentChatInfo.email || 'Переписка с клиентом';
     $('#chatDialogMeta').innerHTML = `<b>${esc(state.currentChatInfo.email || '')}</b><span class="muted">${state.currentChatInfo.invoice_id ? `Последний заказ #${esc(state.currentChatInfo.invoice_id)} · ` : ''}${Number(state.currentChatInfo.debate_count||1)} веток GGSEL объединено</span>`;
@@ -936,7 +1019,9 @@
     if (!await confirmAction('Отправить сообщение покупателю?')) return;
     try {
       await api(`/app/api/conversations/${encodeURIComponent(state.currentChat)}/messages`, {method:'POST', body:JSON.stringify({message, confirm:true})});
-      $('#chatReplyText').value = ''; toast('Сообщение отправлено'); await openChat(state.currentChat);
+      $('#chatReplyText').value = '';
+      $('#chatReplyCounter').textContent = '0 символов';
+      toast('Сообщение отправлено'); await openChat(state.currentChat);
     } catch (error) { toast(error.message, true); }
   }
 
@@ -1228,7 +1313,7 @@
     $('#errorsRefresh')?.addEventListener('click', async()=>renderErrors((await api('/app/api/errors')).data));
     $('#reportSettingsSave')?.addEventListener('click', async()=>{await api('/app/api/report-settings',{method:'PUT',body:JSON.stringify({morning_enabled:$('#morningReportToggle').checked,evening_enabled:$('#eveningReportToggle').checked})}); toast('Настройки отчёта сохранены');});
 
-    $$('.tab').forEach(tab => tab.addEventListener('click', () => switchSection(tab.dataset.section)));
+    $$('.tab,.sidebar-link').forEach(tab => tab.addEventListener('click', () => switchSection(tab.dataset.section)));
     $$('[data-goto]').forEach(button => button.addEventListener('click', () => switchSection(button.dataset.goto)));
     $('#globalRefresh').addEventListener('click', globalRefresh);
     $('#globalSearchBtn').addEventListener('click', openGlobalSearch);
@@ -1238,6 +1323,32 @@
     $('#dashboardRecentClear').addEventListener('click', () => loadRecent().catch(error => toast(error.message, true)));
     $('#compactModeToggle').addEventListener('change', event => { localStorage.setItem('ggselCompactMode', event.target.checked ? '1' : '0'); applyPreferences(); });
     $('#hideBalanceToggle').addEventListener('change', event => { localStorage.setItem('ggselHideBalance', event.target.checked ? '1' : '0'); applyPreferences(); });
+    $('#themePreference')?.addEventListener('change', event => { localStorage.setItem('ggselUiTheme', event.target.value); applyUiTheme(); });
+    document.querySelectorAll('[data-open-search]').forEach(btn => btn.addEventListener('click', openGlobalSearch));
+    $('#shortcutButtons')?.addEventListener('click', event => { const key = event.target.closest('[data-shortcut-section]')?.dataset.shortcutSection; if (key) switchSection(key); });
+    $('#shortcutSettings')?.addEventListener('change', event => {
+      const key = event.target.value;
+      if (!SHORTCUT_SECTIONS.includes(key)) return;
+      const selected = readShortcuts();
+      const next = event.target.checked ? [...new Set([...selected,key])].slice(0,6) : selected.filter(x => x !== key);
+      localStorage.setItem('ggselQuickShortcuts', JSON.stringify(next));
+      renderShortcuts();
+      toast(next.length === 6 && event.target.checked && !next.includes(key) ? 'Максимум 6 быстрых разделов' : 'Быстрые разделы обновлены');
+    });
+    $('[data-edit-shortcuts]')?.addEventListener('click', () => { switchSection('more').then(() => $('#shortcutSettings')?.scrollIntoView({behavior:'smooth',block:'center'})); });
+    $('#chatReplyText')?.addEventListener('input', event => { $('#chatReplyCounter').textContent = `${event.target.value.length} символов`; });
+    $('#chatReplyText')?.addEventListener('keydown', event => {
+      if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        $('#chatReplyForm')?.requestSubmit();
+      }
+    });
+    $('#customerViewToggle')?.addEventListener('click', () => {
+      const active = $('#chatDialog').classList.toggle('customer-view');
+      $('#customerViewToggle').textContent = active ? '← К переписке' : 'Профиль клиента';
+    });
+    $('#chatDialog')?.addEventListener('close', () => { $('#chatDialog').classList.remove('customer-view'); });
+
     $('#dashboardPeriods').addEventListener('click', event => { const button = event.target.closest('[data-dashboard-period]'); if (button) setDashboardPeriod(button.dataset.dashboardPeriod); });
     $('#dashboardProduct').addEventListener('change', async event => { state.dashboardProduct = event.target.value; await loadDashboard(); });
     $('#dashboardDateForm').addEventListener('submit', async event => { event.preventDefault(); state.dashboardStart = $('#dashboardStart').value; state.dashboardEnd = $('#dashboardEnd').value; if (!state.dashboardStart || !state.dashboardEnd) return; await loadDashboard(); });
@@ -1248,7 +1359,7 @@
     $('#dashboardAttention').addEventListener('click', attentionClick);
     $('#attentionList').addEventListener('click', attentionClick);
     $('#dashboardRecent').addEventListener('click', event => { const node = event.target.closest('[data-recent-type]'); if (node) handleNavigationItem(node.dataset.recentType, node.dataset.recentId); });
-    $$('.quick-actions-grid [data-quick-action]').forEach(button => button.addEventListener('click', () => { const action = button.dataset.quickAction; if (action === 'search') openGlobalSearch(); if (action === 'low-stock') { state.offerStatus = 'low_stock'; switchSection('offers').then(() => { $$('#offerFilters .chip').forEach(chip => chip.classList.toggle('active', chip.dataset.status === 'low_stock')); loadOffers(); }); } if (action === 'order') switchSection('orders').then(() => $('#invoiceInput').focus()); if (action === 'chats') switchSection('chats'); }));
+    $$('[data-quick-action]').forEach(button => button.addEventListener('click', () => { const action = button.dataset.quickAction; if (action === 'search') openGlobalSearch(); if (action === 'low-stock') { state.offerStatus = 'low_stock'; switchSection('offers').then(() => { $$('#offerFilters .chip').forEach(chip => chip.classList.toggle('active', chip.dataset.status === 'low_stock')); loadOffers(); }); } if (action === 'order') switchSection('orders').then(() => $('#invoiceInput').focus()); if (action === 'chats') switchSection('chats'); }));
 
     let searchTimer;
     $('#offerSearch').addEventListener('input', event => {
@@ -1357,7 +1468,12 @@
       tg.enableClosingConfirmation?.();
     }
     applyPreferences();
-  
+    renderShortcuts();
+    updateWelcome();
+    setupBackNavigation();
+    tg?.onEvent?.('themeChanged', () => { if ((localStorage.getItem('ggselUiTheme') || 'auto') === 'auto') applyUiTheme(); });
+    window.matchMedia?.('(prefers-color-scheme: dark)')?.addEventListener?.('change', () => { if ((localStorage.getItem('ggselUiTheme') || 'auto') === 'auto') applyUiTheme(); });
+
   document.addEventListener('click', async e=>{
     const order=e.target.closest('[data-open-order]'); if(order?.dataset.openOrder){ switchSection('orders'); $('#invoiceInput').value=order.dataset.openOrder; setTimeout(()=>findOrder(order.dataset.openOrder),150); }
     const chat=e.target.closest('[data-open-chat]'); if(chat?.dataset.openChat){ switchSection('chats'); setTimeout(()=>openChat(chat.dataset.openChat),150); }
