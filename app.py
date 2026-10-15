@@ -551,6 +551,10 @@ def upsert_order(invoice_id: str, response: dict[str, Any]) -> dict[str, Any]:
         return {}
     buyer = order.get("buyer_info") if isinstance(order.get("buyer_info"), dict) else {}
     now = datetime.now(timezone.utc).isoformat()
+    product_title = _good_product_title(order.get("name"))
+    if not product_title:
+        # This lookup is local: do not slow down incoming webhooks with a network call.
+        product_title = _local_sale_name(invoice_id, order.get("item_id"))
     with db_connect() as conn:
         conn.execute(
             """
@@ -561,7 +565,7 @@ def upsert_order(invoice_id: str, response: dict[str, Any]) -> dict[str, Any]:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(invoice_id) DO UPDATE SET
                 item_id=excluded.item_id,
-                product_name=excluded.product_name,
+                product_name=COALESCE(NULLIF(excluded.product_name,''), orders.product_name),
                 buyer_email=excluded.buyer_email,
                 buyer_account=excluded.buyer_account,
                 buyer_phone=excluded.buyer_phone,
@@ -578,7 +582,7 @@ def upsert_order(invoice_id: str, response: dict[str, Any]) -> dict[str, Any]:
             (
                 invoice_id,
                 str(order.get("item_id") or ""),
-                str(order.get("name") or ""),
+                product_title,
                 str(buyer.get("email") or ""),
                 str(buyer.get("account") or ""),
                 str(buyer.get("phone") or ""),
@@ -617,7 +621,7 @@ def upsert_sales(data: Any) -> int:
                 ON CONFLICT(invoice_id) DO UPDATE SET
                     sale_date=excluded.sale_date,
                     product_id=excluded.product_id,
-                    product_name=excluded.product_name,
+                    product_name=COALESCE(NULLIF(excluded.product_name,''), sales.product_name),
                     price_rub=excluded.price_rub,
                     price_usd=excluded.price_usd,
                     price_eur=excluded.price_eur,
@@ -628,7 +632,7 @@ def upsert_sales(data: Any) -> int:
                     invoice_id,
                     str(sale.get("date") or ""),
                     str(product.get("id") or ""),
-                    str(product.get("name") or ""),
+                    _good_product_title(product.get("name")),
                     as_float(product.get("price_rub")),
                     as_float(product.get("price_usd")),
                     as_float(product.get("price_eur")),
@@ -2824,6 +2828,7 @@ def ensure_conversation(*, debate_id: str, invoice_id: str = "", email: str = ""
     conversation_id = _conversation_id(identity)
     now = datetime.now(timezone.utc).isoformat()
     normalized_when = normalize_datetime_text(when) or now
+    product_name = _good_product_title(product_name)
     with db_connect() as conn:
         conn.execute(
             """
@@ -2925,9 +2930,18 @@ def _conversation_summary(conversation_id: str) -> dict[str, Any]:
     if not conv:
         return {}
     orders = _conversation_orders(conversation_id)
+    enriched = [dict(conv)]
+    _enrich_conversation_titles(enriched)
+    conv_data = enriched[0]
+    # Render recovered titles in client order history, where source was UUID.
+    if orders:
+        offer_title = {str(o.get('item_id') or ''): _good_product_title(o.get('product_name')) for o in orders if _good_product_title(o.get('product_name'))}
+        for order in orders:
+            if not _good_product_title(order.get('product_name')):
+                order['product_name'] = offer_title.get(str(order.get('item_id') or ''), '') or ''
     total_spent = sum(as_float(item.get('amount')) for item in orders)
     return {
-        **dict(conv),
+        **conv_data,
         "debate_ids":[str(row['debate_id']) for row in debates],
         "orders_count":len(orders),
         "total_spent":total_spent,
@@ -2958,10 +2972,25 @@ def process_ggsel_event(data: dict[str, Any]) -> None:
             logger.exception("Unable to load order %s", invoice_id)
 
     buyer = order.get("buyer_info") if isinstance(order.get("buyer_info"), dict) else {}
+    # GGSEL sometimes returns a UUID in order.name; use local sales or a title
+    # from the product endpoint only as a fallback, never present that UUID.
+    display_title = _good_product_title(order.get('name'))
+    if not display_title and invoice_id:
+        display_title = _local_sale_name(invoice_id, order.get('item_id'))
+    if not display_title and as_int(order.get('item_id')) > 0:
+        try:
+            response = ggsel.product_v1(as_int(order['item_id']))
+            display_title = _good_product_title(_find_text_in_nested(
+                response, ('title_ru', 'name_goods', 'product_name', 'title', 'name')))
+        except Exception as exc:
+            logger.info('GGSEL product name temporarily unavailable: %s', exc)
+    if display_title and invoice_id:
+        with db_connect() as conn:
+            conn.execute('UPDATE orders SET product_name=? WHERE invoice_id=?', (display_title, invoice_id))
     conversation_id = ensure_conversation(
         debate_id=debate_id, invoice_id=invoice_id,
         email=str(buyer.get("email") or ""), account=str(buyer.get("account") or ""),
-        product_name=str(order.get("name") or ""), preview=message_text or ("[Изображение]" if image_url else ""),
+        product_name=display_title, preview=message_text or ("[Изображение]" if image_url else ""),
         when=message_date,
     )
     save_message_record(
@@ -2977,7 +3006,7 @@ def process_ggsel_event(data: dict[str, Any]) -> None:
     text = (
         prefix
         + "📩 <b>Новое сообщение GGSEL</b>\n\n"
-        + f"Товар: <b>{safe(order.get('name'))}</b>\n"
+        + f"Товар: <b>{safe(display_title or 'Товар (название уточняется)')}</b>\n"
         + f"Заказ: <code>{safe(invoice_id)}</code>\n"
         + f"Диалог: <code>{safe(debate_id)}</code>\n"
         + f"Почта: {safe(buyer.get('email'))}\n"
@@ -2991,7 +3020,7 @@ def process_ggsel_event(data: dict[str, Any]) -> None:
     if image_url:
         caption = (
             "🖼 <b>Изображение покупателя</b>\n\n"
-            f"Товар: {safe(order.get('name'))}\n"
+            f"Товар: {safe(display_title or 'Товар (название уточняется)')}\n"
             f"Заказ: <code>{safe(invoice_id)}</code>\n"
             f"Диалог: <code>{safe(debate_id)}</code>\n"
             f"Почта: {safe(buyer.get('email'))}"
@@ -3008,7 +3037,7 @@ def process_ggsel_event(data: dict[str, Any]) -> None:
             conversation_id=conversation_id,
             debate_id=debate_id,
             offer_id=str(order.get("item_id") or ""),
-            product_name=str(order.get("name") or ""),
+            product_name=display_title,
             message_text=message_text,
             message_date=message_date,
         )
@@ -3055,6 +3084,25 @@ def _looks_like_uuid(value: Any) -> bool:
     return bool(UUID_LIKE_RE.fullmatch(str(value or "").strip()))
 
 
+def _looks_like_opaque_product_name(value: Any) -> bool:
+    """GGSEL can put a UUID or another opaque ID in an order's `name`."""
+    name = str(value or "").strip()
+    if not name or name in {"—", "-"}:
+        return True
+    if _looks_like_uuid(name):
+        return True
+    if re.fullmatch(r"[0-9a-fA-F]{24,}", name):
+        return True
+    if re.fullmatch(r"\d{9,}", name):
+        return True
+    return False
+
+
+def _good_product_title(value: Any) -> str:
+    name = str(value or "").strip()
+    return name if not _looks_like_opaque_product_name(name) and name.casefold() not in {"товар", "без названия", "неизвестный товар"} else ""
+
+
 def _find_text_in_nested(data: Any, keys: tuple[str, ...]) -> str:
     """Find the first useful non-UUID text value in a nested API response."""
     queue: list[Any] = [data]
@@ -3089,14 +3137,14 @@ def _local_sale_name(invoice_id: str, item_id: Any = "") -> str:
             (str(invoice_id), str(item_id or ""), str(item_id or "")),
         ).fetchone()
     value = str(row["product_name"] or "") if row else ""
-    return "" if _looks_like_uuid(value) else value
+    return _good_product_title(value)
 
 
 def _resolve_order_name(invoice_id: str, item: dict[str, Any]) -> tuple[str, str]:
     """Return (human product title, opaque reference if GGSEL put a UUID in name)."""
     raw_name = str(item.get("name") or "").strip()
-    opaque_reference = raw_name if _looks_like_uuid(raw_name) else ""
-    if raw_name and not opaque_reference:
+    opaque_reference = raw_name if _looks_like_opaque_product_name(raw_name) else ""
+    if _good_product_title(raw_name) and not opaque_reference:
         return raw_name, ""
 
     item_id = item.get("item_id")
@@ -3174,6 +3222,90 @@ def _review_payload(data: Any) -> list[dict[str, Any]]:
 
 
 
+# Product titles are resolved from trusted purchase/catalogue data, never from guessed IDs.
+_chat_title_refresh_lock = threading.Lock()
+_chat_title_refresh_retry_at = 0.0
+
+
+def _enrich_conversation_titles(rows: list[dict[str, Any]], *, fetch_catalogue: bool = True) -> None:
+    """Replace opaque GGSEL purchase IDs with product names; backfill older chats.
+
+    Local orders/sales have priority. The catalogue, if needed, is fetched once
+    rather than making one API request per chat. No misleading UUID is displayed.
+    """
+    global _chat_title_refresh_retry_at
+    needs = [r for r in rows if not _good_product_title(r.get('product_name'))]
+    if not needs:
+        return
+    invoice_ids = {str(r.get('latest_invoice_id') or '') for r in needs}
+    known_by_invoice: dict[str, str] = {}
+    known_by_offer: dict[str, str] = {}
+    offer_by_invoice: dict[str, str] = {}
+    # Read once from the local database, not 1-3 SQL queries per conversation.
+    with db_connect() as conn:
+        for row in conn.execute('SELECT invoice_id,item_id,product_name FROM orders').fetchall():
+            invoice, product_id = str(row['invoice_id'] or ''), str(row['item_id'] or '')
+            title = _good_product_title(row['product_name'])
+            offer_by_invoice[invoice] = product_id
+            if title:
+                known_by_invoice[invoice] = title
+                if product_id: known_by_offer[product_id] = title
+        for row in conn.execute('SELECT invoice_id,product_id,product_name FROM sales ORDER BY updated_at DESC').fetchall():
+            invoice, product_id = str(row['invoice_id'] or ''), str(row['product_id'] or '')
+            title = _good_product_title(row['product_name'])
+            if title:
+                known_by_invoice.setdefault(invoice, title)
+                if product_id: known_by_offer.setdefault(product_id, title)
+            offer_by_invoice.setdefault(invoice, product_id)
+        for row in conn.execute('SELECT offer_id,product_name FROM inventory_batches ORDER BY id DESC').fetchall():
+            title = _good_product_title(row['product_name'])
+            if title and row['offer_id']: known_by_offer.setdefault(str(row['offer_id']), title)
+    if fetch_catalogue and any(
+        not (known_by_invoice.get(inv) or known_by_offer.get(offer_by_invoice.get(inv,'')))
+        for inv in invoice_ids if inv
+    ) and time.monotonic() >= _chat_title_refresh_retry_at:
+        if _chat_title_refresh_lock.acquire(blocking=False):
+            try:
+                # Backoff even on failure to avoid flooding an unhealthy GGSEL API.
+                _chat_title_refresh_retry_at = time.monotonic() + 90
+                for offer in collect_all_offers():
+                    title = _good_product_title(offer.get('title'))
+                    oid = str(offer.get('id') or '')
+                    if title and oid: known_by_offer[oid] = title
+            except Exception as exc:
+                logger.warning('Could not retrieve GGSEL product titles for chats: %s', exc)
+            finally:
+                _chat_title_refresh_lock.release()
+    updates = []
+    for item in needs:
+        invoice = str(item.get('latest_invoice_id') or '')
+        title = known_by_invoice.get(invoice) or known_by_offer.get(offer_by_invoice.get(invoice, ''), '')
+        if title:
+            item['product_name'] = title
+            updates.append((title, str(item['conversation_id'])))
+        else:
+            # A multi-purchase customer might still have a recoverable title
+            # from a related order/message even if latest invoice is absent.
+            item['product_name'] = ''
+    if updates:
+        with db_connect() as conn:
+            conn.executemany('UPDATE conversations SET product_name=? WHERE conversation_id=?', updates)
+
+
+def _classify_chat_attention(item: dict[str, Any]) -> str:
+    """Small, explainable rules; no AI or automatic messages to the buyer."""
+    waiting = str(item.get('last_sender') or '').casefold() == 'buyer'
+    text = str(item.get('last_message') or '').casefold()
+    critical_terms = ('возврат', 'не работает', 'не активир', 'ключ не', 'обман', 'жалоб',
+                      'ошибка', 'не получил', 'не пришло', 'refund', 'not working', 'invalid key')
+    has_problem = bool(item.get('has_open_case'))
+    if has_problem or (waiting and any(term in text for term in critical_terms)):
+        return 'urgent'
+    if waiting:
+        return 'unanswered'
+    return 'normal'
+
+
 def _conversation_chat_payload(query: str = "") -> list[dict[str, Any]]:
     rebuild_conversations()
     folded = str(query or '').strip().casefold()
@@ -3184,7 +3316,11 @@ def _conversation_chat_payload(query: str = "") -> list[dict[str, Any]]:
                    COALESCE(cp.favorite,0) AS favorite,
                    COALESCE(cl.label,'new') AS label, COALESCE(cl.note,'') AS label_note,
                    (SELECT COUNT(*) FROM conversation_debates d WHERE d.conversation_id=c.conversation_id) AS debate_count,
-                   (SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.conversation_id AND m.sender='buyer') AS buyer_messages
+                   (SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.conversation_id AND m.sender='buyer') AS buyer_messages,
+                   (SELECT m.sender FROM messages m WHERE m.conversation_id=c.conversation_id
+                     ORDER BY COALESCE(NULLIF(m.message_date,''),m.created_at) DESC, m.id DESC LIMIT 1) AS last_sender,
+                   EXISTS(SELECT 1 FROM problem_cases pc WHERE pc.conversation_id=c.conversation_id
+                     AND pc.status NOT IN ('resolved','closed')) AS has_open_case
             FROM conversations c
             LEFT JOIN customer_profiles cp ON cp.conversation_id=c.conversation_id
             LEFT JOIN chat_labels cl ON cl.debate_id=c.conversation_id
@@ -3201,9 +3337,11 @@ def _conversation_chat_payload(query: str = "") -> list[dict[str, Any]]:
                 (pattern, pattern),
             ).fetchall():
                 matched_ids.add(str(row['conversation_id']))
+    prepared = [dict(row) for row in rows]
+    _enrich_conversation_titles(prepared)
     result=[]
-    for row in rows:
-        item=dict(row)
+    for item in prepared:
+        item['attention'] = _classify_chat_attention(item)
         hay=' '.join(str(item.get(k) or '') for k in ('buyer_email','buyer_account','latest_invoice_id','product_name','last_message','customer_note')).casefold()
         if folded and folded not in hay and item['conversation_id'] not in matched_ids:
             continue
@@ -4801,6 +4939,35 @@ def miniapp_chats(user: dict[str, Any]):
     return miniapp_success(_conversation_chat_payload(str(request.args.get('query') or '')))
 
 
+def _suggest_chat_answer(messages: list[dict[str, Any]], product_name: str) -> dict[str, Any] | None:
+    """Suggest a manual reply only for an exact error code in the knowledge base.
+
+    Never send a message or apply a replacement. This is a draft, not an
+    activation diagnosis or a guarantee about a licence key.
+    """
+    last_buyer = next((m for m in reversed(messages) if m.get('buyer') is True), None)
+    if not last_buyer:
+        return None
+    text = str(last_buyer.get('message') or '')
+    error = extract_error_code(text)
+    if not error:
+        return None
+    product = str(product_name or '').casefold()
+    for article in list_knowledge(error_code=error, product=product):
+        codes = [str(c).casefold() for c in article.get('error_codes', [])]
+        if error.casefold() not in codes:
+            continue
+        pattern = str(article.get('product_pattern') or '').casefold()
+        if pattern and (not product or pattern not in product):
+            continue
+        return {'title':str(article.get('title') or '')[:150],
+                'error_code':error,
+                'draft':str(article.get('body') or '')[:3500],
+                'source':'Локальная база знаний',
+                'note':'Проверьте ответ перед отправкой. Это рекомендация, не автоматическая диагностика.'}
+    return None
+
+
 @app.get("/app/api/conversations/<conversation_id>")
 @miniapp_api
 def miniapp_conversation(user: dict[str, Any], conversation_id: str):
@@ -4823,7 +4990,85 @@ def miniapp_conversation(user: dict[str, Any], conversation_id: str):
         seen.add(key); merged.append(item)
     merged.sort(key=lambda x: parse_iso_datetime(x.get('date_written')) or datetime.min.replace(tzinfo=timezone.utc))
     remember_recent_view('chat',conversation_id,str(summary.get('buyer_email') or summary.get('product_name') or 'Клиент'),{'invoice_id':summary.get('latest_invoice_id')})
-    return miniapp_success({'conversation':summary,'messages':merged})
+    return miniapp_success({'conversation':summary,'messages':merged,
+                            'suggestion':_suggest_chat_answer(merged, str(summary.get('product_name') or ''))})
+
+
+# The support copilot is strictly read-only. It never replies, archives stock, or edits GGSEL.
+def build_support_brief(conversation_id: str) -> dict[str, Any]:
+    summary = _conversation_summary(conversation_id)
+    if not summary:
+        raise ValueError("Переписка не найдена")
+    messages = _conversation_messages(conversation_id)
+    orders = summary.get('orders') or []
+    latest_order = orders[0] if orders else {}
+    buyers = [m for m in messages if m.get('buyer') and str(m.get('message') or '').strip()]
+    last = buyers[-1] if buyers else {}
+    last_text = str(last.get('message') or '')
+    signal = classify_issue(last_text)
+    error = signal.get('error_code') or ''
+    category = signal.get('category') or ''
+    family_name = str(summary.get('product_name') or latest_order.get('product_name') or '')
+    invoice_id = str(last.get('invoice_id') or summary.get('latest_invoice_id') or latest_order.get('invoice_id') or '')
+    profile = summary.get('profile') or {}
+    same_error = sum(bool(error and error.casefold() in str(m.get('message') or '').casefold()) for m in buyers)
+    past_cases = []
+    with db_connect() as conn:
+        rows = conn.execute("""SELECT id,invoice_id,status,priority,category,error_code,reason,updated_at
+            FROM problem_cases WHERE conversation_id=? OR (? != '' AND invoice_id=?)
+            ORDER BY updated_at DESC LIMIT 12""", (conversation_id,invoice_id,invoice_id)).fetchall()
+        past_cases = [dict(row) for row in rows]
+        similar = 0
+        if error:
+            similar = conn.execute("""SELECT COUNT(DISTINCT COALESCE(NULLIF(conversation_id,''), 'order:' || invoice_id))
+                FROM problem_cases WHERE lower(error_code)=lower(?) AND conversation_id!=?""",
+                (error,conversation_id)).fetchone()[0]
+    suggestions = []
+    if error:
+        for article in list_knowledge(error_code=error, product=family_name):
+            codes = [str(x).lower() for x in article.get('error_codes', [])]
+            pattern = str(article.get('product_pattern') or '').casefold()
+            if error.lower() in codes and (not pattern or pattern in family_name.casefold()):
+                suggestions.append({'title':str(article.get('title') or ''), 'text':str(article.get('body') or '')[:3500]})
+                break
+    steps=[]
+    if not last_text:
+        steps.append('Сообщений покупателя пока нет. Откройте заказ и проверьте его статус.')
+    elif error or category == 'activation':
+        steps.extend(['Уточнить установленную версию продукта и скриншот ошибки.', 'Сопоставить редакцию установленного ПО с приобретённым товаром.', 'Проверить историю похожих обращений перед решением о замене.'])
+    elif category == 'not_received':
+        steps.extend(['Открыть заказ и проверить оплату и статус выдачи.', 'Проверить доставленное содержимое; не отправлять повторно без проверки.'])
+    elif category == 'refund':
+        steps.extend(['Проверить условия заказа и причину обращения.', 'Собрать факты; не обещать возврат без подтверждения GGSEL.'])
+    else:
+        steps.extend(['Прочитать последнее обращение и проверить заказ.', 'При необходимости попросить скриншот или дополнительные сведения.'])
+    if same_error >= 2:
+        steps.insert(0, 'Повторное упоминание этой ошибки у покупателя — проверьте историю переписки.')
+    if similar >= 2:
+        steps.insert(0, 'Та же ошибка встречалась у других покупателей — проверьте партию товара.')
+    draft = suggestions[0]['text'] if suggestions else ''
+    if not draft and last_text:
+        draft = ('Здравствуйте! Спасибо за сообщение. ' +
+                 ('Пришлите, пожалуйста, скриншот ошибки и уточните установленную версию продукта — проверим ситуацию.' if category in ('activation','installation') or error else
+                  'Уточните, пожалуйста, детали проблемы и, если возможно, приложите скриншот — мы проверим заказ.'))
+    return {'customer':{'email':str(summary.get('buyer_email') or ''),
+                        'orders_count':summary.get('orders_count',0),
+                        'total_spent':summary.get('total_spent',0),
+                        'tags':profile.get('tags') or [], 'note':str(profile.get('note') or '')[:600]},
+            'product_name':family_name, 'invoice_id':invoice_id,
+            'last_message':last_text[:1200], 'error_code':error,
+            'category':category or 'other', 'priority':signal.get('priority') or 'normal',
+            'same_error_count':same_error, 'other_customer_cases':similar,
+            'previous_cases':past_cases[:5], 'steps':steps[:6],
+            'article':suggestions[0] if suggestions else None, 'draft':draft[:3500],
+            'disclaimer':'Это подсказка по локальным данным. Проверяйте факты перед отправкой или заменой ключа.'}
+
+
+@app.get('/app/api/conversations/<conversation_id>/support-brief')
+@miniapp_api
+def miniapp_support_brief(user: dict[str, Any], conversation_id: str):
+    rebuild_conversations()
+    return miniapp_success(build_support_brief(conversation_id))
 
 
 @app.put("/app/api/conversations/<conversation_id>/profile")

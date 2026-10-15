@@ -18,6 +18,7 @@
     chats: [],
     chatQuery: '',
     chatLabel: 'all',
+    chatAttention: 'all',
     dashboardPeriod: '30d',
     dashboardStart: '',
     dashboardEnd: '',
@@ -896,7 +897,14 @@
       const value = new Date(normalized).getTime();
       return Number.isNaN(value) ? 0 : value;
     };
+    const isAttention = (item) => (item.attention || 'normal');
+    const urgentCount = (state.chats || []).filter(item => isAttention(item) === 'urgent').length;
+    const awaitingCount = (state.chats || []).filter(item => ['urgent', 'unanswered'].includes(isAttention(item))).length;
+    const summary = $('#chatSmartSummary');
+    if (summary) summary.innerHTML = `<span>⚡ Требуют внимания: <b>${awaitingCount}</b></span><span>🚨 Срочные: <b>${urgentCount}</b></span><small>Приоритет рассчитан по последнему сообщению и открытым обращениям. Ответы не отправляются автоматически.</small>`;
     const items = (state.chats || []).filter(item => {
+      if (state.chatAttention === 'urgent' && isAttention(item) !== 'urgent') return false;
+      if (state.chatAttention === 'unanswered' && !['urgent','unanswered'].includes(isAttention(item))) return false;
       if (state.chatLabel !== 'all' && (item.label || 'new') !== state.chatLabel) return false;
       if (!query) return true;
       return [item.email,item.invoice_id,item.product_name,item.preview,item.id_i].some(value => String(value || '').toLowerCase().includes(query));
@@ -904,7 +912,9 @@
     if (!items.length) { $('#chatsList').innerHTML = '<div class="empty">Чаты не найдены</div>'; return; }
     $('#chatsList').innerHTML = items.map(item => {
       const id = getAny(item, ['conversation_id','id_i','debate_id','id','invoice_id']);
-      const title = getAny(item, ['product_name','name','subject','email'], item.invoice_id ? `Заказ #${item.invoice_id}` : `Диалог #${id}`);
+      const candidate = String(getAny(item, ['product_name','name','subject'], '') || '').trim();
+      const opaque = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(candidate) || /^[0-9a-f]{24,}$/i.test(candidate) || /^\d{9,}$/.test(candidate);
+      const title = candidate && !opaque ? candidate : (item.invoice_id ? `Товар по заказу #${item.invoice_id}` : 'Товар не определён');
       const preview = getAny(item, ['preview','message','text'], 'Открыть переписку');
       const unread = Number(item.cnt_new || 0);
       const meta = [item.email, item.invoice_id ? `заказ #${item.invoice_id}` : '', formatDate(item.last_message)].filter(Boolean).join(' · ');
@@ -912,13 +922,15 @@
       const initials = (who.includes('@') ? who.split('@')[0] : who).split(/[\s._-]+/).slice(0,2).map(x => x[0] || '').join('').toUpperCase().slice(0,2) || '•';
       const tone = [...who].reduce((a,ch) => a+ch.charCodeAt(0),0) % 4;
       const readableDate = formatDate(item.last_message_iso || item.last_message || item.created_at);
-      return `<button class="chat-card plain-button" data-chat="${esc(id)}" aria-label="Открыть переписку: ${esc(title)}">
+      const urgency = isAttention(item);
+      const priorityBadge = urgency === 'urgent' ? '<span class="chat-priority urgent">🚨 Срочно</span>' : urgency === 'unanswered' ? '<span class="chat-priority awaiting">● Ждёт ответа</span>' : '';
+      return `<button class="chat-card plain-button ${urgency==='urgent'?'is-urgent':''}" data-chat="${esc(id)}" aria-label="Открыть переписку: ${esc(title)}">
         <span class="chat-avatar tone-${tone}">${esc(initials)}</span>
         <div class="chat-card-main">
           <strong>${item.pinned ? '<span class="chat-pin">📌 </span>' : ''}${item.favorite ? '★ ' : ''}${esc(title)}</strong>
           <p class="chat-preview">${esc(typeof preview === 'object' ? JSON.stringify(preview) : preview)}</p>
           <span class="muted chat-meta">${esc(item.email || (item.invoice_id ? `Заказ #${item.invoice_id}` : `#${id}`))}</span>
-          <div class="chat-card-footer"><span class="badge chat-${esc(item.label || 'new')}">${esc(chatLabelName(item.label || 'new'))}</span>${Number(item.debate_count || 1) > 1 ? `<span class="badge">${Number(item.debate_count)} ветки</span>` : ''}</div>
+          <div class="chat-card-footer">${priorityBadge}<span class="badge chat-${esc(item.label || 'new')}">${esc(chatLabelName(item.label || 'new'))}</span>${Number(item.debate_count || 1) > 1 ? `<span class="badge">${Number(item.debate_count)} ветки</span>` : ''}</div>
         </div>
         <span class="chat-card-side"><time class="chat-timestamp">${esc(readableDate)}</time>${unread ? `<span class="chat-unread">${unread > 99 ? '99+' : unread}</span>` : ''}</span>
       </button>`;
@@ -975,17 +987,35 @@
     $('#chatDialog')?.classList.remove('customer-view');
     $('#customerViewToggle').textContent = 'Профиль клиента';
     state.currentChatInfo = state.chats.find(item => String(getAny(item,['conversation_id','id_i','debate_id','id'])) === String(id)) || {};
-    $('#chatDialogTitle').textContent = state.currentChatInfo.product_name || state.currentChatInfo.email || 'Переписка с клиентом';
+    const rawName = String(state.currentChatInfo.product_name || '');
+    $('#chatDialogTitle').textContent = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(rawName) ? 'Товар по заказу' : (rawName || 'Переписка с клиентом');
     $('#chatDialogMeta').innerHTML = `<b>${esc(state.currentChatInfo.email || '')}</b><span class="muted">${state.currentChatInfo.invoice_id ? `Последний заказ #${esc(state.currentChatInfo.invoice_id)} · ` : ''}${Number(state.currentChatInfo.debate_count||1)} веток GGSEL объединено</span>`;
     $$('.chat-label-actions [data-set-chat-label]').forEach(btn => btn.classList.toggle('active', btn.dataset.setChatLabel === (state.currentChatInfo.label || 'new')));
     $('#chatMessages').innerHTML = '<div class="empty">Загрузка…</div>';
+    $('#chatCopilot')?.classList.add('hidden');
+    $('#chatSuggestion').classList.add('hidden');
+    $('#chatSuggestion').replaceChildren();
     openDialog($('#chatDialog'));
     try {
       const {data} = await api(`/app/api/conversations/${encodeURIComponent(id)}`);
       const conv = data.conversation || {};
       state.currentChatInfo = {...state.currentChatInfo, ...conv};
+      const productTitle = conv.product_name || (conv.orders||[]).find(o=>o.product_name)?.product_name || '';
+      $('#chatDialogTitle').textContent = productTitle || (conv.latest_invoice_id ? `Товар по заказу #${conv.latest_invoice_id}` : 'Переписка с клиентом');
       renderCustomerPanel(conv);
       const messages = data.messages || [];
+      const suggestion = data.suggestion;
+      const suggestionNode = $('#chatSuggestion');
+      if (suggestion?.draft) {
+        suggestionNode.innerHTML = `<div><b>✨ Найдено решение в базе знаний</b><p>${esc(suggestion.title)} · ${esc(suggestion.error_code)}</p><small>${esc(suggestion.note)}</small></div><button type="button" class="secondary-button small" id="useChatSuggestion">Вставить ответ</button>`;
+        suggestionNode.classList.remove('hidden');
+        $('#useChatSuggestion').addEventListener('click', () => {
+          $('#chatReplyText').value = suggestion.draft;
+          $('#chatReplyCounter').textContent = `${suggestion.draft.length} символов`;
+          $('#chatReplyText').focus();
+          toast('Черновик добавлен — проверь его перед отправкой');
+        });
+      }
       if (!messages.length) { $('#chatMessages').innerHTML = '<div class="empty">Сообщений нет</div>'; return; }
       $('#chatMessages').innerHTML = messages.map(item => {
         const seller = item.seller === true || Number(item.seller) === 1 || item.is_seller === true || Number(item.is_seller) === 1 || String(item.sender || '').toLowerCase() === 'seller';
@@ -997,6 +1027,39 @@
       }).join('');
       $('#chatMessages').scrollTop = $('#chatMessages').scrollHeight;
     } catch (error) { $('#chatMessages').innerHTML = `<div class="notice">${esc(error.message)}</div>`; }
+  }
+
+  async function openSupportBrief() {
+    if (!state.currentChat) return;
+    const target = $('#chatCopilot');
+    target.classList.remove('hidden');
+    target.innerHTML = '<div class="empty">Собираю историю обращения…</div>';
+    const chatId = state.currentChat;
+    try {
+      const {data} = await api(`/app/api/conversations/${encodeURIComponent(chatId)}/support-brief`);
+      if (state.currentChat !== chatId) return;
+      const customer = data.customer || {};
+      const steps = (data.steps||[]).map(s=>`<li>${esc(s)}</li>`).join('');
+      const flags = [data.error_code ? `Ошибка ${esc(data.error_code)}` : '',
+        data.same_error_count > 1 ? `Повторная ошибка ×${Number(data.same_error_count)}` : '',
+        data.other_customer_cases > 0 ? `Похожие обращения: ${Number(data.other_customer_cases)}` : ''].filter(Boolean);
+      target.innerHTML = `<div class="support-copilot-head"><div><span class="kicker">Диспетчер поддержки</span><h3>Разбор обращения</h3></div><button type="button" class="secondary-button small" data-copilot-close>Скрыть</button></div>
+        <p><b>${esc(data.product_name || 'Товар не определён')}</b>${data.invoice_id ? ` · Заказ #${esc(data.invoice_id)}` : ''}</p>
+        <p class="muted">Покупок: ${Number(customer.orders_count||0)} · Предыдущих обращений: ${(data.previous_cases||[]).length}</p>
+        ${flags.length ? `<div class="copilot-flags">${flags.map(f=>`<span class="badge">${f}</span>`).join('')}</div>` : ''}
+        ${customer.note ? `<p class="copilot-note"><b>Ваша заметка:</b> ${esc(customer.note)}</p>` : ''}
+        <h4>Что проверить</h4><ol>${steps}</ol>
+        ${data.article ? `<p class="muted">Найдена инструкция: ${esc(data.article.title)}</p>` : ''}
+        ${data.draft ? `<div class="copilot-draft"><b>Готовый черновик</b><p>${esc(data.draft)}</p><button type="button" class="primary-button small" data-copilot-draft>Вставить в ответ</button></div>` : ''}
+        <small class="muted">${esc(data.disclaimer)}</small>`;
+      target.querySelector('[data-copilot-close]')?.addEventListener('click',()=>target.classList.add('hidden'));
+      target.querySelector('[data-copilot-draft]')?.addEventListener('click',()=>{
+        const field = $('#chatReplyText');
+        if (field.value.trim() && !window.confirm('Заменить текущий черновик ответа?')) return;
+        field.value = data.draft; field.dispatchEvent(new Event('input', {bubbles:true})); field.focus();
+        toast('Черновик вставлен — проверь перед отправкой');
+      });
+    } catch (error) {target.innerHTML = `<div class="notice">${esc(error.message)}</div>`;}
   }
 
   async function setChatLabel(label) {
@@ -1321,6 +1384,13 @@
     $('#knowledgeForm')?.addEventListener('submit', saveKnowledge);
     let knowledgeTimer; $('#knowledgeSearch')?.addEventListener('input',e=>{clearTimeout(knowledgeTimer);knowledgeTimer=setTimeout(()=>loadKnowledge(e.target.value),260);});
     $('#knowledgePickerSearch')?.addEventListener('input',e=>{const q=e.target.value.toLowerCase();renderKnowledgePicker(state.knowledge.filter(x=>[x.title,x.body,x.category,(x.error_codes||[]).join(' ')].some(v=>String(v||'').toLowerCase().includes(q))));});
+    $('#chatPriorityFilters')?.addEventListener('click', event => {
+      const button = event.target.closest('[data-chat-attention]');
+      if (!button) return;
+      state.chatAttention = button.dataset.chatAttention;
+      $$('#chatPriorityFilters .chip').forEach(chip => chip.classList.toggle('active', chip === button));
+      renderChats();
+    });
     $('#chatKnowledgeBtn')?.addEventListener('click', openKnowledgePicker);
     $('#chatDiagnosticBtn')?.addEventListener('click',()=>openDiagnostic(state.currentChatInfo?.invoice_id||'',state.currentChat||''));
     $('#chatCaseBtn')?.addEventListener('click',()=>openCaseEditor({invoice_id:state.currentChatInfo?.invoice_id||'',conversation_id:state.currentChat||'',product_name:state.currentChatInfo?.product_name||''}));
@@ -1459,6 +1529,7 @@
     $('#revenueForm').addEventListener('submit', calculateRevenue);
     $$('.finance-presets [data-period]').forEach(button => button.addEventListener('click', () => applyFinancePeriod(button.dataset.period)));
     $('#receiptsRefresh').addEventListener('click', loadReceipts);
+    $('#chatCopilotBtn')?.addEventListener('click', openSupportBrief);
     $('#chatsRefresh').addEventListener('click', loadChats);
     let chatSearchTimer; $('#chatSearch').addEventListener('input', event => { state.chatQuery = event.target.value.trim(); clearTimeout(chatSearchTimer); chatSearchTimer = setTimeout(() => loadChats(state.chatQuery), 320); });
     $('#chatFilters').addEventListener('click', event => { const chip = event.target.closest('[data-chat-label]'); if (!chip) return; $$('#chatFilters .chip').forEach(x => x.classList.toggle('active', x === chip)); state.chatLabel = chip.dataset.chatLabel; renderChats(); });

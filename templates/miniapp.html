@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#f5f7fc">
   <title>GGSEL · Панель продавца</title>
   <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
-  <link rel="stylesheet" href="{{ url_for('static', filename='miniapp.css', v='83') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='miniapp.css', v='85') }}">
 </head>
 <body>
   <div id="app" class="app-shell">
@@ -226,6 +226,12 @@
         <div class="section-heading"><div><span class="kicker">Поддержка</span><h2>Чаты</h2></div><button id="chatsRefresh" class="icon-button">↻</button></div>
         <div id="chatStatus" class="notice"><div class="empty">Проверяю webhook…</div></div>
         <label class="search-field"><span>⌕</span><input id="chatSearch" type="search" placeholder="Email, заказ, товар или текст"></label>
+        <div id="chatSmartSummary" class="chat-smart-summary" aria-live="polite"><span>Загрузка приоритетов…</span></div>
+        <div id="chatPriorityFilters" class="chips chat-smart-filters" aria-label="Очередь обращений">
+          <button class="chip active" data-chat-attention="all">Все диалоги</button>
+          <button class="chip" data-chat-attention="unanswered">⚡ Требуют ответа</button>
+          <button class="chip" data-chat-attention="urgent">🚨 Срочные</button>
+        </div>
         <div id="chatFilters" class="chips">
           <button class="chip active" data-chat-label="all">Все</button>
           <button class="chip" data-chat-label="new">Новые</button>
@@ -427,7 +433,10 @@
     <div class="crm-chat-layout">
       <section class="crm-thread">
         <div id="chatMessages" class="messages"></div>
+        <div id="chatCopilot" class="support-copilot hidden" aria-live="polite"></div>
+        <div id="chatSuggestion" class="chat-suggestion hidden" role="status"></div>
         <div class="chat-tools">
+          <button id="chatCopilotBtn" class="primary-button small" type="button">✦ Разобрать обращение</button>
           <button id="chatKnowledgeBtn" class="secondary-button small" type="button">◎ Инструкция</button>
           <button id="chatDiagnosticBtn" class="secondary-button small" type="button">⌁ Диагностика</button>
           <button id="chatCaseBtn" class="secondary-button small" type="button">⚑ Проблема</button>
@@ -536,6 +545,6 @@
 
   <button id="backToTop" class="back-to-top" type="button" aria-label="Вернуться наверх" title="Наверх">↑</button>
   <div id="toast" class="toast hidden"></div>
-  <script src="{{ url_for('static', filename='miniapp.js', v='83') }}" defer></script>
+  <script src="{{ url_for('static', filename='miniapp.js', v='85') }}" defer></script>
 </body>
 </html>
