@@ -645,3 +645,20 @@ html[data-ui-theme="dark"] .messages .message.seller{background:#35447a;border-c
   .chat-card .chat-card-footer .badge{font-size:9px;}
 }
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.001ms!important;transition-duration:.001ms!important;scroll-behavior:auto!important;}}
+
+/* v8.3 — monitoring & service-chat controls */
+.monitor-panel .panel-heading { align-items: flex-start; }
+.monitor-panel .panel-heading p { margin: 6px 0 0; max-width: 530px; }
+.monitor-summary { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 9px; margin: 13px 0 18px; }
+.monitor-metric { border-radius: 13px; background: color-mix(in srgb, var(--muted) 7%, transparent); padding: 12px; display: grid; align-content: start; gap: 5px; min-height: 76px; overflow-wrap: anywhere; }
+.monitor-metric small, .monitor-metric .muted { font-size: 11px; }
+.monitor-dot { width: 9px; height: 9px; border-radius: 100%; display: inline-block; background: var(--warning); }
+.monitor-dot.online { background: var(--success); }
+.monitor-dot.offline { background: var(--danger); }
+.monitor-service { border: 1px solid var(--line); padding: 12px; border-radius: 15px; display: grid; gap: 10px; }
+.monitor-field { display: grid; gap: 5px; }
+.monitor-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.monitor-diagnostic { max-height: 340px; overflow: auto; }
+.monitor-chat-row { display: flex; align-items: center; gap: 10px; justify-content: space-between; padding: 11px 0; border-bottom: 1px solid var(--line); }
+.monitor-chat-row small { display: block; margin-top: 5px; }
+@media(max-width:640px) { .monitor-summary { grid-template-columns: 1fr 1fr; } .monitor-metric:first-child { grid-column:1 / -1; } .monitor-chat-row { display: grid; } .monitor-panel .panel-heading { flex-wrap: wrap; } }

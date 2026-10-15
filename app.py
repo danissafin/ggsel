@@ -64,6 +64,9 @@ SLA_CRITICAL_MINUTES = max(SLA_WARNING_MINUTES, int(os.environ.get("SLA_CRITICAL
 SETTLEMENT_TO_RUB_RATE = max(0.0, float(os.environ.get("SETTLEMENT_TO_RUB_RATE", "0") or 0))
 ISSUE_WINDOW_MINUTES = max(15, int(os.environ.get("ISSUE_WINDOW_MINUTES", "120")))
 ISSUE_ALERT_THRESHOLD = max(2, int(os.environ.get("ISSUE_ALERT_THRESHOLD", "3")))
+# The poller runs in the Railway web service, and shares a SQLite lease across workers.
+GGSEL_MONITOR_ENABLED = os.environ.get("GGSEL_MONITOR_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+GGSEL_MONITOR_INTERVAL_SECONDS = max(60, min(3600, int(os.environ.get("GGSEL_MONITOR_INTERVAL_SECONDS", "300"))))
 
 if not BOT_TOKEN or not OWNER_ID:
     raise RuntimeError("BOT_TOKEN and OWNER_ID (or CHAT_ID) must be set")
@@ -1386,6 +1389,10 @@ def refresh_operations() -> list[dict[str, Any]]:
 
 
 def maybe_send_low_stock_alerts(offers: list[dict[str, Any]]) -> None:
+    # v8.3 monitors ALL stock in the background and sends grouped transition alerts.
+    # Prevent duplicate notifications from the old dashboard-triggered watcher.
+    if GGSEL_MONITOR_ENABLED:
+        return
     configured = get_offer_settings_map()
     for item in enrich_offer_settings(offers):
         offer_id_value = str(item.get("id") or "")
@@ -6568,9 +6575,296 @@ def miniapp_incident_patch(user: dict[str, Any], incident_id: int):
     return miniapp_success({'id': incident_id, 'status': status})
 
 
+
+# ============================================================
+# v8.3: owner notifications and optional service-chat diagnostics
+# ============================================================
+
+def init_monitor_db() -> None:
+    with db_connect() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS monitor_config (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                stock_enabled INTEGER NOT NULL DEFAULT 1,
+                support_enabled INTEGER NOT NULL DEFAULT 0,
+                notifications_enabled INTEGER NOT NULL DEFAULT 0,
+                support_debate TEXT NOT NULL DEFAULT '',
+                notifications_debate TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
+            INSERT OR IGNORE INTO monitor_config(id) VALUES (1);
+            CREATE TABLE IF NOT EXISTS monitor_stock (
+                offer_id TEXT PRIMARY KEY, quantity INTEGER NOT NULL,
+                bucket TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS monitor_seen_messages (
+                channel TEXT NOT NULL, debate_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL, first_seen_at TEXT NOT NULL,
+                PRIMARY KEY(channel, debate_id, fingerprint)
+            );
+            CREATE TABLE IF NOT EXISTS monitor_channel_baselines (
+                channel TEXT PRIMARY KEY, debate_id TEXT NOT NULL, initialized_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS monitor_lock (
+                id INTEGER PRIMARY KEY CHECK(id=1), locked_until INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT OR IGNORE INTO monitor_lock(id) VALUES(1);
+            CREATE TABLE IF NOT EXISTS monitor_runs (
+                id INTEGER PRIMARY KEY CHECK(id=1), last_started TEXT,
+                last_success TEXT, last_error TEXT, last_stock_count INTEGER NOT NULL DEFAULT 0,
+                last_notifications INTEGER NOT NULL DEFAULT 0, last_chat_check TEXT
+            );
+            INSERT OR IGNORE INTO monitor_runs(id) VALUES(1);
+        """)
+
+
+def monitor_config() -> dict[str, Any]:
+    with db_connect() as conn:
+        row = conn.execute('SELECT * FROM monitor_config WHERE id=1').fetchone()
+    return dict(row) if row else {}
+
+
+def monitor_status() -> dict[str, Any]:
+    with db_connect() as conn:
+        runtime = conn.execute('SELECT * FROM monitor_runs WHERE id=1').fetchone()
+        stock = conn.execute('SELECT bucket, COUNT(*) count FROM monitor_stock GROUP BY bucket').fetchall()
+    return {
+        'config': monitor_config(), 'runtime': dict(runtime) if runtime else {},
+        'stock': {r['bucket']: r['count'] for r in stock},
+        'running': GGSEL_MONITOR_ENABLED, 'interval_seconds': GGSEL_MONITOR_INTERVAL_SECONDS,
+        'note': 'Служебные чаты можно подключить только если GGSEL Seller API возвращает их сообщения по ID. Новые сообщения пересылаются после первой синхронизации.'
+    }
+
+
+def _monitor_lease_acquire() -> bool:
+    now = int(time.time())
+    with db_connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        old = conn.execute('SELECT locked_until FROM monitor_lock WHERE id=1').fetchone()
+        if old and as_int(old['locked_until']) > now:
+            return False
+        conn.execute('UPDATE monitor_lock SET locked_until=? WHERE id=1', (now + max(240, GGSEL_MONITOR_INTERVAL_SECONDS),))
+    return True
+
+
+def _monitor_lease_release() -> None:
+    with db_connect() as conn:
+        conn.execute('UPDATE monitor_lock SET locked_until=0 WHERE id=1')
+
+
+def _monitor_stock_bucket(quantity: int, minimum: int) -> str:
+    if quantity <= 0: return 'empty'
+    if quantity <= minimum: return 'low'
+    return 'ok'
+
+
+def monitor_check_stock() -> dict[str, int]:
+    config = monitor_config()
+    if not config.get('stock_enabled'):
+        return {'checked': 0, 'alerts': 0}
+    # Always refresh: a user need not open the Mini App for a stock change to be detected.
+    offers = collect_all_offers(force=True)
+    if not offers:
+        # An empty or malformed API response should not be treated as zero-stock.
+        raise RuntimeError('GGSEL returned no offers; stock snapshot was not changed')
+    thresholds = get_offer_settings_map()
+    changes = []
+    restocked = []
+    observations = []
+    with db_connect() as conn:
+        known = {str(row['offer_id']): dict(row) for row in conn.execute('SELECT * FROM monitor_stock')}
+    for item in offers:
+        identifier = str(item.get('id') or '').strip()
+        if not identifier or item.get('status') == 'archived':
+            continue
+        count = max(0, as_int(item.get('quantity')))
+        minimum = max(0, as_int(thresholds.get(identifier, {}).get('min_stock'), LOW_STOCK_DEFAULT))
+        bucket = _monitor_stock_bucket(count, minimum)
+        previous = known.get(identifier)
+        observations.append((identifier, count, bucket))
+        if bucket in ('low', 'empty') and (previous is None or previous['bucket'] != bucket):
+            changes.append((item, count, bucket, minimum))
+        if bucket == 'ok' and previous and previous['bucket'] in ('low', 'empty'):
+            restocked.append((item, count))
+    if changes:
+        lines = ['📦 <b>GGSEL — контроль остатков</b>', '']
+        for item, count, bucket, minimum in changes[:20]:
+            icon = '🚨' if bucket == 'empty' else '⚠️'
+            label = 'ЗАКОНЧИЛСЯ' if bucket == 'empty' else 'МАЛО КЛЮЧЕЙ'
+            lines.append(f"{icon} <b>{safe(item.get('title') or 'Товар')}</b> — {label}\nОстаток: <b>{count}</b> · порог: {minimum} · ID <code>{safe(item.get('id'))}</code>")
+        if len(changes) > 20:
+            lines.append(f'И ещё {len(changes)-20} товаров требуют внимания.')
+        # Save the baseline only AFTER delivery; Telegram failures will be retried.
+        send_text('\n\n'.join(lines))
+    now = datetime.now(timezone.utc).isoformat()
+    with db_connect() as conn:
+        conn.executemany("""INSERT INTO monitor_stock(offer_id,quantity,bucket,updated_at) VALUES(?,?,?,?)
+            ON CONFLICT(offer_id) DO UPDATE SET quantity=excluded.quantity,bucket=excluded.bucket,updated_at=excluded.updated_at""",
+            [(oid, qty, bucket, now) for oid, qty, bucket in observations])
+    return {'checked': len(observations), 'alerts': len(changes), 'restocked': len(restocked)}
+
+
+def _monitor_message_key(item: dict[str, Any]) -> str:
+    # Stable across polls: do not rely on polling time or message array positions.
+    ident = str(get_any(item, ('id','message_id','MessageId'), '') or '')
+    date_value = str(get_any(item, ('date_written','date','created_at','MessageDate'), '') or '')
+    message = str(get_any(item, ('message','text','Message'), '') or '')
+    file_ref = str(get_any(item, ('url','image_url','filename'), '') or '')
+    author = str(get_any(item, ('seller','is_seller','sender'), '') or '')
+    return hashlib.sha256(json.dumps([ident, date_value, message, file_ref, author], ensure_ascii=False).encode('utf-8')).hexdigest()
+
+
+def monitor_check_service_chats() -> dict[str, int]:
+    cfg = monitor_config()
+    forwarded = 0
+    checked = 0
+    now = datetime.now(timezone.utc).isoformat()
+    for channel, label in [('support', 'Поддержка GGSEL'), ('notifications', 'Уведомления GGSEL')]:
+        debate = str(cfg.get(channel + '_debate') or '').strip()
+        if not cfg.get(channel + '_enabled') or not debate:
+            continue
+        # IMPORTANT: the Seller API does not document service conversations.
+        # This is opt-in using a user-verified ID, not page scraping.
+        result = ggsel.chat_messages(debate)
+        data = [m for m in extract_list(result, ('messages', 'items')) if isinstance(m, dict)]
+        checked += 1
+        with db_connect() as conn:
+            baseline = conn.execute('SELECT debate_id FROM monitor_channel_baselines WHERE channel=?', (channel,)).fetchone()
+            is_first = baseline is None or str(baseline['debate_id']) != debate
+            if is_first:
+                conn.execute('DELETE FROM monitor_seen_messages WHERE channel=?', (channel,))
+                conn.execute("""INSERT INTO monitor_channel_baselines(channel,debate_id,initialized_at) VALUES(?,?,?)
+                    ON CONFLICT(channel) DO UPDATE SET debate_id=excluded.debate_id,initialized_at=excluded.initialized_at""",
+                    (channel, debate, now))
+                conn.executemany('INSERT OR IGNORE INTO monitor_seen_messages(channel,debate_id,fingerprint,first_seen_at) VALUES(?,?,?,?)',
+                    [(channel, debate, _monitor_message_key(item), now) for item in data])
+                continue
+        for item in data:
+            if item.get('seller') is True or item.get('is_seller') is True:
+                continue  # never forward seller's own messages
+            key = _monitor_message_key(item)
+            with db_connect() as conn:
+                exists = conn.execute('SELECT 1 FROM monitor_seen_messages WHERE channel=? AND debate_id=? AND fingerprint=?', (channel,debate,key)).fetchone()
+            if exists: continue
+            when = str(get_any(item, ('date_written','date','created_at'), '') or '')
+            message = str(get_any(item, ('message','text'), '') or '')
+            file_ref = str(get_any(item, ('url','image_url'), '') or '')
+            body = f"{'🚨' if channel=='support' else '🔔'} <b>{safe(label)}</b>\nДиалог: <code>{safe(debate)}</code>\n{safe(when)}\n\n{safe(message[:3300] or '[вложение]')}"
+            if file_ref.startswith('https://'):
+                body += f'\nВложение: {safe(file_ref[:250])}'
+            send_text(body)
+            with db_connect() as conn:
+                conn.execute('INSERT OR IGNORE INTO monitor_seen_messages(channel,debate_id,fingerprint,first_seen_at) VALUES(?,?,?,?)', (channel, debate, key, now))
+            forwarded += 1
+    if checked:
+        with db_connect() as conn:
+            conn.execute('UPDATE monitor_runs SET last_chat_check=? WHERE id=1', (now,))
+    return {'checked': checked, 'forwarded': forwarded}
+
+
+def monitor_run_once() -> dict[str, Any]:
+    if not _monitor_lease_acquire():
+        return {'skipped': 'already_running'}
+    now = datetime.now(timezone.utc).isoformat()
+    with db_connect() as conn:
+        conn.execute('UPDATE monitor_runs SET last_started=? WHERE id=1', (now,))
+    result = {'stock': {}, 'service_chats': {}}
+    errors = []
+    try:
+        try: result['stock'] = monitor_check_stock()
+        except Exception as exc:
+            logger.exception('GGSEL monitor: stock fetch failed')
+            errors.append('Остатки: ' + str(exc)[:180])
+        try: result['service_chats'] = monitor_check_service_chats()
+        except Exception as exc:
+            logger.exception('GGSEL monitor: service chats check failed')
+            errors.append('Служебные чаты: ' + str(exc)[:180])
+        with db_connect() as conn:
+            conn.execute("""UPDATE monitor_runs SET last_success=?,last_error=?,last_stock_count=?,last_notifications=? WHERE id=1""",
+                         (now if not errors else None, '; '.join(errors), result['stock'].get('checked',0),
+                          result['stock'].get('alerts',0)+result['service_chats'].get('forwarded',0)))
+        return {**result, 'errors': errors}
+    finally:
+        _monitor_lease_release()
+
+
+def _monitor_loop() -> None:
+    # Delay first run to allow the web server to initialize. No scheduler plugin needed.
+    time.sleep(20)
+    while GGSEL_MONITOR_ENABLED:
+        try:
+            monitor_run_once()
+        except Exception:
+            logger.exception('GGSEL background monitor failed')
+        time.sleep(GGSEL_MONITOR_INTERVAL_SECONDS)
+
+
+@app.get('/app/api/monitor')
+@miniapp_api
+def miniapp_monitor_status(user: dict[str, Any]):
+    return miniapp_success(monitor_status())
+
+
+@app.post('/app/api/monitor/config')
+@miniapp_api
+def miniapp_monitor_config(user: dict[str, Any]):
+    body = request.get_json(silent=True) or {}
+    def clean_debate(name):
+        value = str(body.get(name) or '').strip()
+        if len(value) > 40 or (value and not re.fullmatch(r'[A-Za-z0-9_-]+', value)):
+            raise ValueError('Некорректный ID переписки')
+        return value
+    support = clean_debate('support_debate')
+    notifications = clean_debate('notifications_debate')
+    if body.get('support_enabled') and not support: raise ValueError('Укажите ID чата поддержки')
+    if body.get('notifications_enabled') and not notifications: raise ValueError('Укажите ID чата уведомлений')
+    now = datetime.now(timezone.utc).isoformat()
+    with db_connect() as conn:
+        conn.execute("""UPDATE monitor_config SET stock_enabled=?,support_enabled=?,notifications_enabled=?,support_debate=?,notifications_debate=?,updated_at=? WHERE id=1""",
+                     (int(bool(body.get('stock_enabled',True))), int(bool(body.get('support_enabled'))),
+                      int(bool(body.get('notifications_enabled'))), support, notifications, now))
+    audit_miniapp(user.get('id'), 'monitor_config', 'system', {'stock_enabled':bool(body.get('stock_enabled')), 'support_enabled':bool(body.get('support_enabled')), 'notifications_enabled':bool(body.get('notifications_enabled'))})
+    return miniapp_success(monitor_status())
+
+
+@app.post('/app/api/monitor/check')
+@miniapp_api
+def miniapp_monitor_check(user: dict[str, Any]):
+    return miniapp_success(monitor_run_once())
+
+
+@app.post('/app/api/monitor/diagnose')
+@miniapp_api
+def miniapp_monitor_diagnose(user: dict[str, Any]):
+    # Returns only safe conversation metadata; no message text, keys or full API payload.
+    raw = ggsel.chats()
+    rows = []
+    for item in extract_list(raw, ('chats','items'))[:100]:
+        if not isinstance(item, dict): continue
+        identifier = str(get_any(item, ('id_i','debate_id','id'), '') or '')
+        if not identifier: continue
+        names = [str(get_any(item, (key,), '') or '')[:100] for key in ('title', 'name', 'type', 'chat_type', 'username')]
+        desc = ' · '.join(n for n in names if n)[:180]
+        rows.append({'id_i':identifier, 'description':desc or 'Без описания',
+                     'candidate': any(w in desc.lower() for w in ('support','поддерж','уведом','notice','system','admin'))})
+    return miniapp_success({'chats':rows, 'count':len(rows),
+        'note':'API возвращает список непрочитанных чатов. Отсутствие служебных бесед здесь не означает, что они не существуют.'})
+
+
+@app.get('/cron/ggsel-monitor')
+def cron_ggsel_monitor():
+    provided = request.args.get('secret') or request.headers.get('X-Cron-Secret', '')
+    if not CRON_SECRET or not secrets.compare_digest(str(provided), CRON_SECRET):
+        return jsonify({'ok': False}), 403
+    return jsonify({'ok':True, 'data':monitor_run_once()})
+
+
 init_db()
 init_v7_db()
 seed_v7_knowledge()
+init_monitor_db()
+if GGSEL_MONITOR_ENABLED:
+    threading.Thread(target=_monitor_loop, daemon=True, name='ggsel-monitor').start()
 
 
 if __name__ == "__main__":

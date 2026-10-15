@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#f5f7fc">
   <title>GGSEL · Панель продавца</title>
   <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
-  <link rel="stylesheet" href="{{ url_for('static', filename='miniapp.css', v='82') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='miniapp.css', v='83') }}">
 </head>
 <body>
   <div id="app" class="app-shell">
@@ -305,6 +305,24 @@
 
       <section id="section-health" class="section">
         <div class="section-heading"><div><span class="kicker">Надёжность</span><h2>Система</h2></div></div>
+        <div class="panel monitor-panel">
+          <div class="panel-heading"><div><h3>🔔 Telegram-уведомления GGSEL</h3><p class="muted">Проверка склада работает без открытого Mini App. Служебные чаты подключаются только после проверки API.</p></div><button id="monitorRefreshBtn" class="secondary-button small">Проверить сейчас</button></div>
+          <div id="monitorStatus" class="monitor-summary"><span class="muted">Загрузка состояния…</span></div>
+          <form id="monitorConfigForm" class="form-stack">
+            <label class="switch-row"><span><strong>Уведомления об остатках</strong><small class="muted">Когда ключей мало или они закончились</small></span><input id="monitorStockEnabled" type="checkbox" checked></label>
+            <div class="monitor-service">
+              <label class="switch-row"><span><strong>🚨 Чат поддержки GGSEL</strong><small class="muted">Только если переписка доступна по API</small></span><input id="monitorSupportEnabled" type="checkbox"></label>
+              <label class="monitor-field">ID переписки поддержки <input id="monitorSupportDebate" type="text" placeholder="id_i из проверки API" autocomplete="off"></label>
+            </div>
+            <div class="monitor-service">
+              <label class="switch-row"><span><strong>🔔 Служебный чат уведомлений</strong><small class="muted">Только если API возвращает сообщения</small></span><input id="monitorNoticesEnabled" type="checkbox"></label>
+              <label class="monitor-field">ID переписки уведомлений <input id="monitorNoticesDebate" type="text" placeholder="id_i из проверки API" autocomplete="off"></label>
+            </div>
+            <div class="monitor-actions"><button class="primary-button" type="submit">Сохранить настройки</button><button id="monitorDiagnoseBtn" type="button" class="secondary-button">Найти чаты в API</button></div>
+          </form>
+          <div id="monitorDiagnostic" class="monitor-diagnostic" aria-live="polite"></div>
+          <p class="muted">GGSEL API документирует список непрочитанных диалогов, но не гарантирует доступ к служебным чатам. Первый опрос выбранного ID только запоминает историю, не пересылая старые сообщения.</p>
+        </div>
         <div class="panel"><div class="panel-heading"><h3>Резервные копии</h3><button id="backupCreateBtn" class="primary-button">Создать копию</button></div><div id="backupsList" class="list"></div></div>
         <div class="panel"><div class="panel-heading"><h3>Ошибки API</h3><button id="errorsRefresh" class="secondary-button">Обновить</button></div><div id="errorsList" class="list"></div></div>
         <div class="panel"><div class="panel-heading"><h3>Ежедневный отчёт</h3></div><label class="switch-row"><span>Утренний отчёт</span><input id="morningReportToggle" type="checkbox"></label><label class="switch-row"><span>Вечерний отчёт</span><input id="eveningReportToggle" type="checkbox"></label><button id="reportSettingsSave" class="primary-button full">Сохранить</button><p class="muted">Для доставки по расписанию добавьте Railway Cron на /cron/daily-report?secret=CRON_SECRET.</p></div>
@@ -518,6 +536,6 @@
 
   <button id="backToTop" class="back-to-top" type="button" aria-label="Вернуться наверх" title="Наверх">↑</button>
   <div id="toast" class="toast hidden"></div>
-  <script src="{{ url_for('static', filename='miniapp.js', v='82') }}" defer></script>
+  <script src="{{ url_for('static', filename='miniapp.js', v='83') }}" defer></script>
 </body>
 </html>

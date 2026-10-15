@@ -1137,7 +1137,40 @@
   function renderRules(data){ $('#rulesList').innerHTML=data.length?data.map(x=>`<div class="list-item"><div><strong>${esc(x.name)}</strong><span class="muted">${esc(x.trigger_type)} · ${x.enabled?'включено':'выключено'}</span></div><div class="inline-actions"><button class="secondary-button small" data-toggle-rule="${x.id}" data-enabled="${x.enabled?0:1}">${x.enabled?'Выкл.':'Вкл.'}</button><button class="danger-link" data-delete-rule="${x.id}">Удалить</button></div></div>`).join(''):'<div class="empty">Правил пока нет</div>'; }
   function renderProductAnalytics(data){ $('#productAnalyticsList').innerHTML=data.length?data.slice(0,30).map(x=>`<div class="list-item"><div><strong>${esc(x.product_name)}</strong><span class="muted">${x.sales_count} продаж · ${x.daily_rate}/день</span></div><span>${money(x.revenue_rub||x.revenue_usd,x.revenue_rub?'RUB':'USD')}</span></div>`).join(''):'<div class="empty">Нет данных</div>'; }
 
-  async function loadHealth(){ const [backups,errors,settings]=await Promise.all([api('/app/api/backups'),api('/app/api/errors'),api('/app/api/report-settings')]); renderBackups(backups.data); renderErrors(errors.data); $('#morningReportToggle').checked=!!settings.data.morning_enabled; $('#eveningReportToggle').checked=!!settings.data.evening_enabled; }
+  async function loadHealth(){ const [backups,errors,settings,monitor]=await Promise.all([api('/app/api/backups'),api('/app/api/errors'),api('/app/api/report-settings'),api('/app/api/monitor')]); renderBackups(backups.data); renderErrors(errors.data); $('#morningReportToggle').checked=!!settings.data.morning_enabled; $('#eveningReportToggle').checked=!!settings.data.evening_enabled; renderMonitor(monitor.data); }
+  function renderMonitor(data) {
+    const cfg = data.config || {}, status = data.runtime || {};
+    $('#monitorStockEnabled').checked = !!cfg.stock_enabled;
+    $('#monitorSupportEnabled').checked = !!cfg.support_enabled;
+    $('#monitorNoticesEnabled').checked = !!cfg.notifications_enabled;
+    $('#monitorSupportDebate').value = cfg.support_debate || '';
+    $('#monitorNoticesDebate').value = cfg.notifications_debate || '';
+    const err = status.last_error || '';
+    const flag = !data.running ? 'Остановлен' : err ? 'Ошибка проверки' : status.last_success ? 'Работает' : 'Ожидает первой проверки';
+    $('#monitorStatus').innerHTML = `<div class="monitor-metric"><span class="monitor-dot ${data.running && !err ? 'online':'offline'}"></span><strong>${esc(flag)}</strong><small>${data.interval_seconds} сек. между проверками</small></div><div class="monitor-metric"><span class="muted">Последняя проверка</span><b>${formatDate(status.last_started)}</b></div><div class="monitor-metric"><span class="muted">Проверено товаров</span><b>${Number(status.last_stock_count || 0)}</b></div>${err?`<p class="notice">${esc(err)}</p>`:''}`;
+  }
+  async function monitorCheck() {
+    const btn = $('#monitorRefreshBtn'); btn.disabled = true; btn.textContent = 'Проверяю…';
+    try {
+      const {data}= await api('/app/api/monitor/check', {method:'POST',body:'{}'});
+      if(data.skipped) toast('Проверка уже идёт');
+      else if(data.errors?.length) toast(data.errors.join('; '), true);
+      else toast(`Проверено товаров: ${data.stock?.checked || 0}. Новых оповещений: ${(data.stock?.alerts||0)+(data.service_chats?.forwarded||0)}`);
+      renderMonitor((await api('/app/api/monitor')).data);
+    } catch(e) { toast(e.message, true); }
+    finally { btn.disabled=false;btn.textContent='Проверить сейчас'; }
+  }
+  async function monitorDiagnose() {
+    const btn = $('#monitorDiagnoseBtn'); btn.disabled=true; btn.textContent='Проверяю API…';
+    const node=$('#monitorDiagnostic');node.innerHTML='<div class="empty">Запрашиваю непрочитанные чаты…</div>';
+    try {
+      const {data}= await api('/app/api/monitor/diagnose',{method:'POST',body:'{}'});
+      node.innerHTML = `<p class="muted">${esc(data.note)} Найдено: ${Number(data.count||0)}.</p>` +
+        (data.chats?.length ? data.chats.map(x => `<div class="monitor-chat-row"><div><strong>${x.candidate?'★ ':''}Диалог ${esc(x.id_i)}</strong><small class="muted">${esc(x.description)}</small></div><div class="monitor-actions"><button type="button" class="secondary-button small" data-monitor-select="support" data-monitor-id="${esc(x.id_i)}">Поддержка</button><button type="button" class="secondary-button small" data-monitor-select="notifications" data-monitor-id="${esc(x.id_i)}">Уведомления</button></div></div>`).join(''):'<div class="empty">API не вернул непрочитанных чатов</div>');
+    } catch(e) { node.innerHTML=`<p class="notice">${esc(e.message)}</p>`; }
+    finally { btn.disabled=false;btn.textContent='Найти чаты в API'; }
+  }
+
   function renderBackups(data){ $('#backupsList').innerHTML=data.length?data.map(x=>`<div class="list-item"><div><strong>${esc(x.name)}</strong><span class="muted">${(x.size/1024/1024).toFixed(2)} МБ · ${formatDate(x.created_at)}</span></div></div>`).join(''):'<div class="empty">Копий пока нет</div>'; }
   function renderErrors(data){ $('#errorsList').innerHTML=data.length?data.slice(0,50).map(x=>`<div class="list-item"><div><strong>${esc(x.service)} · HTTP ${esc(x.status)}</strong><span class="muted">${esc(x.endpoint)} · ${esc(x.message)}</span></div><span>${formatDate(x.created_at)}</span></div>`).join(''):'<div class="empty">Ошибок не зафиксировано</div>'; }
 
@@ -1309,6 +1342,21 @@
     $('#ruleAddBtn')?.addEventListener('click', ()=>openDialog($('#ruleDialog')));
     $('#templateForm')?.addEventListener('submit', async e=>{e.preventDefault(); await api('/app/api/templates',{method:'POST',body:JSON.stringify({category:$('#templateCategory').value,name:$('#templateName').value,body:$('#templateBody').value})}); closeDialog($('#templateDialog')); renderTemplates((await api('/app/api/templates')).data); toast('Шаблон сохранён');});
     $('#ruleForm')?.addEventListener('submit', async e=>{e.preventDefault(); const actionType=$('#ruleAction').value; const val=$('#ruleActionValue').value; await api('/app/api/automations',{method:'POST',body:JSON.stringify({name:$('#ruleName').value,trigger_type:$('#ruleTrigger').value,condition:{contains:$('#ruleContains').value},action:actionType==='notify'?{type:'notify',text:val}:{type:'label_chat',label:val}})}); closeDialog($('#ruleDialog')); renderRules((await api('/app/api/automations')).data); toast('Правило сохранено');});
+    $('#monitorRefreshBtn')?.addEventListener('click', monitorCheck);
+    $('#monitorDiagnoseBtn')?.addEventListener('click', monitorDiagnose);
+    $('#monitorConfigForm')?.addEventListener('submit', async event => {
+      event.preventDefault();
+      try {
+        await api('/app/api/monitor/config', {method:'POST',body:JSON.stringify({stock_enabled:$('#monitorStockEnabled').checked,support_enabled:$('#monitorSupportEnabled').checked,notifications_enabled:$('#monitorNoticesEnabled').checked,support_debate:$('#monitorSupportDebate').value.trim(),notifications_debate:$('#monitorNoticesDebate').value.trim()})});
+        toast('Настройки уведомлений сохранены');renderMonitor((await api('/app/api/monitor')).data);
+      } catch(e){toast(e.message,true);}
+    });
+    $('#monitorDiagnostic')?.addEventListener('click',event=>{
+      const target=event.target.closest('[data-monitor-select]'); if(!target) return;
+      if(target.dataset.monitorSelect==='support') {$('#monitorSupportDebate').value=target.dataset.monitorId;$('#monitorSupportEnabled').checked=true;}
+      else {$('#monitorNoticesDebate').value=target.dataset.monitorId;$('#monitorNoticesEnabled').checked=true;}
+      toast('ID выбран. Нажми «Сохранить настройки»');
+    });
     $('#backupCreateBtn')?.addEventListener('click', async()=>{const {data}=await api('/app/api/backups',{method:'POST',body:'{}'}); toast(`Копия создана: ${data.name}`); renderBackups((await api('/app/api/backups')).data);});
     $('#errorsRefresh')?.addEventListener('click', async()=>renderErrors((await api('/app/api/errors')).data));
     $('#reportSettingsSave')?.addEventListener('click', async()=>{await api('/app/api/report-settings',{method:'PUT',body:JSON.stringify({morning_enabled:$('#morningReportToggle').checked,evening_enabled:$('#eveningReportToggle').checked})}); toast('Настройки отчёта сохранены');});
